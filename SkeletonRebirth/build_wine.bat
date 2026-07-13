@@ -10,5 +10,5 @@ set LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KLIB%\Libraries;%BOOST%\stage\lib
 set PATH=%VC%\bin\amd64;%PATH%
 
 echo ===compiling SkeletonRebirthDiagnostics.dll===
-cl.exe /nologo /EHsc /GL /LD /MD /DUNICODE /D_UNICODE SkeletonRebirthDiagnostics.cpp KenshiLib.lib OgreMain_x64.lib /link /out:SkeletonRebirthDiagnostics.dll
+cl.exe /nologo /EHsc /GL /LD /MD /DUNICODE /D_UNICODE SkeletonRebirthDiagnostics.cpp KenshiLib.lib OgreMain_x64.lib MyGUIEngine_x64.lib /link /out:SkeletonRebirthDiagnostics.dll
 echo ===EXITCODE %ERRORLEVEL%===

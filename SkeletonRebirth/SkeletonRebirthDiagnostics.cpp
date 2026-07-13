@@ -10,6 +10,8 @@
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/Item.h>
 #include <kenshi/Building/Building.h>
+#include <kenshi/gui/ForgottenGUI.h>
+#include <kenshi/Globals.h>
 
 #include <core/Functions.h>
 
@@ -169,6 +171,11 @@ bool TryReactivate(Character* self)
 
 	g_deactivated.erase(self);
 	DebugLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
+
+	ScreenLabel* label = gui->createScreenLabel(self->_NV_getName() + " was revived!", MyGUI::Colour::Green, ScreenLabel::LS_MEDIUM, ScreenLabel::RS_SLOW);
+	if (label)
+		label->setTracking(self->getHandle(), Ogre::Vector3(0, 1, 0));
+
 	return true;
 }
 
