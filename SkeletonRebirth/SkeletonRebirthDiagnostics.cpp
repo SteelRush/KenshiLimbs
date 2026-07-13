@@ -139,10 +139,11 @@ void Character_declareDead_hook(Character* self)
 	Character_declareDead_orig(self);
 }
 
-// Real reactivation trigger - not yet wired to any in-game action (item use, dialogue option,
-// etc.). Unconditional release, not a readiness gate: health can't change at all while Deactivated
-// (medicalUpdate is frozen below), so a "was it repaired?" check here would be a permanent
-// deadlock. Healing happens normally after this releases the lock, not before.
+// Real reactivation trigger - wired to the confirmation panel below (shown when a repair kit is
+// used on a Deactivated character in the Skeleton Bed). Unconditional release, not a readiness
+// gate: health can't change at all while Deactivated (medicalUpdate is frozen below), so a "was it
+// repaired?" check here would be a permanent deadlock. Healing happens normally after this
+// releases the lock, not before.
 //
 // Reactivating with flesh still deep in fatal range would let medicalUpdate() immediately call
 // declareDead() again the moment it un-freezes - our hook would re-block it, snapping the
@@ -172,11 +173,85 @@ bool TryReactivate(Character* self)
 	g_deactivated.erase(self);
 	DebugLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
 
-	ScreenLabel* label = gui->createScreenLabel(self->_NV_getName() + " was revived!", MyGUI::Colour::Green, ScreenLabel::LS_MEDIUM, ScreenLabel::RS_SLOW);
-	if (label)
-		label->setTracking(self->getHandle(), Ogre::Vector3(0, 1, 0));
+	// ForgottenGUI::messageBox's button-flags int isn't documented in the RE'd headers - it's
+	// Kenshi's own wrapper, not stock MyGUI. Confirmed live: 0 crashes the game (rendered invalid
+	// placeholder "A"/"B"/"C" buttons); 1 is a real, dismissible single "OK" button.
+	gui->messageBox("Skeleton Rebirth", self->_NV_getName() + " was revived!", 1, false, nullptr);
 
 	return true;
+}
+
+// Confirmation panel shown instead of reactivating immediately - this is meant to be a deliberate
+// choice, not an automatic side effect of using a repair kit. Two different Kenshi-native
+// mechanisms were tried and abandoned first: ForgottenGUI::messageBox()'s button-flags int is an
+// undocumented bitmask that produced stuck, unclickable dialogs in several combinations tried;
+// Dialogue::runCustomDialog()/sendEvent() either just narrated straight through with no pause for
+// choice, or was silently rejected regardless of which EventTriggerEnum was used. Building the
+// panel directly from MyGUI's own real, documented widget/event API sidesteps both problems -
+// ForgottenGUI::createPanel()/createButton()/createLabel() and MyGUI::Widget::eventMouseButtonClick
+// are standard, well-understood mechanisms, not Kenshi-specific undocumented wrappers. Skin/layer
+// name strings ("Kenshi_FloatingPanelSkin", "Kenshi_Button2", "Kenshi_GenericTextBoxSkin", "Main")
+// were confirmed by searching the game's own binary for genuine, already-in-use resource names.
+static MyGUI::Window* g_activeConfirmPanel = nullptr;
+
+// Click handler for both Yes/No buttons - eventMouseButtonClick is a real MyGUI CMultiDelegate1,
+// which owns and deletes registered delegates itself once the widget it belongs to is destroyed
+// (destroying the panel destroys its child buttons, which destroys their delegate lists) - unlike
+// the messageBox callback's unclear ownership, no leak-vs-double-free guess needed here.
+class ReactivateChoiceDelegate : public MyGUI::delegates::IDelegate1<MyGUI::Widget*>
+{
+public:
+	ReactivateChoiceDelegate(Character* patient, bool isYes) : patient(patient), isYes(isYes) {}
+
+	virtual bool isType(const std::type_info& type) override
+	{
+		return typeid(ReactivateChoiceDelegate) == type;
+	}
+
+	virtual void invoke(MyGUI::Widget* sender) override
+	{
+		DebugLog(std::string("SkeletonRebirth: reactivation panel answered - ") + (isYes ? "Yes" : "No"));
+
+		if (isYes && TryReactivate(patient))
+			DebugLog("SkeletonRebirth: repair kit used in Skeleton Bed -> " + describe(patient));
+
+		if (g_activeConfirmPanel)
+		{
+			gui->destroyWidget(g_activeConfirmPanel);
+			g_activeConfirmPanel = nullptr;
+		}
+	}
+
+	virtual bool compare(MyGUI::delegates::IDelegate1<MyGUI::Widget*>* other) const override
+	{
+		return false;
+	}
+
+private:
+	Character* patient;
+	bool isYes;
+};
+
+static void showReactivateConfirmPanel(Character* patient)
+{
+	if (g_activeConfirmPanel)
+		return; // one at a time - avoid stacking panels if spammed
+
+	MyGUI::Window* panel = gui->createPanel("SkeletonRebirthConfirm", 0.35f, 0.35f, 0.3f, 0.2f, "Main", "Kenshi_FloatingPanelSkin");
+	if (!panel)
+		return;
+
+	g_activeConfirmPanel = panel;
+
+	gui->createLabel(panel, 0.05f, 0.05f, 0.9f, 0.4f, "Attempt to reactivate " + patient->_NV_getName() + "?", MyGUI::Align::Center);
+
+	MyGUI::Button* yesBtn = gui->createButton(panel, 0.55f, 0.1f, 0.35f, 0.3f, "SR_Yes", "Yes", "Kenshi_Button2");
+	if (yesBtn)
+		yesBtn->eventMouseButtonClick += new ReactivateChoiceDelegate(patient, true);
+
+	MyGUI::Button* noBtn = gui->createButton(panel, 0.55f, 0.55f, 0.35f, 0.3f, "SR_No", "No", "Kenshi_Button2");
+	if (noBtn)
+		noBtn->eventMouseButtonClick += new ReactivateChoiceDelegate(patient, false);
 }
 
 // --- Hook: MedicalSystem::applyFirstAid() - real reactivation trigger ------------------------
@@ -192,8 +267,8 @@ bool MedicalSystem_applyFirstAid_hook(MedicalSystem* self, float skill, Item* eq
 
 	if (patient && g_deactivated.count(patient) && equipment && equipment->itemFunction == ITEM_ROBOTREPAIR && isInSkeletonBed(patient))
 	{
-		if (TryReactivate(patient))
-			DebugLog("SkeletonRebirth: repair kit used in Skeleton Bed -> " + describe(patient));
+		showReactivateConfirmPanel(patient);
+		return true; // report handled (not failed) so the repair-kit use doesn't keep retrying while the panel is up - see ReactivateChoiceDelegate::invoke()
 	}
 
 	return MedicalSystem_applyFirstAid_orig(self, skill, equipment, frameTime, who);

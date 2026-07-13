@@ -3,8 +3,8 @@
 Robot-race characters (`RaceData::robot == true` — Skeletons, Iron Spiders, Soldierbot Guards,
 Security Spiders, etc.) never enter vanilla Dead state. Instead they collapse into a permanent
 KO/"Rebooting" **Deactivated** state, and can only be brought back by using a Skeleton Repair Kit
-on them while they're in a Skeleton Repair Bed. See [`DESIGN.md`](DESIGN.md) for the full design
-history, rejected approaches, and confirmed test results.
+on them while they're in a Skeleton Repair Bed and confirming a prompt. See [`DESIGN.md`](DESIGN.md)
+for the full design history, rejected approaches, and confirmed test results.
 
 ## What it does
 
@@ -14,7 +14,9 @@ Three hooks in `SkeletonRebirthDiagnostics.cpp`:
 |---|---|
 | `Character::declareDead()` | Blocked entirely for robots — clears `MedicalSystem::dead` instead of letting real death proceed, and marks the character Deactivated. |
 | `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely (no healing, no further deterioration, and stops `declareDead()` from re-firing). |
-| `MedicalSystem::applyFirstAid(...)` | The reactivation trigger. Reactivates a Deactivated character when a `ITEM_ROBOTREPAIR` item is used on them while they're in a bed with `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`. Applies a small (1%) nudge to head/torso `flesh` toward zero on success, just enough to stop an instant re-death — the character wakes up critically hurt and needs real treatment afterward. |
+| `MedicalSystem::applyFirstAid(...)` | The reactivation trigger. When a `ITEM_ROBOTREPAIR` item is used on a Deactivated character in a bed with `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, shows a confirmation panel ("Attempt to reactivate `<name>`?") instead of reactivating immediately. Clicking "Yes" calls `TryReactivate()`, which applies a small (1%) nudge to head/torso `flesh` toward zero — just enough to stop an instant re-death, not a full heal — and shows a one-button "was revived!" notification. |
+
+The confirmation panel is built directly from MyGUI's own widget/event API (`ForgottenGUI::createPanel`/`createButton`/`createLabel`, real `eventMouseButtonClick` delegates) rather than any of Kenshi's own dialog mechanisms — both `ForgottenGUI::messageBox()` (undocumented button-flags bitmask, several combinations crashed or produced stuck unclickable dialogs) and `Dialogue::runCustomDialog()`/`sendEvent()` (narrated instead of pausing for choice, or was silently rejected) were tried and abandoned first. See DESIGN.md Status section for the full story.
 
 `Character::update()` is deliberately **not** hooked — see DESIGN.md Status section for why.
 

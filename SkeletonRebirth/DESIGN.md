@@ -113,6 +113,46 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   `g_deactivated` checks it's sufficient. **`BF_SKELETON_BED` is confirmed `25`** via live
   `bedSpecialFunction`/`isSkeletonBed` logging - an earlier note in this doc had guessed `150`
   from FCS inspection; that guess was wrong, this value is the actual compiled constant.
+- **CONFIRMED — revival success notification uses `ForgottenGUI::messageBox(title, message, btn,
+  modal, callback)`** (global `gui` pointer, `kenshi/Globals.h`), a real titled dialog window -
+  tried a `ScreenLabel` floating-text popup first, but it read identically to routine pickup/snack
+  notifications, so switched to a real dialog for something categorically more prominent. The
+  `btn` int is Kenshi's own undocumented convention (not stock MyGUI, not in the RE'd headers):
+  **`0` crashes the game** (rendered broken placeholder "A"/"B"/"C" buttons - looks like an
+  invalid-index fallback, not a bitmask); **`1` is confirmed safe and renders a single dismissible
+  "OK" button** - used for this one-button notification only. `MyGUIEngine_x64.lib` needs to be on
+  the link line (`MyGUI::Colour`'s constructor lives there, not in `KenshiLib.lib`).
+- **CONFIRMED — reactivation confirmation is a self-built MyGUI panel, not a Kenshi-native
+  dialog.** Before reactivating, the player is asked "Attempt to reactivate `<name>`?" via a
+  panel built directly from `ForgottenGUI::createPanel()`/`createButton()`/`createLabel()` and real
+  MyGUI `Widget::eventMouseButtonClick` delegates - "Yes" triggers `TryReactivate()`, "No" just
+  closes the panel. This is deliberately *not* the same mechanism as the notification above,
+  because multi-button `messageBox()` proved unusable: extensive live testing found `btn` is an
+  undocumented bitmask where every combination *without* bit `1` present rendered stuck,
+  unclickable buttons (`2` alone = unclickable "Yes"; `2|4` = unclickable "Yes"+"No") and `0`
+  alone crashed the game outright. A separate attempt to trigger an interactive reply through
+  `Dialogue::runCustomDialog()`/`sendEvent()` was also abandoned: `runCustomDialog()` just narrates
+  every line back-to-back with no pause for player choice (seemingly meant for scripted
+  monologues), and `sendEvent()` returned `false` (rejected) for every `EventTriggerEnum` tried
+  (`EV_ALMOST_WOKE_UP`, `EV_BEING_HEALED_START`), for reasons that couldn't be pinned down without
+  a proper disassembler (plain `objdump` wasn't enough to trace the real branch logic). Building
+  the panel from MyGUI's own standard, documented widget/event API sidestepped all of this - it's
+  genuine open-source MyGUI code, not a Kenshi-specific undocumented wrapper. The skin/layer name
+  strings used (`"Kenshi_FloatingPanelSkin"`, `"Kenshi_Button2"`, `"Main"`) were confirmed by
+  searching the game's own binary (`strings`/`objdump` on `kenshi_x64.exe`'s `.rdata` section) for
+  genuine, already-in-use resource names - not guessed.
+- **Tried and reverted — interrupting the treater's repair action so the item isn't wasted while
+  the panel is open.** The panel blocks `applyFirstAid()`'s real effect via its return value
+  (returns `true` instead of `false`, since `false` seemed to make the game keep retrying), but the
+  visible "Repairing" action/animation itself kept running regardless. Tried
+  `OrdersReceiver::removeJob(JOB_REPAIR_ROBOT)` (targeted, confirmed real `TaskType`) - no effect.
+  Tried the broader `AITaskSytem::clearAllTasks()` - also no effect (confirmed via logging that the
+  *target* character was correct; `goalString` stayed `"Repairing"` across every tick regardless of
+  the interrupt call, meaning the AI just immediately re-selects the same action rather than the
+  interrupt failing to reach it) - and on a later attempt this combination left the confirmation
+  panel permanently stuck/unclickable. Both interrupt attempts were removed; the panel now only
+  blocks the *effect*, not the *action* - the repair-kit animation may still play out while the
+  panel is open, a known cosmetic limitation, not a correctness problem.
 
 **RESOLVED — cleanup (§3, secondary feature):** `Character::updateOnScreenCheck()` is a confirmed
 viable trigger. Over one ~260s test session it logged exactly one clean on/off transition each for
@@ -218,7 +258,7 @@ Logic at whichever hook fires, for Deactivated skeletons only:
 - No scheduler or timer thread needs to be built - this piggybacks entirely on hooks that already
   fire for other reasons.
 
-### 4. Revival — DECIDED and wired: Skeleton Repair Bed + repair kit item
+### 4. Revival — DECIDED and wired: Skeleton Repair Bed + repair kit item + player confirmation
 
 Item-based, not dialogue-based (dialogue was only ever used historically because it was the only
 option available - an item trigger is cleaner). `TryReactivate()` is an unconditional release (see
@@ -227,6 +267,11 @@ Status) called from a hook on `MedicalSystem::applyFirstAid()`, gated on: charac
 `Building::_NV_getSpecialFunction() == BF_SKELETON_BED` (confirmed `25`). No readiness/health
 check - health is frozen while Deactivated, so nothing to gate on; healing happens normally via
 the bed after reactivation releases the freeze.
+
+Reactivation additionally requires an explicit player choice: instead of calling `TryReactivate()`
+directly, the hook shows a self-built MyGUI confirmation panel ("Attempt to reactivate `<name>`?"
+with Yes/No buttons) and only reactivates if the player clicks Yes. See the Status section for the
+full story of why this is a hand-built panel rather than one of Kenshi's own dialog mechanisms.
 
 ## Confirmed from testing (SkeletonRebirthDiagnostics)
 
@@ -350,4 +395,30 @@ the bed after reactivation releases the freeze.
 - `GameWorld::getTimeFromStamp_inGameHours(double)` — GameWorld.h:237
 - `ZoneMap::isActive()` — ZoneManager.h:228
 - `ZoneManager::getAllActiveZones()` — ZoneManager.h:336
+- `ForgottenGUI* gui` — global singleton, `Globals.h` (`__declspec(dllimport)`)
+- `ForgottenGUI::messageBox(title, message, btn, modal, callback)` — gui/ForgottenGUI.h:70
+  (RVA 0x740F60 - used only for the single-button success notification, see Status)
+- `ForgottenGUI::createPanel(name, top, left, width, height, layer, skin)` — gui/ForgottenGUI.h:177
+  (returns `MyGUI::Window*`; confirmed non-placeholder export)
+- `ForgottenGUI::createButton(parent, top, left, width, height, name, text, skin)` —
+  gui/ForgottenGUI.h:184 (returns `MyGUI::Button*`; confirmed non-placeholder export)
+- `ForgottenGUI::createLabel(parent, top, left, width, height, text, align)` —
+  gui/ForgottenGUI.h:191 (returns `MyGUI::TextBox*`; confirmed non-placeholder export - there's a
+  second overload returning `EditBox*` that takes a skin string instead of `MyGUI::Align`, not
+  the one used)
+- `ForgottenGUI::destroyWidget(MyGUI::Widget*)` — gui/ForgottenGUI.h:121
+- `MyGUI::Widget::eventMouseButtonClick` — mygui/MyGUI_WidgetInput.h:169, type
+  `CMultiDelegate1<Widget*>` - real stock MyGUI delegate, header-only/inline, owns and deletes
+  registered delegates itself on widget destruction (unlike Kenshi's own `messageBox` callback,
+  whose ownership is undocumented)
+- `MyGUI::Align::Center` — mygui/MyGUI_Align.h:25, header-only constant
+- Skin/layer name strings confirmed genuine by searching `kenshi_x64.exe`'s `.rdata` section
+  directly (`objdump -h`/`dd`/`strings`, not FCS or headers): `"Kenshi_FloatingPanelSkin"`,
+  `"Kenshi_Button2"`, `"Kenshi_GenericTextBoxSkin"`, `"Main"` (layer)
+- `OrdersReceiver::removeJob(TaskType)` / `AITaskSytem::clearAllTasks()` — AI/AITaskSystem.h -
+  **tried and reverted**, see Status; both are real, confirmed-linkable methods, but neither
+  stopped the treater's repair action from continuing, and `clearAllTasks()` caused a
+  confirmation-panel-stuck regression once - do not reintroduce without solving that first
+- `TaskType::JOB_REPAIR_ROBOT` — Enums.h:336 (confirmed real, but removing this specific job had
+  no observable effect - see Status)
 - Existing hook pattern to follow — `/home/bryan/Git/KenshiLimbs/The Limbless (Type 2)/RobotLimbRaceLock.cpp`
