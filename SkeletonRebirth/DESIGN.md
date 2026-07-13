@@ -122,11 +122,11 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   invalid-index fallback, not a bitmask); **`1` is confirmed safe and renders a single dismissible
   "OK" button** - used for this one-button notification only. `MyGUIEngine_x64.lib` needs to be on
   the link line (`MyGUI::Colour`'s constructor lives there, not in `KenshiLib.lib`).
-- **CONFIRMED — reactivation confirmation is a self-built MyGUI panel, not a Kenshi-native
-  dialog.** Before reactivating, the player is asked "Attempt to reactivate `<name>`?" via a
+- **SUPERSEDED — reactivation confirmation was a self-built MyGUI panel, not a Kenshi-native
+  dialog.** Before reactivating, the player was asked "Attempt to reactivate `<name>`?" via a
   panel built directly from `ForgottenGUI::createPanel()`/`createButton()`/`createLabel()` and real
-  MyGUI `Widget::eventMouseButtonClick` delegates - "Yes" triggers `TryReactivate()`, "No" just
-  closes the panel. This is deliberately *not* the same mechanism as the notification above,
+  MyGUI `Widget::eventMouseButtonClick` delegates - "Yes" triggered `TryReactivate()`, "No" just
+  closed the panel. This was deliberately *not* the same mechanism as the notification above,
   because multi-button `messageBox()` proved unusable: extensive live testing found `btn` is an
   undocumented bitmask where every combination *without* bit `1` present rendered stuck,
   unclickable buttons (`2` alone = unclickable "Yes"; `2|4` = unclickable "Yes"+"No") and `0`
@@ -136,11 +136,116 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   monologues), and `sendEvent()` returned `false` (rejected) for every `EventTriggerEnum` tried
   (`EV_ALMOST_WOKE_UP`, `EV_BEING_HEALED_START`), for reasons that couldn't be pinned down without
   a proper disassembler (plain `objdump` wasn't enough to trace the real branch logic). Building
-  the panel from MyGUI's own standard, documented widget/event API sidestepped all of this - it's
-  genuine open-source MyGUI code, not a Kenshi-specific undocumented wrapper. The skin/layer name
-  strings used (`"Kenshi_FloatingPanelSkin"`, `"Kenshi_Button2"`, `"Main"`) were confirmed by
-  searching the game's own binary (`strings`/`objdump` on `kenshi_x64.exe`'s `.rdata` section) for
-  genuine, already-in-use resource names - not guessed.
+  the panel from MyGUI's own standard, documented widget/event API sidestepped all of this at the
+  time - it's genuine open-source MyGUI code, not a Kenshi-specific undocumented wrapper. Replaced
+  below by a proper FCS dialogue hook once a better native entry point was found.
+- **NOT YET LIVE-TESTED — replaced the MyGUI panel with a real FCS dialogue via
+  `Dialogue::startPlayerConversation(Character* target, DialogLineData* _talk)`
+  (`Dialogue.h:390`, RVA `0x683BA0`).** This is a different, previously-untried native entry point
+  from the `runCustomDialog()`/`sendEvent()` dead ends above - it's the function vanilla itself
+  uses to open an actual interactive player conversation (choices, not just narration). It's
+  labelled `private` in the RE'd header, but that label is documentation-only: KenshiLib's headers
+  never actually add a C++ `private:`/`protected:` keyword anywhere in `Dialogue.h` (confirmed by
+  grepping the file - every member ends up compiled as public), and the linked `KenshiLib.lib`
+  exports a real callable thunk for it regardless
+  (`Source/kenshi/functions/Dialogue.inc:294`, mangled name `?startPlayerConversation@Dialogue@@QEAA_N...`
+  - the `Q` in the mangling itself means the *original* Kenshi source really did declare this
+  public, so the RE header's "private" tag looks like a tooling misclassification, not a real
+  restriction). So it's directly callable with no hooking/raw-RVA tricks needed:
+  `patient->dialogue->startPlayerConversation(playerCharacter, dialogLineDataRoot)`.
+  `showReactivateDialogue()` in `SkeletonRebirthDiagnostics.cpp` resolves `dialogLineDataRoot` via
+  `ou->gamedata.getData(SR_REACTIVATE_DIALOGUE_ID, DIALOGUE)` then `DialogDataManager::getData(...)`,
+  and a new `Dialogue::replyClicked(int)` hook (fully public, RVA `0x683670`) reads back which
+  reply was picked by checking `dialogue->currentLine->getStringID()` against a known "Yes" reply
+  ID after letting the real `replyClicked()` run first. Points (1)-(3) below still need live
+  confirmation: (1) `startPlayerConversation()` actually opens the native dialogue window when
+  called from inside the `applyFirstAid()` hook's call context; (2) `currentLine` has already
+  advanced to the clicked reply's own line by the time the hooked `replyClicked()` returns, not to
+  some later auto-advanced line; (3) `conversationHasEnded()` is actually false while our dialogue
+  is active (used as the "don't stack a second start" guard).
+  **FCS content has been authored** under this mod: the "Attempt to reactivate `<name>`?" line with
+  two player-reply children, and its "Yes" reply line. Both ended up with FCS's own auto-assigned
+  String IDs rather than custom strings - `11-Skeleton Rebirth.mod` (dialogue) and
+  `12-Skeleton Rebirth.mod` (Yes reply), FCS's default `"<index>-<mod filename>.mod"` format -
+  hardcoded as `SR_REACTIVATE_DIALOGUE_ID`/`SR_REACTIVATE_YES_REPLY_ID` in the .cpp. **Risk to
+  flag**: since these weren't custom-named, deleting and recreating either node in FCS (or renaming
+  the mod file) will likely assign different IDs and silently break the lookup - the constants
+  would need updating to match.
+  **CONFIRMED BUG, FIXED — FCS's dialogue editor never creates a standalone `itemType::DIALOGUE`
+  GameData object at all.** First live test logged `getReactivateDialogueRoot()` failing on every
+  single call (`ou->gamedata.getData(id, DIALOGUE)` always returned null, spamming ~1300
+  "not found" errors in under a second - `applyFirstAid()` re-fires continuously while the repair
+  action animation plays, same as the earlier-documented ~75-137 calls/sec pattern, and nothing
+  gated the retries because the lookup never got far enough to start a conversation and make
+  `conversationHasEnded()` false). Root cause, confirmed by grepping the compiled `.mod` file's
+  string table directly: every node FCS creates for a dialogue tree - the initial line and each
+  reply alike - is tagged `DIALOGUE_LINE`, never `DIALOGUE`. Fixed by looking up with
+  `itemType::DIALOGUE_LINE` instead.
+  **CONFIRMED PROGRESS, CONFIRMED BUG #2, FIXED — `startPlayerConversation()` genuinely opens the
+  native dialogue window.** After the `DIALOGUE_LINE` fix, live-tested end to end: the FCS dialogue
+  window popped up correctly with the "Attempt to reactivate" prompt and a clickable "Yes" - this
+  confirms open question (1) from above. But clicking "Yes" did **not** trigger `TryReactivate()`
+  (no flesh nudge, no "was revived!" notification) - `Dialogue::replyClicked` is overloaded
+  (`Dialogue.h:378-379`: `replyClicked(const std::string&)` and `replyClicked(int)`), and only the
+  `int` overload was hooked. The native `DialogueWindow` almost certainly calls replies by their
+  string reply ID (`Dialogue::replyIds` is a `vector<std::string>`), not a numeric index, so the
+  hooked overload most likely never fired at all. Fixed by hooking **both** overloads
+  (`handleDialogueReplyClicked()` shared by both) and logging unconditionally on every fire - not
+  just on a Yes match - specifically to get hard evidence next test of which overload actually
+  fires and what `currentLine->getStringID()` looks like, which will also settle open questions (2)
+  and (3) from above.
+  **CONFIRMED BUG #3, FIXED — both overloads do fire (string then int, same timestamp - `int` looks
+  like an internal wrapper around `string`), but `currentLine` was already `null` by the time either
+  hook resumed.** Our Yes/No replies are terminal (no further child lines), so the conversation
+  ends and clears state (`_endPlayerConversation`) inside `replyClicked()` itself, before the hook
+  gets to inspect `currentLine` - checking post-call state was the wrong approach entirely, not
+  just the wrong overload. Fixed by using the string overload's own `index` parameter directly
+  instead of reading any post-call state - on the hypothesis that it already *is* the clicked
+  reply's FCS String ID, since it lines up with `Dialogue::replyIds` being a `vector<std::string>`.
+  The `int` overload's `index` is resolved to a reply ID via `self->replyIds[index]` *before*
+  calling the original, same reasoning - don't trust any Dialogue state read after the real
+  `replyClicked()` runs.
+  **CONFIRMED WORKING END TO END.** Live-tested and logged the full chain in order, same timestamp:
+  `replyClicked(string) fired -> reply="12-Skeleton Rebirth.mod"` (hypothesis confirmed - the string
+  overload's parameter genuinely is the clicked reply's FCS String ID, no `currentLine`/state
+  inspection needed at all) -> `TryReactivate() SUCCEEDED` (torso `isDead` flipped `1` -> `0`,
+  flesh nudged as expected) -> the repair-kit-in-bed log line. This settles all three open questions
+  from the "NOT YET LIVE-TESTED" entry above: `startPlayerConversation()` opens the window correctly
+  from inside the `applyFirstAid()` hook, the reply-detection mechanism works (once fixed to not
+  depend on post-call `currentLine`), and `conversationHasEnded()` behaves as expected for the
+  re-entrancy guard (no stuck/duplicate dialogues observed across repeated tests).
+  **Notification changed twice**: `TryReactivate()`'s modal `gui->messageBox(...)` ("`<name>` was
+  revived!") was first removed outright (reasoning: the dialogue exchange already got the player's
+  attention, a second modal on top felt redundant), then replaced with the exact mechanism this
+  plugin used *before* the messageBox existed at all - `ForgottenGUI::createScreenLabel(text,
+  colour, size, risingSpeed)` (`gui/ForgottenGUI.h:206`, RVA `0x73E920`) plus
+  `ScreenLabel::setTracking(handle, offset)` (`gui/ScreenLabel.h:49`), producing floating green text
+  tracking the character - the same visual language as Kenshi's own stat-increase/pickup
+  notifications. This was tried first, historically, then dropped in favour of the modal
+  `messageBox` specifically because a modal read as more prominent (see the "revival success
+  notification" entry above) - now that the FCS dialogue exchange itself is what gets the player's
+  attention, that prominence isn't needed and the original, more understated `ScreenLabel` is the
+  better fit again. `ScreenLabel`'s constructor is labelled `protected` in the RE'd header, same
+  documentation-only situation as `Dialogue::startPlayerConversation` (no real `private:`/
+  `protected:` in `ScreenLabel.h`) - moot anyway since `createScreenLabel()` itself is a genuinely
+  public factory method.
+  **Notification text is now FCS-authored, not hardcoded** - `SR_REACTIVATE_REVIVED_MESSAGE_ID`
+  (`"18-Skeleton Rebirth.mod"`, same FCS auto-assigned ID situation as the dialogue/reply IDs above)
+  is resolved via the same `GameData` -> `DialogLineData` chain (factored out into a shared
+  `getFcsDialogLine()` helper, reused by `getReactivateDialogueRoot()` too), then
+  `DialogLineData::getText(false)` (`Dialogue.h:246`) gets its raw text and
+  `Dialogue::insertWordSwaps(text, target, swapMeYou, line)` (`Dialogue.h:333`, public) resolves any
+  `/PLACEHOLDER/`-style tokens (this mod's own dialogue text already uses `/MYNAME/`, confirmed via
+  the `.mod` file's string table) against `self` as both speaker and target. **Not yet live-tested**
+  - specifically the `insertWordSwaps()` call, since it's normally invoked internally by the native
+  dialogue flow (`Dialogue::say()`/`sayLine()`), not by plugin code fetching a line's text outside
+  of an active conversation. **No fallback text** - if the FCS line isn't found, the notification is
+  simply skipped entirely (an `ErrorLog` still fires, same "log and no-op" pattern as
+  `getReactivateDialogueRoot()`'s handling of a missing dialogue) rather than showing a hardcoded
+  string that could drift from the FCS-authored wording.
+  Skin/layer name strings from the old panel
+  (`"Kenshi_FloatingPanelSkin"`, `"Kenshi_Button2"`, `"Main"`) are no longer used now that the
+  native dialogue window handles its own UI.
 - **Tried and reverted — interrupting the treater's repair action so the item isn't wasted while
   the panel is open.** The panel blocks `applyFirstAid()`'s real effect via its return value
   (returns `true` instead of `false`, since `false` seemed to make the game keep retrying), but the
@@ -153,6 +258,41 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   panel permanently stuck/unclickable. Both interrupt attempts were removed; the panel now only
   blocks the *effect*, not the *action* - the repair-kit animation may still play out while the
   panel is open, a known cosmetic limitation, not a correctness problem.
+- **CONFIRMED WORKING — third attempt at interrupting the treater's repair action, this time
+  because it's no longer just cosmetic.** The dialogue-based confirmation (see above) surfaced a
+  real correctness bug the MyGUI panel's structure happened to avoid: `applyFirstAid()` re-fires
+  continuously for the same physical action (same root cause as the two reverted attempts above -
+  returning `true` without running the real effect means the underlying task never sees its normal
+  completion signal), and while `TryReactivate()` (on "Yes") removes the patient from
+  `g_deactivated` so later calls stop matching on their own, clicking "No" leaves the patient in
+  `g_deactivated` - the very next `applyFirstAid()` tick sees the dialogue already ended (`No`
+  answers are terminal too) and pops a fresh one right back open, over and over, for as long as the
+  action keeps re-firing. `removeJob()` and `clearAllTasks()` were already ruled out (see above,
+  and `clearAllTasks()`'s stuck-panel side effect specifically). This attempt is different in kind,
+  not just a retry: `AITaskSytem::_notifyBodyTaskComplete()` (`AI/AITaskSystem.h:219`, public, RVA
+  `0x50BFB0`), called on **`who` (the treater passed into `applyFirstAid()`), not the patient** -
+  the treater is the one whose AI is actually looping the action, the patient is KO'd and has no
+  driving goal of its own. The theory: this is the AI's own natural "this body action just finished"
+  signal (what would fire on a real completed repair), so it should end the current goal cleanly
+  and let the AI re-evaluate, rather than wiping the task queue (`clearAllTasks()`) or marking the
+  goal a failure to be avoided (`taskImpossible()`, deliberately not used here for that reason -
+  untested but risked either blacklisting future automatic repair attempts or producing the same
+  kind of stuck state `clearAllTasks()` did). Implemented as `notifyTreaterActionComplete()`, called
+  every time the trigger condition matches in `MedicalSystem_applyFirstAid_hook`.
+  Live-tested end to end: clicking "No" (FCS reply ID `13-Skeleton Rebirth.mod`) produced exactly
+  one `replyClicked` log line with no repeated re-opening afterward - confirming the fix. A later,
+  separate deliberate repair-kit use 9 seconds after that opened a fresh dialogue normally and
+  reactivated cleanly (torso `isDead` flipped `1` -> `0`, no stray re-`declareDead()`), confirming
+  the interrupt doesn't block legitimate later attempts either.
+  **Separately confirmed NOT a regression from this fix**: an earlier test in this same session saw
+  `TryReactivate()` succeed and then `declareDead()` re-fire ~10ms later, looking like "revival
+  doesn't work." Turned out to be the pre-existing, already-documented "third death path" mystery
+  (see Confirmed-from-testing below) - that character's *original* deactivation already showed
+  `torso flesh=200, isDead=0` (nowhere near the normal `-200` threshold), the exact signature of
+  that unsolved bug, not something introduced today. `TryReactivate()` only nudges flesh, which does
+  nothing for whatever hidden condition drives that path, so it's expected to immediately re-fire in
+  that specific scenario regardless of any dialogue/AI-task changes. Confirmed unrelated once a
+  normal low-flesh deactivation reactivated cleanly with the exact same code.
 
 **RESOLVED — cleanup (§3, secondary feature):** `Character::updateOnScreenCheck()` is a confirmed
 viable trigger. Over one ~260s test session it logged exactly one clean on/off transition each for
@@ -260,18 +400,21 @@ Logic at whichever hook fires, for Deactivated skeletons only:
 
 ### 4. Revival — DECIDED and wired: Skeleton Repair Bed + repair kit item + player confirmation
 
-Item-based, not dialogue-based (dialogue was only ever used historically because it was the only
-option available - an item trigger is cleaner). `TryReactivate()` is an unconditional release (see
-Status) called from a hook on `MedicalSystem::applyFirstAid()`, gated on: character is in
-`g_deactivated`, item used has `itemFunction == ITEM_ROBOTREPAIR`, and character is in a bed with
+Item-triggered: the *trigger* is a repair kit used in the Skeleton Repair Bed, not a dialogue.
+`TryReactivate()` is an unconditional release (see Status) called from a hook on
+`MedicalSystem::applyFirstAid()`, gated on: character is in `g_deactivated`, item used has
+`itemFunction == ITEM_ROBOTREPAIR`, and character is in a bed with
 `Building::_NV_getSpecialFunction() == BF_SKELETON_BED` (confirmed `25`). No readiness/health
 check - health is frozen while Deactivated, so nothing to gate on; healing happens normally via
 the bed after reactivation releases the freeze.
 
-Reactivation additionally requires an explicit player choice: instead of calling `TryReactivate()`
-directly, the hook shows a self-built MyGUI confirmation panel ("Attempt to reactivate `<name>`?"
-with Yes/No buttons) and only reactivates if the player clicks Yes. See the Status section for the
-full story of why this is a hand-built panel rather than one of Kenshi's own dialog mechanisms.
+Reactivation additionally requires an explicit player choice, and *that* confirmation step is now
+dialogue-based: instead of calling `TryReactivate()` directly, the hook starts a real FCS dialogue
+("Attempt to reactivate `<name>`?" with Yes/No replies) via `Dialogue::startPlayerConversation()`
+and only reactivates if the player picks the reply tagged as "Yes" (read back via a
+`Dialogue::replyClicked()` hook). See the Status section for the full story, including why an
+earlier version used a hand-built MyGUI panel instead, and what FCS content and live testing this
+still needs.
 
 ## Confirmed from testing (SkeletonRebirthDiagnostics)
 
@@ -398,23 +541,41 @@ full story of why this is a hand-built panel rather than one of Kenshi's own dia
 - `ForgottenGUI* gui` — global singleton, `Globals.h` (`__declspec(dllimport)`)
 - `ForgottenGUI::messageBox(title, message, btn, modal, callback)` — gui/ForgottenGUI.h:70
   (RVA 0x740F60 - used only for the single-button success notification, see Status)
-- `ForgottenGUI::createPanel(name, top, left, width, height, layer, skin)` — gui/ForgottenGUI.h:177
-  (returns `MyGUI::Window*`; confirmed non-placeholder export)
-- `ForgottenGUI::createButton(parent, top, left, width, height, name, text, skin)` —
-  gui/ForgottenGUI.h:184 (returns `MyGUI::Button*`; confirmed non-placeholder export)
-- `ForgottenGUI::createLabel(parent, top, left, width, height, text, align)` —
-  gui/ForgottenGUI.h:191 (returns `MyGUI::TextBox*`; confirmed non-placeholder export - there's a
-  second overload returning `EditBox*` that takes a skin string instead of `MyGUI::Align`, not
-  the one used)
-- `ForgottenGUI::destroyWidget(MyGUI::Widget*)` — gui/ForgottenGUI.h:121
-- `MyGUI::Widget::eventMouseButtonClick` — mygui/MyGUI_WidgetInput.h:169, type
-  `CMultiDelegate1<Widget*>` - real stock MyGUI delegate, header-only/inline, owns and deletes
-  registered delegates itself on widget destruction (unlike Kenshi's own `messageBox` callback,
-  whose ownership is undocumented)
-- `MyGUI::Align::Center` — mygui/MyGUI_Align.h:25, header-only constant
-- Skin/layer name strings confirmed genuine by searching `kenshi_x64.exe`'s `.rdata` section
-  directly (`objdump -h`/`dd`/`strings`, not FCS or headers): `"Kenshi_FloatingPanelSkin"`,
-  `"Kenshi_Button2"`, `"Kenshi_GenericTextBoxSkin"`, `"Main"` (layer)
+- **Superseded, no longer called — kept for historical reference only (the reactivation prompt is
+  now the FCS dialogue system, see Status):**
+  - `ForgottenGUI::createPanel(name, top, left, width, height, layer, skin)` — gui/ForgottenGUI.h:177
+  - `ForgottenGUI::createButton(parent, top, left, width, height, name, text, skin)` — gui/ForgottenGUI.h:184
+  - `ForgottenGUI::createLabel(parent, top, left, width, height, text, align)` — gui/ForgottenGUI.h:191
+  - `ForgottenGUI::destroyWidget(MyGUI::Widget*)` — gui/ForgottenGUI.h:121
+  - `MyGUI::Widget::eventMouseButtonClick` — mygui/MyGUI_WidgetInput.h:169
+  - `MyGUI::Align::Center` — mygui/MyGUI_Align.h:25
+  - Skin/layer name strings (`"Kenshi_FloatingPanelSkin"`, `"Kenshi_Button2"`,
+    `"Kenshi_GenericTextBoxSkin"`, `"Main"`)
+- `Dialogue* Character::dialogue` — Character.h:492 (0x280 Member) - every `Character` owns one
+- `Dialogue::startPlayerConversation(Character* target, DialogLineData* _talk)` — Dialogue.h:390
+  (RVA 0x683BA0 - opens the real interactive dialogue window; see Status for the "private" label
+  being documentation-only, not a real access restriction)
+- `Dialogue::startConversation(Character* target, DialogLineData* _talk, EventTriggerEnum ev, bool force)`
+  — Dialogue.h:391 (RVA 0x683810 - lower-level generic starter, not currently used; `startPlayerConversation`
+  covers our case)
+- `Dialogue::replyClicked(int index)` — Dialogue.h:379 (RVA 0x683670, public - hooked to read back
+  the player's reply)
+- `Dialogue::conversationHasEnded() const` — Dialogue.h:355 (RVA 0x6714E0 - used as the "don't
+  start a second conversation on top of one already running" guard)
+- `Dialogue::me` / `Dialogue::currentLine` — Dialogue.h:395,401 (0x150/0x198 Members - `me` is the
+  Dialogue's owning `Character*`, i.e. the patient, not the player)
+- `DialogLineData::getStringID() const` — Dialogue.h:248 (RVA 0x6A12E0 - the FCS "String ID" field
+  set per-line in FCS; used to detect the "Yes" reply)
+- `DialogDataManager::getData(GameData* d)` — Dialogue.h:443 (RVA 0x6AD120, static - converts an
+  FCS Dialogue `GameData*` into the `DialogLineData*` tree `startPlayerConversation` needs)
+- `GameDataContainer::getData(const std::string& sid, itemType category)` — GameDataManager.h:28
+  (RVA 0x6BF420 - resolves an FCS String ID + category to a `GameData*`; called as
+  `ou->gamedata.getData(sid, DIALOGUE)`)
+- `GameWorld::gamedata` — GameWorld.h:97 (0x20 Member, type `GameDataManager`) - reached via the
+  global `ou` (`Globals.h`)
+- `PlayerInterface::getAnyPlayerCharacter() const` — PlayerInterface.h:177 (RVA 0x7F19B0) - reached
+  via the global `ou->player`
+- `itemType::DIALOGUE` — Enums.h:24, one value of the `itemType` category enum passed to `getData()`
 - `OrdersReceiver::removeJob(TaskType)` / `AITaskSytem::clearAllTasks()` — AI/AITaskSystem.h -
   **tried and reverted**, see Status; both are real, confirmed-linkable methods, but neither
   stopped the treater's repair action from continuing, and `clearAllTasks()` caused a
