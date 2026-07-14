@@ -39,9 +39,18 @@ the item used has `itemFunction == ITEM_ROBOTREPAIR`, and the patient is in a be
 `Building::_NV_getSpecialFunction() == BF_SKELETON_BED` (`25`) — instead of reactivating immediately,
 it opens a real FCS dialogue confirmation via `Dialogue::startPlayerConversation(target, root)`
 (`Dialogue.h:390`), where `root` is resolved from the hardcoded `SR_REACTIVATE_DIALOGUE_ID` FCS String
-ID. `AITaskSytem::_notifyBodyTaskComplete()` is called on the treater (not the patient) so the
-underlying repair-kit-use action ends cleanly instead of re-firing `applyFirstAid()` every tick while
-the dialogue is open.
+ID.
+
+`applyFirstAid()` re-fires many times per second for one continuous repair-kit-use action (the
+treater's AI calls it every tick the animation plays). The dialogue is only opened once per "ask and
+await an answer" cycle, gated by `g_reactivateDialogueShown` (keyed by patient) — checked directly in
+`MedicalSystem_applyFirstAid_hook` before ever calling `showReactivateDialogue()`, not by trying to stop
+the underlying repair action at the right moment (that approach is racy: the action can re-fire again
+before a stop signal takes effect, reopening the dialogue immediately). The flag is cleared once the
+cycle genuinely concludes — reactivated, or declined with no `delay` still pending toward reactivating
+— so a later, distinct repair-kit-use can prompt again. `AITaskSytem::_notifyBodyTaskComplete()` is
+called on the treater (not the patient) at that same conclusion point, ending the repair animation
+cleanly instead of leaving it stuck or wiping the task queue - see `notifyTreaterActionComplete()`.
 
 `TryReactivate()` does the actual state change: nudges each part's `flesh` 1% toward zero (enough to
 clear whatever makes `HealthPartStatus::isDead()` stick, not a full heal — the character wakes up
@@ -70,17 +79,27 @@ mod's own — can be tagged with one or more named overrides:
 }
 ```
 
-Three override types:
+Four override types:
 
 | `type` | Params | Purpose |
 |---|---|---|
-| `reactivate_skeleton` | *(none)* | Calls `TryReactivate()`. |
+| `reactivate_skeleton` | *(none)* | Calls `TryReactivate()`; on success also stops the treater's repair animation and clears `g_reactivateDialogueShown` (see §2) — placing a `delay` before this in the JSON keeps the treater visibly working for the full delay instead of stopping early. |
 | `take_item` | `item` — the item's own FCS String ID | Takes one of that item from whoever clicked the reply. |
 | `show_text` | `string` (`/MYNAME/` replaced with the character's name); `color` | Floating colored text tracking the character, same visual language as Kenshi's own stat-increase/pickup notifications. |
+| `delay` | `seconds` (fractional allowed) | Pauses this reply's remaining overrides for that long before continuing. |
 
 `show_text`'s `color` accepts a named constant (`Red`/`Green`/`Blue`/`Black`/`White`), `"#RRGGBB"` hex
 (`#` optional), or raw `"R,G,B"` (each 0-255). Unrecognized values fall back to `White` and log an
 error.
+
+`delay` is special-cased in `dispatchConversationOverridesFrom()` rather than registered as a normal
+`OverrideHandler` - handlers perform one action and return, but a delay needs to suspend the whole
+remaining sequence and resume it later, which the handler interface has no way to express. When the
+dispatch loop hits a `delay`, it records a `PendingOverrideSequence` (patient, initiator, replyId, and
+the index to resume at) keyed by patient, and returns without processing the rest of the list.
+`Dialogue::update()` (already hooked for the Yes/No buffering commit below) decrements
+`remainingSeconds` every frame it fires for that patient - which happens regardless of whether a
+conversation is currently active - and resumes dispatch from the saved index once it reaches zero.
 
 `Dialogue::replyClicked` is hooked (both the `int` and `const std::string&` overloads — the native
 dialogue window calls both for a single click, but only the `string` overload's parameter is trusted

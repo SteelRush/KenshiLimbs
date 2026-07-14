@@ -71,6 +71,15 @@ static bool isRobotRace(Character* c)
 // version (see DESIGN.md §2), since Character* doesn't survive across sessions.
 static std::map<Character*, bool> g_deactivated;
 
+// Set once the reactivation dialogue has been opened for a patient, cleared once that "ask and await
+// an answer" cycle has genuinely concluded (see the clearing site in Dialogue_update_hook). Gates
+// showReactivateDialogue()'s caller directly, rather than relying on stopping the treater's repair
+// task at the right moment - applyFirstAid() re-fires many times per second for one continuous
+// repair-kit-use action, and stopping the underlying AI task is inherently racy (it can re-fire again
+// before the stop signal takes effect). This flag makes "only ask once per cycle" independent of that
+// timing entirely.
+static std::map<Character*, bool> g_reactivateDialogueShown;
+
 static std::string describePart(MedicalSystem* med, MedicalSystem::HealthPartStatus::PartType type, const char* label)
 {
 	if (!med)
@@ -287,12 +296,14 @@ static void showReactivateDialogue(Character* patient, Character* initiator)
 //
 // applyFirstAid() re-fires many times per second for the same continuous repair-kit-use action (the
 // treater's AI keeps calling it every tick, since returning true here without running the real effect
-// means the underlying task never sees its normal completion signal). Without this, "No" would leave
-// the patient in g_deactivated and the very next tick would pop a fresh dialogue right back open
-// ("Yes" doesn't have this problem since TryReactivate() removes the patient from g_deactivated).
-// Notifies "who" (the treater, not the patient - the one whose AI is actually looping the action) via
-// the AI task system's own natural completion signal, which ends the "Repairing" goal cleanly instead
-// of wiping the task queue or marking it a failure.
+// means the underlying task never sees its normal completion signal). Deliberately NOT called here at
+// dialogue-open time - the repair animation stays playing while the confirmation is pending, so the
+// treater visibly keeps working on the patient until reactivation actually happens (or the conversation
+// ends without it - see the cleanup call in Dialogue_update_hook, which also guards against the
+// dialogue immediately reopening after "No" the same way this used to). Notifies "who" (the treater,
+// not the patient - the one whose AI is actually looping the action) via the AI task system's own
+// natural completion signal, which ends the "Repairing" goal cleanly instead of wiping the task queue
+// or marking it a failure.
 static void notifyTreaterActionComplete(Character* who)
 {
 	if (!who)
@@ -312,8 +323,11 @@ bool MedicalSystem_applyFirstAid_hook(MedicalSystem* self, float skill, Item* eq
 
 	if (patient && g_deactivated.count(patient) && equipment && equipment->itemFunction == ITEM_ROBOTREPAIR && isInSkeletonBed(patient))
 	{
-		showReactivateDialogue(patient, who);
-		notifyTreaterActionComplete(who);
+		if (!g_reactivateDialogueShown.count(patient))
+		{
+			showReactivateDialogue(patient, who);
+			g_reactivateDialogueShown[patient] = true;
+		}
 		return true; // report handled (not failed) so the repair-kit use doesn't keep retrying while the dialogue is up - see Dialogue_replyClicked_hook()
 	}
 
@@ -349,10 +363,19 @@ static std::string getParam(const ConversationOverride& override, const std::str
 }
 
 // The existing revival logic, unchanged - just relocated behind the generic dispatch instead of
-// being called directly by name from handleDialogueReplyClicked.
+// being called directly by name from handleDialogueReplyClicked. Stops the treater's repair animation
+// exactly here, at the moment reactivation actually happens (see notifyTreaterActionComplete's
+// comment) - not before, so a "delay" override placed ahead of this one in the JSON keeps the treater
+// visibly working for the full delay instead of stopping early.
 static bool applyReactivateSkeletonOverride(Character* patient, Character* initiator, DialogLineData* dialogueLine, const ConversationOverride& override)
 {
-	return TryReactivate(patient);
+	bool success = TryReactivate(patient);
+	if (success)
+	{
+		notifyTreaterActionComplete(initiator);
+		g_reactivateDialogueShown.erase(patient); // cycle concluded - a future fresh repair-kit-use may prompt again
+	}
+	return success;
 }
 
 // The item is identified by *its own* FCS ID directly (itemType::ITEM, not DIALOGUE_LINE, unlike
@@ -505,22 +528,50 @@ static bool applyShowTextOverride(Character* patient, Character* initiator, Dial
 static std::map<Character*, std::string> g_pendingReplyId;
 static std::map<Character*, Character*> g_pendingInitiator;
 
-static void dispatchConversationOverrides(Character* patient, Character* initiator, const std::string& replyId)
+// "delay" pauses the dispatch sequence itself rather than performing an action, so it's special-cased
+// here instead of going through g_overrideHandlers - the handler interface has no way to say "stop
+// and resume the rest of this list later." A paused sequence is resumed from Dialogue::update() (see
+// below), which already runs every frame per-character regardless of whether a conversation is
+// currently active, decrementing remainingSeconds until it reaches zero.
+struct PendingOverrideSequence
+{
+	Character* initiator;
+	std::string replyId;
+	size_t nextIndex;      // index into g_conversationOverrides[replyId] to resume at
+	float remainingSeconds;
+};
+static std::map<Character*, PendingOverrideSequence> g_pendingDelayedOverrides; // keyed by patient
+
+static void dispatchConversationOverridesFrom(Character* patient, Character* initiator, const std::string& replyId, size_t startIndex)
 {
 	std::map<std::string, std::vector<ConversationOverride> >::iterator overridesIt = g_conversationOverrides.find(replyId);
 	if (overridesIt == g_conversationOverrides.end())
-	{
-		DebugLog("SkeletonRebirth: no ConversationOverrides configured for reply \"" + replyId + "\" - nothing to do");
 		return;
-	}
 
 	// dialogueLine isn't resolved here - no handler needs it (see the OverrideHandler typedef comment
 	// above), so dispatch runs purely off the FCS String ID, never touching the underlying game data
 	// object for content this plugin didn't author.
 	const std::vector<ConversationOverride>& overrides = overridesIt->second;
-	for (size_t i = 0; i < overrides.size(); ++i)
+	for (size_t i = startIndex; i < overrides.size(); ++i)
 	{
 		const ConversationOverride& override = overrides[i];
+
+		if (override.type == "delay")
+		{
+			float seconds = (float)atof(getParam(override, "seconds", "0").c_str());
+			if (seconds > 0.0f)
+			{
+				PendingOverrideSequence pending;
+				pending.initiator = initiator;
+				pending.replyId = replyId;
+				pending.nextIndex = i + 1;
+				pending.remainingSeconds = seconds;
+				g_pendingDelayedOverrides[patient] = pending;
+				return; // remaining overrides resume later, see Dialogue_update_hook
+			}
+			continue;
+		}
+
 		std::map<std::string, OverrideHandler>::iterator handlerIt = g_overrideHandlers.find(override.type);
 		if (handlerIt == g_overrideHandlers.end())
 		{
@@ -531,6 +582,17 @@ static void dispatchConversationOverrides(Character* patient, Character* initiat
 		if (!handlerIt->second(patient, initiator, nullptr, override))
 			ErrorLog("SkeletonRebirth: conversation override \"" + override.type + "\" failed for reply \"" + replyId + "\"");
 	}
+}
+
+static void dispatchConversationOverrides(Character* patient, Character* initiator, const std::string& replyId)
+{
+	if (!g_conversationOverrides.count(replyId))
+	{
+		DebugLog("SkeletonRebirth: no ConversationOverrides configured for reply \"" + replyId + "\" - nothing to do");
+		return;
+	}
+
+	dispatchConversationOverridesFrom(patient, initiator, replyId, 0);
 }
 
 // --- Reply detection: Dialogue::replyClicked, both overloads ---------------------------------------
@@ -589,6 +651,11 @@ void Dialogue_replyClickedStr_hook(Dialogue* self, const std::string& index)
 // Character::update()), so a cheap map lookup gates everything else: this only does real work for
 // patients that actually have a pending reply buffered, in practice zero characters almost all the
 // time, one at most while our own dialogue is active.
+//
+// Also drives resuming a "delay"-paused override sequence (see dispatchConversationOverridesFrom) -
+// this fires regardless of conversation state, so a delay keeps ticking down even after the dialogue
+// that triggered it has closed. Same cheap-gate shape: a map lookup for patients with nothing pending
+// costs nothing further.
 void (*Dialogue_update_orig)(Dialogue*, float);
 void Dialogue_update_hook(Dialogue* self, float frameTime)
 {
@@ -596,6 +663,21 @@ void Dialogue_update_hook(Dialogue* self, float frameTime)
 	bool hasPending = patient && g_pendingReplyId.count(patient) != 0;
 
 	Dialogue_update_orig(self, frameTime);
+
+	if (patient)
+	{
+		std::map<Character*, PendingOverrideSequence>::iterator delayIt = g_pendingDelayedOverrides.find(patient);
+		if (delayIt != g_pendingDelayedOverrides.end())
+		{
+			delayIt->second.remainingSeconds -= frameTime;
+			if (delayIt->second.remainingSeconds <= 0.0f)
+			{
+				PendingOverrideSequence pending = delayIt->second;
+				g_pendingDelayedOverrides.erase(delayIt);
+				dispatchConversationOverridesFrom(patient, pending.initiator, pending.replyId, pending.nextIndex);
+			}
+		}
+	}
 
 	if (!hasPending || !self->conversationHasEnded())
 		return;
@@ -607,6 +689,18 @@ void Dialogue_update_hook(Dialogue* self, float frameTime)
 
 	DebugLog("SkeletonRebirth: conversation ended for " + patient->_NV_getName() + " - committing last-seen reply \"" + replyId + "\"");
 	dispatchConversationOverrides(patient, initiator, replyId);
+
+	// If dispatch didn't reactivate the patient (e.g. "No", or a reply with no reactivate_skeleton
+	// override at all) and isn't mid-delay toward doing so, this "ask and await an answer" cycle is
+	// over: stop the treater's repair animation, and clear g_reactivateDialogueShown so a genuinely
+	// new repair-kit-use later can prompt again (MedicalSystem_applyFirstAid_hook is what actually
+	// guards against the dialogue reopening immediately - this is no longer relying on the AI task's
+	// stop timing for that).
+	if (g_deactivated.count(patient) && !g_pendingDelayedOverrides.count(patient))
+	{
+		notifyTreaterActionComplete(initiator);
+		g_reactivateDialogueShown.erase(patient);
+	}
 }
 
 // Character::update() is deliberately NOT hooked. Skipping it entirely (an earlier version did)

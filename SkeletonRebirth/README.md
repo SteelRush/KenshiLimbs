@@ -45,19 +45,25 @@ overrides**, dispatched generically whenever that reply is clicked:
 }
 ```
 
-Three override types exist:
+Four override types exist:
 
 | `type` | Params | Purpose |
 |---|---|---|
 | `reactivate_skeleton` | *(none)* | The core revival logic — flesh nudge, un-Deactivate. |
 | `take_item` | `item` — the item's own FCS String ID | Takes one of that item from whoever clicked the reply. |
 | `show_text` | `string` — the text (`/MYNAME/` is replaced with the character's name); `color` — see below | Floating colored text tracking the character, same visual language as Kenshi's own stat-increase/pickup notifications. |
+| `delay` | `seconds` — how long to pause, fractional allowed (e.g. `"1.5"`) | Pauses this reply's remaining overrides for that many seconds before continuing. |
 
 `show_text`'s `color` accepts a named constant (case-sensitive: `Red`, `Green`, `Blue`, `Black`,
 `White` — the full set `MyGUI::Colour` exposes), `"#RRGGBB"` hex (the `#` is optional, e.g.
 `"#FF8C00"` or `"FF8C00"` for orange), or raw RGB as `"R,G,B"` with each component 0-255 (e.g.
 `"255,140,0"`) — `resolveNamedColor()`/`tryParseHexColor()`/`tryParseRgb()` in the .cpp. Omitted or
 unrecognized values fall back to `White` and log an error, rather than failing silently.
+
+`delay` only pauses the *rest of that one reply's override list* — other characters, other replies,
+and the rest of the game keep running normally. It's handled specially rather than as a normal
+override handler, since it needs to suspend and resume the dispatch sequence itself rather than
+perform a single action; see `dispatchConversationOverridesFrom()` in the .cpp.
 
 Attaching an existing override type to a new or changed FCS reply only needs a JSON edit and a
 restart — no rebuild. Adding a genuinely new override *type* still needs new C++ (a handler function
