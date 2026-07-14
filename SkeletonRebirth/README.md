@@ -5,22 +5,23 @@ Security Spiders, etc.) never enter vanilla Dead state. Instead they collapse in
 KO/"Rebooting" **Deactivated** state, and can only be brought back by using a Skeleton Repair Kit
 on them while they're in a Skeleton Repair Bed, confirming a prompt, and spending an item (a Power
 Core, per the FCS dialogue's own text and item requirement) from whoever used the kit. See
-[`DESIGN.md`](DESIGN.md) for the full design history, rejected approaches, and confirmed test results.
+[`DESIGN.md`](DESIGN.md) for the full architecture and implementation reference.
 
 ## What it does
 
-Four hooks in `SkeletonRebirthDiagnostics.cpp`:
+Six hooks in `SkeletonRebirthDiagnostics.cpp`:
 
 | Hook | Purpose |
 |---|---|
 | `Character::declareDead()` | Blocked entirely for robots — clears `MedicalSystem::dead` instead of letting real death proceed, and marks the character Deactivated. |
 | `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely (no healing, no further deterioration, and stops `declareDead()` from re-firing). |
 | `MedicalSystem::applyFirstAid(...)` | The reactivation trigger. When a `ITEM_ROBOTREPAIR` item is used on a Deactivated character in a bed with `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, starts a real FCS dialogue instead of reactivating immediately. |
-| `Dialogue::replyClicked(int)` / `Dialogue::replyClicked(const std::string&)` | Reads back which reply the player picked (both overloads are hooked - live testing found the native dialogue window calls both for a single click), then dispatches whatever **conversation overrides** are configured for that reply in `RE_Kenshi.json` — see below. |
+| `Dialogue::replyClicked(int)` / `Dialogue::replyClicked(const std::string&)` | Reads back which reply the player picked (both overloads are hooked - the native dialogue window calls both for a single click; only the `string` overload's value is trusted), then dispatches whatever **conversation overrides** are configured for that reply in `RE_Kenshi.json` — see below. |
+| `Dialogue::update(float)` | Detects when a conversation has genuinely ended, to commit the last reply reported (see DESIGN.md — `Dialogue::replyClicked` can report both sides of a Yes/No choice for one click). |
 
-The confirmation prompt is a real interactive conversation opened via `Dialogue::startPlayerConversation()` — the actual native "start a player conversation with choices" entry point, not the monologue-only `Dialogue::runCustomDialog()`/`sendEvent()` mechanisms tried and abandoned first (see DESIGN.md Status section), and not the hand-built MyGUI panel an earlier version used instead while that entry point was still unknown.
+The confirmation prompt is a real interactive conversation opened via `Dialogue::startPlayerConversation()` — the actual native "start a player conversation with choices" entry point.
 
-`Character::update()` is deliberately **not** hooked — see DESIGN.md Status section for why.
+`Character::update()` is deliberately **not** hooked — see DESIGN.md for why.
 
 Debug output goes through KenshiLib's `DebugLog()` (see `Debug.h`) with a `SkeletonRebirth:` prefix.
 
@@ -63,8 +64,8 @@ restart — no rebuild. Adding a genuinely new override *type* still needs new C
 registered in `startPlugin()`), but from then on it's reusable by any conversation, not just this one.
 
 **Works on any FCS dialogue reply, including stock/vanilla content** — not limited to this mod's own
-dialogue tree. Confirmed via live testing (see DESIGN.md Status section): attaching a `show_text`
-override directly to a stock NPC's own reply fires correctly with zero side effects on other dialogue.
+dialogue tree. Confirmed via live testing: attaching a `show_text` override directly to a stock NPC's
+own reply fires correctly with zero side effects on other dialogue.
 
 Parsed with **rapidjson** (vendored into `KenshiLib_Examples_deps/rapidjson` — see Build below),
 reusing the same file RE_Kenshi's own loader already reads for `"Plugins"`.
