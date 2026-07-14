@@ -178,21 +178,14 @@ static void nudgeFleshTowardSurvivable(MedicalSystem::HealthPartStatus* part)
 		part->flesh += std::fabs(part->flesh) * 0.01f;
 }
 
-// Shared by every lookup of an FCS-authored dialogue node in this mod - confirmed via live testing
-// (see the comment above SR_REACTIVATE_DIALOGUE_ID below) that FCS's dialogue editor never creates
-// a standalone itemType::DIALOGUE object; every node, including plain notification-text lines with
-// no replies of their own, is tagged DIALOGUE_LINE.
-//
-// CONFIRMED CRASH, wrapped in SEH: ConversationOverrides can reference IDs from anywhere in the
-// game (stock dialogue included, not just this mod's own FCS content - confirmed live), and this
-// plugin has no way to validate an ID is safe before looking it up. Live-tested: a specific stock
-// dialogue ID (55811-Dialogue.mod) crashed the game inside this lookup outright - a real access
-// violation, not a graceful null return - even after narrowing which reply IDs trigger this call at
-// all (see handleDialogueReplyClicked). No null-check on our side after the call can help when the
-// fault happens inside it, so __try/__except converts the crash into a logged failure instead.
-// Kept deliberately free of local C++ objects requiring destruction (no std::string/std::vector
-// locals) - MSVC (C2712, under this project's /EHsc build) won't allow __try in a function that
-// also needs C++ object unwinding.
+// Resolves an FCS dialogue node's String ID to the DialogLineData tree startPlayerConversation()
+// needs. FCS's dialogue editor tags every node DIALOGUE_LINE, never a standalone DIALOGUE - notification
+// lines with no replies included. Only ever called with SR_REACTIVATE_DIALOGUE_ID (this mod's own
+// trusted content); wrapped in SEH as defense-in-depth against a missing/renamed FCS node rather than
+// a null-check, since a failed native lookup can fault outright instead of returning null. Kept free of
+// local C++ objects requiring destruction (no std::string/std::vector locals) - MSVC C2712 (under this
+// project's /EHsc build) disallows __try in a function that also needs C++ object unwinding, including
+// inside the __except handler itself.
 static DialogLineData* getFcsDialogLine(const std::string& stringID)
 {
 	__try
@@ -205,11 +198,7 @@ static DialogLineData* getFcsDialogLine(const std::string& stringID)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
 	{
-		// No std::string (or any C++ object requiring destruction) anywhere in this function, not
-		// even here in the handler - MSVC's C2712 rejects __try/__except in a function that needs
-		// C++ object unwinding *anywhere* in its body under /EHsc, not just inside the __try block
-		// itself (confirmed by hitting this exact error with the logging call that used to be
-		// here). Callers are responsible for logging - see getFcsDialogLine's callers.
+		// Callers are responsible for logging - see C2712 note above for why nothing can happen here.
 		return nullptr;
 	}
 }
@@ -296,21 +285,14 @@ static void showReactivateDialogue(Character* patient, Character* initiator)
 // itemFunction == ITEM_ROBOTREPAIR is also the only value ever seen for robot patients - not a
 // very selective filter on its own, but still the correct check to make.
 //
-// applyFirstAid() re-fires many times per second for the same continuous repair-kit-use action
-// (the treater's AI keeps calling it every tick, since returning true here without ever running
-// the real effect means the underlying task never sees its normal completion signal). Live testing
-// confirmed this actually breaks "No": TryReactivate() (on "Yes") removes the patient from
-// g_deactivated, so later calls stop matching the trigger condition on their own - but "No" leaves
-// the patient in g_deactivated, so the very next applyFirstAid() tick sees the dialogue already
-// ended and pops a fresh one right back open. Two earlier, different attempts at stopping the
-// repair *action* itself (OrdersReceiver::removeJob(JOB_REPAIR_ROBOT), AITaskSytem::clearAllTasks())
-// were tried and reverted (see DESIGN.md) - neither stopped goalString from staying "Repairing",
-// and clearAllTasks() once left the (then-MyGUI) panel stuck. Not yet live-tested: notifying "who"
-// (the treater, not the patient - the one whose AI is actually looping this action) that its
-// current body task is complete, via the AI task system's own natural completion signal rather
-// than wiping its task queue, on the theory that this ends the "Repairing" goal cleanly instead of
-// leaving it stuck or blacklisting it as failed (unlike taskImpossible(), not used here for that
-// reason).
+// applyFirstAid() re-fires many times per second for the same continuous repair-kit-use action (the
+// treater's AI keeps calling it every tick, since returning true here without running the real effect
+// means the underlying task never sees its normal completion signal). Without this, "No" would leave
+// the patient in g_deactivated and the very next tick would pop a fresh dialogue right back open
+// ("Yes" doesn't have this problem since TryReactivate() removes the patient from g_deactivated).
+// Notifies "who" (the treater, not the patient - the one whose AI is actually looping the action) via
+// the AI task system's own natural completion signal, which ends the "Repairing" goal cleanly instead
+// of wiping the task queue or marking it a failure.
 static void notifyTreaterActionComplete(Character* who)
 {
 	if (!who)
@@ -353,11 +335,10 @@ struct ConversationOverride
 };
 static std::map<std::string, std::vector<ConversationOverride> > g_conversationOverrides; // keyed by FCS reply ID
 
-// dialogueLine is currently always nullptr - see the CONFIRMED CRASH comment in
-// dispatchConversationOverrides for why this plugin stopped resolving DialogLineData objects for
-// arbitrary (potentially stock/vanilla) reply IDs at all. Kept in the signature so a future override
-// type that genuinely needs it can add SEH-guarded resolution scoped to just that handler, without
-// forcing every dispatch (including ones that never touch it) back into the native lookup.
+// dialogueLine is currently always nullptr - no override handler needs the resolved DialogLineData
+// object, so dispatch never resolves it (see dispatchConversationOverrides). Kept in the signature so
+// a future override type that genuinely needs it can add SEH-guarded resolution scoped to just that
+// handler, without forcing every dispatch back into the native lookup.
 typedef bool (*OverrideHandler)(Character* patient, Character* initiator, DialogLineData* dialogueLine, const ConversationOverride&);
 static std::map<std::string, OverrideHandler> g_overrideHandlers; // keyed by override type
 
@@ -379,10 +360,9 @@ static bool applyReactivateSkeletonOverride(Character* patient, Character* initi
 // field. FCS's own native hasItem dialogue condition already gates whether a reply offering this
 // override is even clickable; this only handles actually removing the item, which FCS's condition
 // doesn't do on its own.
-// Same SEH reasoning as getFcsDialogLine above (see its comment) - item IDs in ConversationOverrides
-// are equally user/JSON-supplied and unverified, so equally capable of crashing the game outright
-// inside the native lookup. Kept free of local C++ objects requiring destruction for the same
-// MSVC C2712 reason - __try cannot share a function with locals needing unwinding under /EHsc.
+// Item IDs come from JSON (user-supplied, unverified), so this is SEH-guarded the same way as
+// getFcsDialogLine above - same C2712 reasoning applies, kept free of local C++ objects requiring
+// destruction.
 static GameData* getGameDataGuarded(const std::string& id, itemType category)
 {
 	__try
@@ -478,23 +458,12 @@ static MyGUI::Colour resolveNamedColor(const std::string& name)
 	return MyGUI::Colour::White;
 }
 
-// CONFIRMED ROOT CAUSE - Dialogue::insertWordSwaps() is not safe to call outside the native engine's
-// own controlled conversation flow. Live-tested and reported directly: once any ConversationOverride
-// touched one stock dialogue line for a character, *all* stock dialogue for that same character
-// started crashing, not just the configured line - "like it's corrupting an internal reference".
-// Character::dialogue is a per-character singleton, reused for every conversation that character
-// ever has; insertWordSwaps() is native code that almost certainly mutates internal Dialogue state
-// as a side effect (this project's own header lists fields like currentLine, locked, _hasChanceLines
-// that plausibly get touched). Calling it manually, outside the live conversation the engine itself
-// is managing, with a DialogLineData that isn't the character's actual current line, most likely
-// left that per-character Dialogue object in an inconsistent state rather than crashing immediately
-// - explaining why it only broke *future* native conversations with that same character, not the
-// moment of the call itself. The earlier SEH guard around this call could only catch an immediate
-// hard fault, not corrupted-but-still-"valid" state left behind afterward - the right fix is to
-// never call it this way at all, not to make the call safer. Replaced with a small, self-contained,
-// pure-C++ substitution below that touches nothing on the native Dialogue object - only handles
-// /MYNAME/ (all this mod's own content ever needed), not the full native wordswap tag vocabulary,
-// but that tradeoff is clearly worth it against corrupting a character's dialogue permanently.
+// Deliberately not Dialogue::insertWordSwaps() - that's native code meant to run only inside the
+// engine's own live conversation flow (Character::dialogue is a per-character singleton, and calling
+// it manually on a DialogLineData that isn't the character's actual current line risks leaving that
+// singleton in a bad state). This is a small, self-contained substitute that touches nothing on the
+// native Dialogue object - only handles /MYNAME/ (all this mod's content needs), not the full native
+// wordswap tag vocabulary.
 static void applySimpleWordSwaps(std::string& text, Character* patient)
 {
 	std::string name = patient->_NV_getName();
@@ -527,16 +496,12 @@ static bool applyShowTextOverride(Character* patient, Character* initiator, Dial
 	return true;
 }
 
-// CONFIRMED BUG, FIXED: Dialogue::replyClicked can report BOTH sides of a mutually-exclusive
-// Yes/No choice for what the player experienced as a single click - live-tested and confirmed
-// directly by the user: clicking only "No" still logged "Yes" firing (and reactivating!) about 1.5
-// seconds before "No" itself fired. Dispatching immediately on the first replyClicked seen was
-// therefore acting on the wrong answer. Fixed by buffering the most recent reply per-patient instead
-// of dispatching straight away, and only committing it once Dialogue::update() (see below) detects
-// the conversation has ended - i.e. trust the LAST reply reported before the conversation genuinely
-// ends, not the first one seen. Not yet confirmed whether the earlier "Yes" report is the dialogue system
-// pre-evaluating/scoring candidate lines, a hover-triggered call, or something else - the fix here
-// doesn't depend on knowing why, only on waiting for a definitive end-of-conversation signal.
+// Dialogue::replyClicked can report both sides of a mutually-exclusive Yes/No choice for what the
+// player experienced as a single click (a spurious report of the unclicked side, ~1.5s before the
+// real one). Dispatching immediately on the first replyClicked seen would act on the wrong answer, so
+// replies are buffered per-patient instead and only committed once Dialogue::update() (see below)
+// detects the conversation has ended - trust the last reply reported before the conversation
+// genuinely ends, not the first one seen.
 static std::map<Character*, std::string> g_pendingReplyId;
 static std::map<Character*, Character*> g_pendingInitiator;
 
@@ -549,25 +514,9 @@ static void dispatchConversationOverrides(Character* patient, Character* initiat
 		return;
 	}
 
-	// CONFIRMED CRASH, FIXED (round 3): dialogueLine used to be resolved here via getFcsDialogLine()
-	// and passed to every handler "just in case" - but none of the three handlers actually read it
-	// (show_text stopped needing it once it moved off the native insertWordSwaps() path - see
-	// applySimpleWordSwaps's comment). Live-tested and confirmed: attaching a show_text override to a
-	// *stock* dialogue reply crashed the game hard (access violation) every time that reply fired,
-	// even with the resolution itself SEH-guarded - crash dump analysis (two independent captures,
-	// identical fault address both times) placed the actual fault inside msvcr100.dll's memcpy/memmove,
-	// not in our own guarded lookup call. Root cause: DialogLineData::getName()/getText() return
-	// std::string *by value* across the native ABI (the same hidden-pointer-return hazard already
-	// flagged elsewhere in this file) - safe for this mod's own dialogue tree (exercised the same way
-	// by the vanilla game every time it runs), but for arbitrary stock content the returned buffer was
-	// getting corrupted somewhere inside that native call, and the corruption only surfaced later, once
-	// something (originally: word-swaps; still, after removing those: this file's own diagnostic
-	// describeDialogLine() concatenating the returned strings into a log line) copied it. SEH around
-	// the resolution *call* couldn't catch this because the fault didn't happen there - it happened
-	// later, during string construction/copying, arbitrarily far from any __try. Since nothing here
-	// actually needs the DialogLineData object anymore, the fix is to stop resolving it at all: dispatch
-	// purely off the FCS String ID (plain std::string compare, no native calls), never touching the
-	// underlying game data object for content this plugin didn't author.
+	// dialogueLine isn't resolved here - no handler needs it (see the OverrideHandler typedef comment
+	// above), so dispatch runs purely off the FCS String ID, never touching the underlying game data
+	// object for content this plugin didn't author.
 	const std::vector<ConversationOverride>& overrides = overridesIt->second;
 	for (size_t i = 0; i < overrides.size(); ++i)
 	{
@@ -589,23 +538,11 @@ static void dispatchConversationOverrides(Character* patient, Character* initiat
 // startPlayerConversation() has started it (see showReactivateDialogue() above); this hook is only how
 // the plugin finds out which reply the player picked.
 //
-// CONFIRMED ROOT CAUSE (finally, after a long detour): hooking replyClicked itself was never the
-// problem. Five alternative approaches were tried and abandoned chasing a wrong theory - triggerNextLine
-// (MinHook won't hook it), DialogueWindow::activateResponse (installs, never fires), MyGUI widget click
-// events (never fire, widgets churn constantly), Dialogue::currentLine polling (only ever reflects
-// NPC-spoken lines, structurally can't see a player's reply), and even the player character's own
-// Dialogue object (its update() never fires at all). The actual, decisive test: this exact hook shape
-// (both overloads, unconditional self->replyIds[index] read in the int overload) already exists and has
-// run stably end-to-end in this file the whole time - the crash only ever showed up in the JSON-refactored
-// version, which is what changed. Live-tested side by side: a hardcoded stock-dialogue reply
-// ("55804-Dialogue.mod", the Skeleton Barman) handled with a true, instant, no-op early return for
-// every other reply never crashed, across multiple repeated clicks. The real bug was that the JSON
-// version's "nothing configured" path *wasn't* actually a no-op - it still called patient->_NV_getName()
-// and built a log string for every single dialogue reply click in the entire game, and separately, the
-// Barman's own ID was explicitly configured during testing, so the plugin was doing real dispatch work
-// against stock content on top of that. Fixed by gating on g_conversationOverrides.count(replyId) as the
-// very first thing handleDialogueReplyClicked does - a plain map lookup, no native calls, no string
-// construction - matching the true early-return shape that's been safe in this file all along.
+// This fires for every dialogue reply click in the entire game, not just this mod's, so
+// g_conversationOverrides.count(replyId) must stay the very first thing this function does - a plain
+// map lookup, no native calls, no string construction, a true instant no-op for anything unconfigured.
+// Both overloads are hooked because the native dialogue window calls both for a single click, but only
+// the string overload's value is trusted (see the int overload's comment below).
 static void handleDialogueReplyClicked(Dialogue* self, const std::string& replyId, Character* initiator, const char* fromOverload, bool trustworthy)
 {
 	if (!g_conversationOverrides.count(replyId))
@@ -627,13 +564,9 @@ static void handleDialogueReplyClicked(Dialogue* self, const std::string& replyI
 	g_pendingInitiator[patient] = initiator;
 }
 
-// index here is a position into Dialogue::replyIds, not itself a reply's String ID. Reading
-// self->replyIds[index] unconditionally (for every dialogue reply click in the whole game) looks risky
-// on paper - a struct-offset std::vector<std::string> read on a native object - but this exact line has
-// run stably through extensive live testing, including the decisive side-by-side test that finally
-// isolated the real crash cause (see handleDialogueReplyClicked's comment). Kept as-is rather than
-// "optimized away" - matching a proven-safe shape exactly is worth more here than a theoretical
-// efficiency gain.
+// index here is a position into Dialogue::replyIds, not itself a reply's String ID - resolved to a
+// String ID for the diagnostic log line only. Its value is known unreliable (can report a different
+// reply than the string overload for the same click), so it's never buffered/dispatched, only logged.
 void (*Dialogue_replyClickedInt_orig)(Dialogue*, int);
 void Dialogue_replyClickedInt_hook(Dialogue* self, int index)
 {
@@ -650,14 +583,12 @@ void Dialogue_replyClickedStr_hook(Dialogue* self, const std::string& index)
 	handleDialogueReplyClicked(self, index, initiator, "string", true);
 }
 
-// CONFIRMED, Dialogue::_endPlayerConversation does NOT fire in this flow - live-tested: the hook
-// installed without error, but never once logged, even after a genuine Yes click that should have
-// ended the conversation. Removed. Replaced with edge-detecting Dialogue::conversationHasEnded()
-// inside Dialogue::update() instead - update() is a per-frame, per-character function (same
-// "hook something this hot is risky" category as the deliberately-avoided Character::update()), so
-// this only ever does real work for patients that actually have a pending reply buffered (a cheap
-// map lookup gates everything else) - in practice that's zero characters almost all the time, one
-// at most while our own dialogue is active. CONFIRMED working via live testing.
+// Dialogue::_endPlayerConversation does not fire in this flow, so conversation-end is detected by
+// edge-triggering on Dialogue::conversationHasEnded() inside Dialogue::update() instead - a per-frame,
+// per-character function (same "hot function, hook carefully" category as the deliberately-avoided
+// Character::update()), so a cheap map lookup gates everything else: this only does real work for
+// patients that actually have a pending reply buffered, in practice zero characters almost all the
+// time, one at most while our own dialogue is active.
 void (*Dialogue_update_orig)(Dialogue*, float);
 void Dialogue_update_hook(Dialogue* self, float frameTime)
 {
