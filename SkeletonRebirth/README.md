@@ -9,7 +9,7 @@ Core, per the FCS dialogue's own text and item requirement) from whoever used th
 
 ## What it does
 
-Seven hooks in `SkeletonRebirthDiagnostics.cpp`:
+Six hooks in `SkeletonRebirthDiagnostics.cpp`:
 
 | Hook | Purpose |
 |---|---|
@@ -18,7 +18,6 @@ Seven hooks in `SkeletonRebirthDiagnostics.cpp`:
 | `MedicalSystem::applyFirstAid(...)` | The reactivation trigger. When a `ITEM_ROBOTREPAIR` item is used on a Deactivated character in a bed with `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, starts a real FCS dialogue instead of reactivating immediately. |
 | `Dialogue::replyClicked(int)` / `Dialogue::replyClicked(const std::string&)` | Reads back which reply the player picked (both overloads are hooked - the native dialogue window calls both for a single click; only the `string` overload's value is trusted), then dispatches whatever **conversation overrides** are configured for that reply in `RE_Kenshi.json` — see below. |
 | `Dialogue::update(float)` | Detects when a conversation has genuinely ended, to commit the last reply reported (see DESIGN.md — `Dialogue::replyClicked` can report both sides of a Yes/No choice for one click). |
-| `DialogLineData::checkConditions(Dialogue*, Character*, bool)` | Extends FCS's native condition system with skill checks. FCS has no skill-check condition type at all, so this hides player reply choices (or NPC lines) tagged in `RE_Kenshi.json` under `DialogueSkillChecks` when the player doesn't meet the configured skill threshold — see below. |
 
 The confirmation prompt is a real interactive conversation opened via `Dialogue::startPlayerConversation()` — the actual native "start a player conversation with choices" entry point.
 
@@ -38,67 +37,32 @@ overrides**, dispatched generically whenever that reply is clicked:
     "Plugins": ["SkeletonRebirthDiagnostics.dll"],
     "ConversationOverrides": {
         "12-Skeleton Rebirth.mod": [
-            { "type": "reactivate_skeleton" },
-            { "type": "take_item", "item": "43392-changes_otto.mod" },
-            { "type": "show_text", "color": "Green", "string": "/MYNAME/ has been revived!" }
+            { "type": "reactivate_skeleton" }
         ]
     }
 }
 ```
 
-Four override types exist:
+One override type exists:
 
 | `type` | Params | Purpose |
 |---|---|---|
 | `reactivate_skeleton` | *(none)* | The core revival logic — flesh nudge, un-Deactivate. |
-| `take_item` | `item` — the item's own FCS String ID | Takes one of that item from whoever clicked the reply. |
-| `show_text` | `string` — the text (`/MYNAME/` is replaced with the character's name); `color` — see below | Floating colored text tracking the character, same visual language as Kenshi's own stat-increase/pickup notifications. |
-| `delay` | `seconds` — how long to pause, fractional allowed (e.g. `"1.5"`) | Pauses this reply's remaining overrides for that many seconds before continuing. |
-
-`show_text`'s `color` accepts a named constant (case-sensitive: `Red`, `Green`, `Blue`, `Black`,
-`White` — the full set `MyGUI::Colour` exposes), `"#RRGGBB"` hex (the `#` is optional, e.g.
-`"#FF8C00"` or `"FF8C00"` for orange), or raw RGB as `"R,G,B"` with each component 0-255 (e.g.
-`"255,140,0"`) — `resolveNamedColor()`/`tryParseHexColor()`/`tryParseRgb()` in the .cpp. Omitted or
-unrecognized values fall back to `White` and log an error, rather than failing silently.
-
-`delay` only pauses the *rest of that one reply's override list* — other characters, other replies,
-and the rest of the game keep running normally. It's handled specially rather than as a normal
-override handler, since it needs to suspend and resume the dispatch sequence itself rather than
-perform a single action; see `dispatchConversationOverridesFrom()` in the .cpp.
 
 Attaching an existing override type to a new or changed FCS reply only needs a JSON edit and a
 restart — no rebuild. Adding a genuinely new override *type* still needs new C++ (a handler function
 registered in `startPlugin()`), but from then on it's reusable by any conversation, not just this one.
 
 **Works on any FCS dialogue reply, including stock/vanilla content** — not limited to this mod's own
-dialogue tree. Confirmed via live testing: attaching a `show_text` override directly to a stock NPC's
-own reply fires correctly with zero side effects on other dialogue.
+dialogue tree.
 
-## Skill-gated dialogue choices via `RE_Kenshi.json`
-
-FCS's own dialogue conditions have no skill-check condition type at all, so "only show this reply if
-Science is 80+" can't be authored in FCS. `DialogueSkillChecks` extends the same native eligibility
-gate FCS itself uses (`DialogLineData::checkConditions()`, hooked in `SkeletonRebirthDiagnostics.cpp`)
-to add one, keyed by FCS reply/line String ID the same way `ConversationOverrides` is:
-
-```json
-{
-    "DialogueSkillChecks": {
-        "15-Skeleton Rebirth.mod": [
-            { "skill": "science", "min": 80 }
-        ]
-    }
-}
-```
-
-Each entry needs `skill` (a lowercase `CharStats` field name — e.g. `science`, `lockpicking`,
-`engineer`; see `g_skillFields` in the .cpp for the full list) and at least one of `min`/`max` (Kenshi's
-native 0-100 skill scale). All entries for a line must pass for it to stay visible. Checks are always
-evaluated against the player, since a reply is something only the player picks. If the hook can't
-resolve a player `CharStats` at all, the line is hidden (fails closed) rather than shown.
-
-Like `ConversationOverrides`, this works on any FCS dialogue line, not just this mod's own, and
-attaching a check to an existing reply only needs a JSON edit and a restart — no rebuild.
+Item-consumption effects, floating notification text, delayed sequencing, and skill-gated dialogue
+conditions used to be implemented here too (`take_item`/`show_text`/`delay` overrides,
+`DialogueSkillChecks`). All were removed in favor of
+[BFrizz_Extra_Extensions](https://github.com/BFrizzleFoShizzle/BFrizz_Extra_Extensions/wiki), a
+community-supported FCS extension that already provides native item, notification, and stat-level
+dialogue effects/conditions — author those directly in FCS using that extension instead of through
+`RE_Kenshi.json`.
 
 Parsed with **rapidjson** (vendored into `KenshiLib_Examples_deps/rapidjson` — see Build below),
 reusing the same file RE_Kenshi's own loader already reads for `"Plugins"`.

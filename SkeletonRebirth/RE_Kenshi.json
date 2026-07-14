@@ -2,16 +2,7 @@
 	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
 	"ConversationOverrides" : {
 		"12-Skeleton Rebirth.mod" : [
-			{ "type" : "take_item", "item" : "43392-changes_otto.mod" },
-			{ "type" : "show_text", "color" : "Red", "string" : "AI core used!" },
-			{ "type" : "delay", "seconds" : "5" },
-			{ "type" : "reactivate_skeleton" },
-			{ "type" : "show_text", "color" : "Green", "string" : "/MYNAME/ has been revived!" }
-		]
-	},
-	"DialogueSkillChecks" : {
-		"12-Skeleton Rebirth.mod" : [
-			{ "skill" : "science", "min" : 80 }
+			{ "type" : "reactivate_skeleton" }
 		]
 	}
 }
