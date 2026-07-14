@@ -16,6 +16,7 @@
 #include <kenshi/Dialogue.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/CharStats.h>
 #include <kenshi/Globals.h>
 
 #include <core/Functions.h>
@@ -730,12 +731,143 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 	MedicalSystem_medicalUpdate_orig(self, frameTime);
 }
 
-// --- Loading ConversationOverrides from RE_Kenshi.json -------------------------------------------
+// --- Hook: DialogLineData::checkConditions() - JSON-driven skill-gated dialogue choices --------
+// FCS's own dialogue conditions (DialogConditionEnum, Enums.h:796) have no skill-check type at
+// all - no way to author "only show this reply if Science is 80+" in FCS itself. checkConditions()
+// is the general eligibility gate FCS calls for every dialogue line, including player reply choices
+// (DialogLineData::getPlayerReplies() relies on it the same way NPC line selection does), so hooking
+// it here extends that same native gate instead of reimplementing reply-list filtering separately.
+//
+// Only ever turns a true into false: the original result is checked first and returned as-is
+// whenever it's already false or nothing is configured for this line, so lines nobody's tagged -
+// which is almost every dialogue line in the game, since this hook fires for all of them - see zero
+// added behavior. Config lives in RE_Kenshi.json under "DialogueSkillChecks", keyed by FCS reply/line
+// String ID the same way "ConversationOverrides" is, e.g.:
+//   "DialogueSkillChecks": { "15-Some Mod.mod": [ { "skill": "science", "min": 80 } ] }
+// Every check for a line must pass (AND) for the line to stay visible. "skill" is a lowercase
+// CharStats field name (see g_skillFields below) - not necessarily identical to the skill's in-game
+// display label. "min"/"max" are both optional (at least one required); values are Kenshi's native
+// 0-100 skill scale.
+struct DialogueSkillCheck
+{
+	std::string skill; // lowercase CharStats field name, e.g. "science" - see g_skillFields
+	bool hasMin;
+	float min;
+	bool hasMax;
+	float max;
+};
+static std::map<std::string, std::vector<DialogueSkillCheck> > g_dialogueSkillChecks; // keyed by FCS reply/line String ID
+
+// Deliberately only the plain "skill" floats (the ones under the Skills tab in-game), not attributes
+// like strength/dexterity/toughness - those are derived through accessor methods rather than plain
+// settable members on some builds, and aren't what "skill check" means in the requested feature.
+// Keys are the CharStats member name lowercased, not Kenshi's in-game display label, to keep the
+// mapping unambiguous against the header this was written from (CharStats.h).
+static std::map<std::string, float CharStats::*> buildSkillFieldTable()
+{
+	std::map<std::string, float CharStats::*> table;
+	table["medic"] = &CharStats::medic;
+	table["masscombat"] = &CharStats::massCombat;
+	table["arrowdefence"] = &CharStats::arrowDefence;
+	table["stealth"] = &CharStats::stealth;
+	table["swimming"] = &CharStats::swimming;
+	table["thieving"] = &CharStats::thieving;
+	table["lockpicking"] = &CharStats::lockpicking;
+	table["bluff"] = &CharStats::bluff;
+	table["assassin"] = &CharStats::assassin;
+	table["survival"] = &CharStats::survival;
+	table["tracking"] = &CharStats::tracking;
+	table["climbing"] = &CharStats::climbing;
+	table["doctor"] = &CharStats::doctor;
+	table["engineer"] = &CharStats::engineer;
+	table["weaponsmith"] = &CharStats::weaponSmith;
+	table["armoursmith"] = &CharStats::armourSmith;
+	table["bowsmith"] = &CharStats::bowSmith;
+	table["robotics"] = &CharStats::robotics;
+	table["science"] = &CharStats::science;
+	table["labouring"] = &CharStats::labouring;
+	table["farming"] = &CharStats::farming;
+	table["cooking"] = &CharStats::cooking;
+	table["dodging"] = &CharStats::dodging;
+	table["friendlyfire"] = &CharStats::friendlyFire;
+	table["katanas"] = &CharStats::katanas;
+	table["sabres"] = &CharStats::sabres;
+	table["hackers"] = &CharStats::hackers;
+	table["blunt"] = &CharStats::blunt;
+	table["heavyweapons"] = &CharStats::heavyWeapons;
+	table["unarmed"] = &CharStats::unarmed;
+	table["bows"] = &CharStats::bows;
+	table["turrets"] = &CharStats::turrets;
+	table["polearms"] = &CharStats::polearms;
+	return table;
+}
+static const std::map<std::string, float CharStats::*> g_skillFields = buildSkillFieldTable();
+
+static std::string toLower(const std::string& s)
+{
+	std::string out = s;
+	for (size_t i = 0; i < out.size(); ++i)
+		out[i] = (char)tolower((unsigned char)out[i]);
+	return out;
+}
+
+// Unknown skill names are logged once at JSON-load time (see loadDialogueSkillChecksFromJson) and
+// simply skipped here rather than failing the whole line closed - a typo in one check out of several
+// on the same reply shouldn't hide a reply whose other checks are all fine.
+static bool evaluateSkillChecks(const std::vector<DialogueSkillCheck>& checks, CharStats* stats)
+{
+	for (size_t i = 0; i < checks.size(); ++i)
+	{
+		const DialogueSkillCheck& check = checks[i];
+
+		std::map<std::string, float CharStats::*>::const_iterator fieldIt = g_skillFields.find(check.skill);
+		if (fieldIt == g_skillFields.end())
+			continue;
+
+		float value = stats->*(fieldIt->second);
+		if (check.hasMin && value < check.min)
+			return false;
+		if (check.hasMax && value > check.max)
+			return false;
+	}
+	return true;
+}
+
+bool (*DialogLineData_checkConditions_orig)(DialogLineData*, Dialogue*, Character*, bool);
+bool DialogLineData_checkConditions_hook(DialogLineData* self, Dialogue* dialog, Character* target, bool isWordswap)
+{
+	bool result = DialogLineData_checkConditions_orig(self, dialog, target, isWordswap);
+
+	// Cheapest possible no-op path for the overwhelming majority of calls (every dialogue line in the
+	// entire game, not just tagged ones): skip getStringID() and the map lookup entirely whenever the
+	// original already said no, or nobody's configured any DialogueSkillChecks at all.
+	if (!result || g_dialogueSkillChecks.empty())
+		return result;
+
+	std::string stringId = self->getStringID();
+	std::map<std::string, std::vector<DialogueSkillCheck> >::iterator it = g_dialogueSkillChecks.find(stringId);
+	if (it == g_dialogueSkillChecks.end())
+		return true;
+
+	// Skill-gated choices are always evaluated against the player, regardless of which Character
+	// object dialog/target resolve to for this particular line - a reply choice is something only the
+	// player ever picks, so it's the player's skill that's meant to gate it.
+	Character* player = ou->player ? ou->player->getAnyPlayerCharacter() : nullptr;
+	if (!player || !player->stats)
+	{
+		DebugLog("SkeletonRebirth: DialogueSkillChecks - no player CharStats available to evaluate \"" + stringId + "\" - hiding");
+		return false; // can't verify eligibility for a gated choice - fail closed, don't show it
+	}
+
+	return evaluateSkillChecks(it->second, player->stats);
+}
+
+// --- Loading ConversationOverrides and DialogueSkillChecks from RE_Kenshi.json -----------------
 // RE_Kenshi.json already sits next to this DLL in the mod folder and is already parsed with
 // rapidjson by RE_Kenshi's own loader (Plugins.cpp, for "PreloadPlugins"/"Plugins") - reusing that
 // same file/library here instead of a new config file or a new dependency. Extra top-level keys
 // don't interfere with RE_Kenshi's own parsing (it only ever checks for specific expected keys), so
-// adding "ConversationOverrides" alongside "Plugins" is safe.
+// adding "ConversationOverrides"/"DialogueSkillChecks" alongside "Plugins" is safe.
 
 // No existing KenshiLib helper resolves a plugin's own directory - Debug.cpp's GetModuleName()
 // deliberately strips to just the base filename (confirmed by reading its implementation), which
@@ -755,24 +887,29 @@ static std::string getOwnModDirectory()
 	return lastSlash != std::string::npos ? path.substr(0, lastSlash + 1) : "";
 }
 
-static void loadConversationOverridesFromJson()
+// Shared by both loaders below - RE_Kenshi.json is only opened/parsed once per startPlugin() now,
+// rather than once per JSON section consumed.
+static bool loadOwnJsonDocument(rapidjson::Document& doc, const std::string& jsonPath)
 {
-	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
 	std::ifstream file(jsonPath.c_str());
 	if (!file.is_open())
 	{
-		ErrorLog("SkeletonRebirth: could not open \"" + jsonPath + "\" to load ConversationOverrides");
-		return;
+		ErrorLog("SkeletonRebirth: could not open \"" + jsonPath + "\"");
+		return false;
 	}
 
 	rapidjson::IStreamWrapper isw(file);
-	rapidjson::Document doc;
 	if (doc.ParseStream(isw).HasParseError())
 	{
 		ErrorLog("SkeletonRebirth: JSON parse error in \"" + jsonPath + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
-		return;
+		return false;
 	}
 
+	return true;
+}
+
+static void loadConversationOverridesFromJson(const rapidjson::Document& doc, const std::string& jsonPath)
+{
 	if (!doc.HasMember("ConversationOverrides") || !doc["ConversationOverrides"].IsObject())
 	{
 		ErrorLog("SkeletonRebirth: \"" + jsonPath + "\" has no \"ConversationOverrides\" object - reactivation dialogue replies will do nothing");
@@ -816,12 +953,76 @@ static void loadConversationOverridesFromJson()
 	DebugLog(countMsg.str());
 }
 
+static void loadDialogueSkillChecksFromJson(const rapidjson::Document& doc, const std::string& jsonPath)
+{
+	if (!doc.HasMember("DialogueSkillChecks") || !doc["DialogueSkillChecks"].IsObject())
+	{
+		DebugLog("SkeletonRebirth: \"" + jsonPath + "\" has no \"DialogueSkillChecks\" object - dialogue skill gating disabled");
+		return;
+	}
+
+	const rapidjson::Value& skillChecks = doc["DialogueSkillChecks"];
+	for (rapidjson::Value::ConstMemberIterator lineIt = skillChecks.MemberBegin(); lineIt != skillChecks.MemberEnd(); ++lineIt)
+	{
+		std::string lineId = lineIt->name.GetString();
+		if (!lineIt->value.IsArray())
+		{
+			ErrorLog("SkeletonRebirth: DialogueSkillChecks[\"" + lineId + "\"] is not an array - skipped");
+			continue;
+		}
+
+		std::vector<DialogueSkillCheck> checks;
+		const rapidjson::Value& checkArray = lineIt->value;
+		for (rapidjson::SizeType i = 0; i < checkArray.Size(); ++i)
+		{
+			const rapidjson::Value& entry = checkArray[i];
+			if (!entry.HasMember("skill") || !entry["skill"].IsString())
+			{
+				ErrorLog("SkeletonRebirth: DialogueSkillChecks[\"" + lineId + "\"] has an entry with no \"skill\" string - skipped");
+				continue;
+			}
+
+			DialogueSkillCheck check;
+			check.skill = toLower(entry["skill"].GetString());
+			check.hasMin = entry.HasMember("min") && entry["min"].IsNumber();
+			check.min = check.hasMin ? entry["min"].GetFloat() : 0.0f;
+			check.hasMax = entry.HasMember("max") && entry["max"].IsNumber();
+			check.max = check.hasMax ? entry["max"].GetFloat() : 0.0f;
+
+			if (!check.hasMin && !check.hasMax)
+			{
+				ErrorLog("SkeletonRebirth: DialogueSkillChecks[\"" + lineId + "\"] entry for skill \"" + check.skill + "\" has neither \"min\" nor \"max\" - skipped");
+				continue;
+			}
+
+			if (!g_skillFields.count(check.skill))
+				ErrorLog("SkeletonRebirth: DialogueSkillChecks[\"" + lineId + "\"] references unknown skill \"" + check.skill + "\" - that check will never gate anything");
+
+			checks.push_back(check);
+		}
+
+		if (!checks.empty())
+			g_dialogueSkillChecks[lineId] = checks;
+	}
+
+	std::ostringstream countMsg;
+	countMsg << "SkeletonRebirth: loaded DialogueSkillChecks for " << g_dialogueSkillChecks.size() << " line(s) from JSON";
+	DebugLog(countMsg.str());
+}
+
 __declspec(dllexport) void startPlugin()
 {
 	g_overrideHandlers["reactivate_skeleton"] = &applyReactivateSkeletonOverride;
 	g_overrideHandlers["take_item"] = &applyTakeItemOverride;
 	g_overrideHandlers["show_text"] = &applyShowTextOverride;
-	loadConversationOverridesFromJson();
+
+	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
+	rapidjson::Document doc;
+	if (loadOwnJsonDocument(doc, jsonPath))
+	{
+		loadConversationOverridesFromJson(doc, jsonPath);
+		loadDialogueSkillChecksFromJson(doc, jsonPath);
+	}
 
 	// CONFIRMED SAFE - each individually isolated via single-variable live testing (removed alone while
 	// the rest of the plugin's hooks stayed active; crash still reproduced identically both times,
@@ -843,4 +1044,7 @@ __declspec(dllexport) void startPlugin()
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Dialogue::update), Dialogue_update_hook, &Dialogue_update_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add Dialogue::update hook!");
+
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&DialogLineData::checkConditions), DialogLineData_checkConditions_hook, &DialogLineData_checkConditions_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add DialogLineData::checkConditions hook!");
 }

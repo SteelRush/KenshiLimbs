@@ -120,7 +120,54 @@ genuinely ends, not the first one seen.
 Parsed with rapidjson (vendored into `KenshiLib_Examples_deps/rapidjson`, added to `build_wine.bat`'s
 `INCLUDE`), reusing the same `RE_Kenshi.json` RE_Kenshi's own loader already reads for `"Plugins"`.
 
-### 4. Cleanup sweep
+### 4. Skill-gated dialogue choices
+
+FCS's own dialogue conditions (`DialogConditionEnum`, `Enums.h:796`) have no skill-check type at all
+- there's no way to author "only show this reply if Science is 80+" in FCS itself. `RE_Kenshi.json`'s
+`"DialogueSkillChecks"` key extends the same native eligibility gate FCS uses for every dialogue line
+- `DialogLineData::checkConditions(Dialogue*, Character*, bool)` - to add one, keyed by FCS reply/line
+String ID the same way `"ConversationOverrides"` is:
+
+```json
+{
+    "DialogueSkillChecks": {
+        "15-Skeleton Rebirth.mod": [
+            { "skill": "science", "min": 80 }
+        ]
+    }
+}
+```
+
+`checkConditions()` is the gate FCS itself calls for every dialogue line, including player reply
+choices (`DialogLineData::getPlayerReplies()` relies on it the same way NPC line selection does) - so
+hooking it here extends that native gate rather than reimplementing reply-list filtering separately.
+The hook only ever turns a `true` into `false`: the original result is checked first and returned
+as-is whenever it's already `false` or nothing is configured for that line's String ID, so the
+overwhelming majority of calls (every dialogue line in the game, not just tagged ones) take a cheap
+no-op path - a plain `g_dialogueSkillChecks.empty()` check before even calling `getStringID()`, the
+same "cheap gate first" shape as `handleDialogueReplyClicked`'s `g_conversationOverrides.count()`
+check in §3.
+
+Skill checks are always evaluated against the player (`PlayerInterface::getAnyPlayerCharacter()`),
+regardless of what `dialog`/`target` resolve to for that call - a reply choice is something only the
+player ever picks, so it's the player's skill that's meant to gate it. If a player `CharStats` can't be
+resolved at all, the line is hidden rather than shown - failing closed on a gated choice rather than
+risking exposing content behind a check that couldn't be verified.
+
+`skill` is matched against a fixed lookup table (`g_skillFields`, a `std::map<std::string, float
+CharStats::*>`) of lowercase `CharStats` field names - `science`, `lockpicking`, `weaponsmith`, etc. -
+not Kenshi's in-game display labels, to keep the mapping unambiguous against the header this was
+written from. Only the plain "skill" floats are included (the ones under the Skills tab in-game), not
+attributes like strength/dexterity/toughness, which aren't what "skill check" means in the requested
+feature. An entry needs at least one of `min`/`max` (Kenshi's native 0-100 scale); an unknown `skill`
+name is logged once at JSON-load time and simply skipped when evaluating (a typo in one check
+shouldn't hide a reply whose other checks are all fine).
+
+RE_Kenshi.json is only opened/parsed once now (`loadOwnJsonDocument()`), shared by both
+`loadConversationOverridesFromJson()` and `loadDialogueSkillChecksFromJson()`, rather than each section
+opening the file separately.
+
+### 5. Cleanup sweep
 
 Not a background timer — `Character::updateOnScreenCheck()` (fires roughly every frame per character)
 is edge-detected on `isOnScreen` transitioning, giving a lazy "check relevance only when it changes"
@@ -166,3 +213,7 @@ before the player next sees the character.
 - `PlayerInterface::getAnyPlayerCharacter() const` — PlayerInterface.h:177, RVA `0x7F19B0`, via `ou->player`
 - `AITaskSytem::_notifyBodyTaskComplete()` — AI/AITaskSystem.h:219, RVA `0x50BFB0`
 - `Inventory::hasItem()` / `takeOneItemOnly()` — Inventory.h, via `Character::_NV_getInventory()`
+- `DialogLineData::checkConditions(Dialogue*, Character*, bool)` — Dialogue.h:244, RVA `0x6787B0`, non-virtual — hooked for skill-gated dialogue choices (§4)
+- `DialogLineData::getPlayerReplies(lektor<DialogLineData*>&, Dialogue*, Character*)` — Dialogue.h:251, RVA `0x679380` — relies on `checkConditions()` to filter player reply choices, not called directly
+- `Character::stats` (`CharStats*`) — Character.h:710 (`0x450` member)
+- `CharStats` skill fields (e.g. `science`, `lockpicking`) — CharStats.h:106-135, plain public `float` members

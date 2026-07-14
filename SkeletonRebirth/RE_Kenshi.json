@@ -8,5 +8,10 @@
 			{ "type" : "reactivate_skeleton" },
 			{ "type" : "show_text", "color" : "Green", "string" : "/MYNAME/ has been revived!" }
 		]
+	},
+	"DialogueSkillChecks" : {
+		"12-Skeleton Rebirth.mod" : [
+			{ "skill" : "science", "min" : 80 }
+		]
 	}
 }
