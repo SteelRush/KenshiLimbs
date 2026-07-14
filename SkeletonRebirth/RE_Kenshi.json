@@ -1,3 +1,10 @@
 {
-	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ]
+	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
+	"ConversationOverrides" : {
+		"12-Skeleton Rebirth.mod" : [
+			{ "type" : "reactivate_skeleton" },
+			{ "type" : "take_item", "item" : "43392-changes_otto.mod" },
+			{ "type" : "show_text", "color" : "Green", "string" : "/MYNAME/ has been revived!" }
+		]
+	}
 }

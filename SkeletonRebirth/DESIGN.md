@@ -11,6 +11,251 @@ This is a plan only — nothing below is built yet. File:line references are to
 
 ## Status (read this first)
 
+**RESOLVED — `ConversationOverrides` now works reliably for any FCS dialogue reply, including
+stock/vanilla content, not just this mod's own.** This supersedes every entry below about crashes,
+`replyClicked` being unsafe to hook, `currentLine` polling, MyGUI events, `triggerNextLine`, or
+`activateResponse` - all of that was a long detour chasing the wrong cause. The actual bug, found by
+reverting to a known-good prior version of this file and diffing against it directly (rather than
+continuing to re-derive an explanation from first principles): `handleDialogueReplyClicked`'s "nothing
+configured for this reply" path was never a true no-op - it called `patient->_NV_getName()` and built a
+log string for *every single dialogue reply click in the entire game*, every NPC, constantly. Separately,
+during testing the crashing stock ID had been explicitly added to `RE_Kenshi.json`, so the plugin was
+also doing real dispatch work against that content. Hooking `Dialogue::replyClicked` (both overloads,
+including the int overload's unconditional `self->replyIds[index]` read) was never actually unsafe - a
+prior, simpler version of this plugin hooked exactly the same functions the same way and ran completely
+stably. Fixed by making `g_conversationOverrides.count(replyId)` the literal first thing
+`handleDialogueReplyClicked` checks - a plain map lookup, no native calls, no string construction - a
+true, instant, zero-cost return for any reply this plugin doesn't care about. Confirmed via a targeted
+side-by-side test (a hardcoded stock ID handled with a true early-return, live-tested crash-free across
+repeated clicks) before rebuilding the JSON dispatch path on top of that same proven-safe shape.
+**Lesson for next time**: when a prior working version exists, diff against it before re-deriving the
+answer from static analysis/first principles - a live crash-dump/disassembly/`.pdata` investigation
+(documented in full below) produced a lot of true, real findings that were nonetheless not the actual
+cause, and cost far more time than the eventual fix.
+
+**SUPERSEDED — CONFIRMED ACTUAL ROOT CAUSE, FIXED — `DialogLineData::getName()`/`getText()` are not safe to call on
+arbitrary (stock/vanilla) content; the earlier `insertWordSwaps()` theory below was disproven.** After
+removing `insertWordSwaps()` entirely (see the superseded entry directly below), the user retested and
+the crash recurred with the **identical** fault address — proof `insertWordSwaps()` was never the (sole)
+cause. Root-caused properly this time via the actual crash dump: RE_Kenshi's own `MiniDumpWriteDump`
+handler wrote a `.dmp`, hand-parsed with a Python script (no `minidump-stackwalk`/`cdb` available) to
+pull `MINIDUMP_EXCEPTION_STREAM`. Two independent crashes both faulted at the exact same address
+(`0xc0000005`, read access violation from a garbage pointer), which fell in none of our own DLLs'
+PE ranges. Captured the *live* running Kenshi process's `/proc/<pid>/maps` and found that address
+actually lands inside `msvcr100.dll` (the VS2010 CRT this project itself builds against, loaded into
+the Proton prefix at `C:\windows\system32\msvcr100.dll`) — RVA `0x3c131`, which sits between the
+exported `memcpy`/`memmove` (`0x3bf60`) and `memset` (`0x3c2b0`) symbols (`objdump -p` on the DLL's
+export table). **The fault is inside `memcpy`/`memmove` itself, reading from a corrupted source
+pointer** — consistent with a `std::string` returned *by value* across the native ABI (the
+hidden-pointer-return calling-convention hazard already flagged elsewhere in this file) having a bad
+internal buffer for this specific content, which then faults later, whenever something copies it - not
+at the point of the original native call. The actual culprit was `describeDialogLine()`, this file's
+own diagnostic helper, which called `line->getName()`/`line->getText(false)` (both by-value returns)
+directly on a `DialogLineData*` resolved from unverified, arbitrary FCS IDs and concatenated the
+results into a log line — exercised on **every** `replyClicked` for any reply with `ConversationOverrides`
+configured, including stock dialogue this plugin never touched before. This also explains the "zero log
+output before the crash" symptom seen in every earlier attempt: the crash happened *while constructing*
+the `DebugLog()` argument, before `DebugLog()` itself was ever called. SEH around the earlier
+`getFcsDialogLine()` lookup call couldn't catch this because the fault wasn't at that call — it surfaced
+later, inside `describeDialogLine()`, arbitrarily far from any `__try`. **Fixed by removing DialogLineData
+resolution from the hot dispatch/logging path entirely** (`describeDialogLine()` deleted,
+`dispatchConversationOverrides()` and `handleDialogueReplyClicked()` no longer call `getFcsDialogLine()`)
+— turned out to be safe to remove outright since, after `show_text` moved off native `insertWordSwaps()`
+(see below), **none of the three override handlers actually read the resolved line anymore**. Dispatch
+is now driven purely by the FCS String ID (plain `std::string` compare), never touching the underlying
+native game-data object for content this plugin didn't author. `getFcsDialogLine()` itself is kept (still
+used once, for `SR_REACTIVATE_DIALOGUE_ID` — this mod's own trusted content, exercised the same way by
+every install of this mod). Compiles clean, deployed. **Not yet live-tested** — next step is the user
+reattaching a `show_text` override to the stock `55804-Dialogue.mod` reply (already present in the
+deployed `RE_Kenshi.json`) and confirming it no longer crashes.
+
+**SUPERSEDED — CONFIRMED ROOT CAUSE, FIXED - `Dialogue::insertWordSwaps()` is not safe to call outside the native
+engine's own controlled conversation flow.** Live-tested and reported directly, the decisive symptom:
+once any `ConversationOverride` touched one stock dialogue line for a character, **all** stock
+dialogue for that same character started crashing, not just the configured line - "like it's
+corrupting an internal reference." `Character::dialogue` is a per-character singleton, reused for
+every conversation that character ever has. `insertWordSwaps()` is native code that almost certainly
+mutates internal `Dialogue` state as a side effect (plausible candidates already documented in this
+file's own header: `currentLine`, `locked`, `_hasChanceLines`). `show_text` called it manually,
+outside the live conversation the engine itself manages, on a `DialogLineData` that isn't the
+character's actual current line - most likely leaving that per-character `Dialogue` object in an
+inconsistent state rather than crashing immediately, which is exactly why it only broke *future*
+native conversations with that same character rather than the moment of the call itself. The earlier
+SEH guard around this call (see below) could only ever have caught an immediate hard fault, not
+corrupted-but-still-"valid" state left behind afterward - explains why that fix compiled fine and
+still didn't resolve the crash. **Fixed by removing the native call entirely**, not by trying to make
+it safer: `show_text` now resolves `/MYNAME/` via a small, self-contained, pure-C++ string
+substitution (`applySimpleWordSwaps()`) that touches nothing on the native `Dialogue` object at all.
+Loses the full native wordswap tag vocabulary (this mod's own content never used anything beyond
+`/MYNAME/` anyway) in exchange for no longer being able to corrupt a character's dialogue state. Kept
+regardless of the disproof below (still strictly safer, and this mod's own content never needed more
+than `/MYNAME/`), but **live-tested and confirmed NOT to have been the crash's root cause** — the crash
+recurred with an identical fault address after this fix. See the actual root cause at the top of this
+Status section.
+
+**CRASH INVESTIGATION - key reframe: it was breaking *all* original dialogue, not just the
+configured stock ID.** User-reported and decisive: attaching one override to one stock dialogue ID
+broke vanilla dialogue broadly, not just that specific entry - which rules out "something wrong
+resolving this one ID" as the root cause and points at the hooks touching far more shared state than
+they need to for dialogue this plugin has no reason to care about.
+
+Analyzed the actual crash dump (`crashDump1.0.65_x64.zip`, written by RE_Kenshi's own
+`MiniDumpWriteDump` crash handler - `Bugs.cpp`) directly, no debugger needed: parsed the minidump's
+stream directory and exception record with a small Python script (module list stream was
+unfortunately empty in this dump, but the exception stream wasn't). Confirmed: genuine access
+violation (`0xC0000005`), reading from a garbage-looking address (`0x10ef7415e`), at an instruction
+address that falls in **none** of kenshi_x64.exe/KenshiLib.dll/RE_Kenshi.dll/
+SkeletonRebirthDiagnostics.dll's own PE header address ranges (checked each directly) - consistent
+with the fault surfacing deep inside a Wine/system DLL (ntdll/ucrtbase-style address range), the
+classic signature of heap corruption whose *cause* happened earlier and whose *symptom* (the actual
+crash) only surfaces later, elsewhere, when the corrupted memory finally gets touched - explaining
+why SEH guards around the specific lookup calls didn't help: the fault wasn't happening at the
+point being guarded.
+
+**Confirmed root cause candidate, fixed: `g_pendingReplyId[patient] = replyId` ran unconditionally
+for every trustworthy `replyClicked`, regardless of whether anything was configured for that
+reply.** This meant `Dialogue::update()` (hooked globally, fires every frame per character) was
+doing real work - map lookups, a native `conversationHasEnded()` call, potential dispatch - for
+*every* character with any pending vanilla/other-mod dialogue reply, not just this mod's own. Given
+Kenshi has NPCs constantly having ambient background conversations with each other, this could mean
+our hooks were touching shared mutable state (`g_pendingReplyId`/`g_pendingInitiator`) far more
+often, for far more characters, than intended - a much larger surface area for something to go wrong
+than "one specific ID," matching the "breaks all dialogue" report. Fixed by returning early - before
+touching `g_pendingReplyId` at all - for any reply nobody configured overrides for, mirroring the
+narrowing already applied to the diagnostic FCS-line lookup. **Not yet live-tested against either
+symptom** (the original 55811 crash, or the "breaks all dialogue" regression) - this is a strong,
+well-evidenced candidate fix, not a confirmed resolution.
+
+**CRASH, PARTIALLY MITIGATED - `ConversationOverrides` can be attached to any dialogue reply in the
+whole game (not just this mod's, confirmed - a stock/vanilla dialogue entry, `55811-Dialogue.mod`,
+was configured and crashed the game).** `Dialogue::replyClicked` is hooked globally (there's no
+per-mod scoping on the native function itself), which is exactly what makes attaching overrides to
+*any* conversation ID possible - but it also means the plugin was, until this fix, running a native
+FCS lookup (`getFcsDialogLine()` -> `GameDataContainer::getData()` -> `DialogDataManager::getData()`)
+on *every single dialogue reply click in the entire game*, purely to build a diagnostic log line,
+regardless of whether that reply had anything to do with this mod. Live-tested: the crash happened
+with **zero** SkeletonRebirth log output beforehand, and `getFcsDialogLine()` ran *before* the
+`DebugLog()` call in `handleDialogueReplyClicked()` - consistent with the crash happening inside
+that lookup itself, before there was anything to log. Two fixes applied:
+1. The diagnostic lookup now only runs when the clicked reply actually has `ConversationOverrides`
+   configured for it (`g_conversationOverrides.count(replyId)`) - the vast majority of dialogue in
+   the game (everything nobody configured) no longer touches this lookup at all. This protects all
+   *other* dialogue in the game from a risk this plugin was introducing for no reason.
+2. `applyShowTextOverride()` no longer assumes `dialogueLine` is non-null before passing it to
+   `insertWordSwaps()` - falls back to unswapped text instead of risking a null-pointer call into
+   native code that likely doesn't check its own parameter.
+**Confirmed the caveat was real - crash recurred even with fix (1), then fixed with SEH.**
+`55811-Dialogue.mod` crashed again on the exact same test, live-confirmed by the user, proving the
+native lookup crashes outright (an access violation) rather than gracefully returning null - no
+null-check after the call could ever catch this. Fixed by wrapping the two native lookups that take
+user/JSON-supplied IDs (`getFcsDialogLine()` and the new `getGameDataGuarded()`, used by
+`applyTakeItemOverride()`) in `__try`/`__except (EXCEPTION_EXECUTE_HANDLER)`, converting a hard
+crash into a logged failure + graceful `nullptr`.
+
+**MSVC gotcha hit twice getting this to compile - `C2712: Cannot use __try in functions that require
+object unwinding`.** This project builds with `/EHsc`, and MSVC rejects `__try`/`__except` in *any*
+function that also needs C++ object unwinding *anywhere* in its body - not just inside the `__try`
+block. First attempt put `ErrorLog(std::string(...))` inside the `__except` handler - rejected, even
+though the handler is a separate block from the `__try`. Second attempt removed that but still took
+`const char*` parameters, passed straight to `ou->gamedata.getData(stringID, ...)` (which takes
+`const std::string&`) - the *implicit temporary* `std::string` created by that conversion, entirely
+within the `__try` block, was *also* enough to trigger C2712. Fixed by changing both guarded
+functions to take `const std::string&` directly (a reference needs no construction/destruction
+inside the callee) and updating call sites to pass their already-existing `std::string`s directly
+instead of round-tripping through `.c_str()`. End state: these two functions contain **zero** C++
+objects requiring destruction anywhere in their bodies - only raw pointers and references. Callers
+are responsible for any logging (the guarded functions themselves stay silent on failure) -
+`dispatchConversationOverrides()`'s existing "doesn't resolve to a real FCS DIALOGUE_LINE" error and
+the generic "conversation override... failed" error already cover a recovered-`nullptr` the same as
+a legitimately-missing ID, so no diagnostic information was lost.
+**Not yet re-tested live** - needs confirming the SEH guard actually catches this specific crash
+now, not just that it compiles.
+
+**CONFIRMED BUG, FIXED — `Dialogue::replyClicked` can report BOTH sides of a mutually-exclusive
+Yes/No choice for a single click.** Live-tested and confirmed directly by the user: clicking only
+"No" still logged "Yes" firing - and reactivating the character - about 1.5 seconds *before* "No"
+itself fired. The improved diagnostic logging below (which resolves each reply ID to its actual FCS
+`name`/`text`/`parent` fields) is what made this legible enough to catch: the log line for the
+spurious "Yes" showed `text="Yes"` plainly, ruling out an ID-mismatch/mislabeling theory and
+confirming the *wrong side of a binary choice* was genuinely reported as clicked. Root cause not
+confirmed (candidates: the dialogue system pre-evaluating/scoring candidate lines before the real
+click, a hover-triggered call, something else) - not knowable without a disassembler, and the fix
+doesn't depend on knowing why. Fixed by no longer dispatching straight from `replyClicked`: it now
+only buffers the most recently reported reply per-patient
+(`g_pendingReplyId`/`g_pendingInitiator`), committed once the conversation is confirmed to have
+genuinely ended. Trusts the final answer, not the first signal seen.
+
+**First attempt at the "conversation genuinely ended" signal was wrong - `Dialogue::_endPlayerConversation`
+never fires in this flow.** Hooked it first (`Dialogue.h:389`, RVA `0x674750`) since it's the direct
+counterpart to `startPlayerConversation`; installed without error, but live-tested and confirmed it
+never logs even once, including after a real Yes click that should have ended the conversation - not
+knowable without a disassembler why (candidates: only reachable via a different closing path,
+internal-only helper not actually invoked at the point we assumed). Replaced with edge-detecting
+`Dialogue::conversationHasEnded()` (a query function already trusted elsewhere in this file, e.g.
+`showReactivateDialogue()`'s guard) inside a `Dialogue::update(float)` hook instead - a real signal
+we already know reflects true conversation state correctly. `update()` is a per-frame,
+per-character function (same "hooking something this hot is risky" category as the deliberately-
+avoided `Character::update()`), so the hook only does real work when `g_pendingReplyId` actually has
+an entry for that patient (a cheap map lookup gates everything else - in practice zero characters
+almost all the time, one at most while our own dialogue is active).
+
+**CONFIRMED WORKING END TO END, both critical cases live-tested by the user separately:**
+1. First run: "Yes" fired twice (both buffered, same value, harmless), conversation ended, exactly
+   one commit, exactly one `TryReactivate()` - log showed
+   `conversation ended for Sadneil - committing last-seen reply "12-Skeleton Rebirth.mod"` immediately
+   followed by `TryReactivate() SUCCEEDED`, 9ms apart.
+2. Second run, the actual regression test for the original bug: clicked only "No" - **nothing
+   fired**, no reactivation, confirmed correct (this is the exact scenario that previously
+   reactivated on the wrong answer). Went through the dialogue again afterward and chose "Yes" -
+   worked correctly.
+This closes out the "wrong side of Yes/No" bug - the buffer-and-commit-on-conversation-end design is
+confirmed sound, not just theoretically reasoned through.
+
+**NOT YET LIVE-TESTED — reactivation dialogue rearchitected to a JSON-driven "conversation
+overrides" system.** Everything below about `SR_REACTIVATE_YES_REPLY_ID`,
+`SR_REACTIVATE_ITEM_GATE_ID`, `takeReviveCostItem()`, and the FCS-linked/hardcoded revival message
+is **historical** - superseded by this entry, kept for context on how the design got here. Only
+`SR_REACTIVATE_DIALOGUE_ID` (which FCS dialogue to *start* on the repair-kit-in-bed trigger) is
+still a hardcoded C++ constant, by design - starting the conversation is inherent to this specific
+feature. Everything about **what happens when a given reply fires** is now data-driven:
+
+- `RE_Kenshi.json` (the manifest already read by RE_Kenshi's own loader for `"Plugins"`) gets a new
+  top-level `"ConversationOverrides"` key: a flat map from any FCS reply/line String ID to a list of
+  named overrides. `Dialogue::replyClicked`'s hook (unchanged mechanism) looks up whichever list is
+  registered for the clicked reply and dispatches each entry to a registered C++ handler by `"type"`.
+  Adding a new FCS-authored choice that reuses an existing override type needs a JSON edit and a
+  restart - no recompile.
+- Three override types exist: `reactivate_skeleton` (the old `TryReactivate()`, narrowed to just the
+  mechanical state change), `take_item` (takes one of an item identified by *its own* FCS ID
+  directly - `itemType::ITEM`, not a dialogue-line lookup like the superseded
+  `SR_REACTIVATE_ITEM_GATE_ID` approach), and `show_text` (floating `ScreenLabel` text, generic, not
+  revival-specific - resolves `/PLACEHOLDER/` word-swap tokens via `Dialogue::insertWordSwaps()`
+  against a `DialogLineData` resolved fresh via `getFcsDialogLine(replyId)`, not read from any live
+  `Dialogue` state).
+- New dependency: **rapidjson**, vendored (cloned, not authored) into
+  `/home/bryan/Git/KenshiLib_Examples_deps/rapidjson` - RE_Kenshi itself already depends on it
+  (`Plugins.cpp`) but that copy lives in RE_Kenshi's own build, not the separate
+  `KenshiLib_Examples_deps` toolchain this plugin builds against. Confirmed compiles and runs
+  correctly under this project's VS2010 (`v100`) toolset via an isolated smoke-test *before* touching
+  the real refactor (a real, justified concern - this session already hit one C++11-incompatibility
+  surprise, range-based `for`, under this exact toolchain). All new code uses explicit iterators and
+  `ostringstream`, no range-`for`/`std::to_string` (caught one `std::to_string` slip during review,
+  fixed before the first real build attempt).
+- Locating the plugin's own directory (to find `RE_Kenshi.json` next to the DLL): no existing
+  KenshiLib helper does this - `Debug.cpp`'s `GetModuleName()` deliberately strips to just the base
+  filename (confirmed by reading its source). New `getOwnModDirectory()` uses the same underlying
+  Win32 call (`GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, ...)` +
+  `GetModuleFileNameA`), keeping the directory instead of stripping it.
+- Current live config (`RE_Kenshi.json`): all three override types attached to
+  `"12-Skeleton Rebirth.mod"` (the "Yes" reply) - `reactivate_skeleton`, `take_item` with
+  `item: "43392-changes_otto.mod"` (the AI Core), `show_text` with `color: "Green"`,
+  `string: "/MYNAME/ has been revived!"`.
+- **Compiles clean, deployed, not yet live-tested against the real game.** In particular still
+  needs confirming: the full repair-kit → dialogue → Yes → all three overrides fire in order →
+  reactivation + item taken + green text shown, exactly as before this refactor; and that editing
+  only `RE_Kenshi.json` (no rebuild) actually changes behavior, which is the entire point of this
+  change.
+
 **CONFIRMED WORKING, CLEAN, MINIMAL — core Deactivated mechanism (§1, §2):** built and live-tested
 in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
 1. `Character::declareDead()` — blocked for robots, plus `MedicalSystem::dead = false`. Confirmed
@@ -165,12 +410,25 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   is active (used as the "don't stack a second start" guard).
   **FCS content has been authored** under this mod: the "Attempt to reactivate `<name>`?" line with
   two player-reply children, and its "Yes" reply line. Both ended up with FCS's own auto-assigned
-  String IDs rather than custom strings - `11-Skeleton Rebirth.mod` (dialogue) and
-  `12-Skeleton Rebirth.mod` (Yes reply), FCS's default `"<index>-<mod filename>.mod"` format -
-  hardcoded as `SR_REACTIVATE_DIALOGUE_ID`/`SR_REACTIVATE_YES_REPLY_ID` in the .cpp. **Risk to
-  flag**: since these weren't custom-named, deleting and recreating either node in FCS (or renaming
-  the mod file) will likely assign different IDs and silently break the lookup - the constants
-  would need updating to match.
+  String IDs rather than custom strings - `24-Skeleton Rebirth.mod` (dialogue, originally
+  `11-Skeleton Rebirth.mod` until the initial-dialogue line was recreated in FCS and picked up a new
+  auto-assigned ID) and `12-Skeleton Rebirth.mod` (Yes reply, unchanged), FCS's default
+  `"<index>-<mod filename>.mod"` format - hardcoded as
+  `SR_REACTIVATE_DIALOGUE_ID`/`SR_REACTIVATE_YES_REPLY_ID` in the .cpp. **Risk to flag**: since
+  these weren't custom-named, deleting and recreating either node in FCS (or renaming the mod file)
+  will likely assign yet another new ID and silently break the lookup - the constants would need
+  updating to match, exactly as just happened with the dialogue ID.
+  **`SR_REACTIVATE_DIALOGUE_ID = "24-Skeleton Rebirth.mod"` is intentional, confirmed by the user -
+  not a bug.** The conversation's start point was deliberately moved to `24` in FCS. Investigating
+  the earlier "revived text with no Yes click" report, grepping the compiled `.mod` file's string
+  table directly showed node `24`'s own text as `"Reset CPU"` with an `effects` field pointing at
+  `DialogLineData::DialogAction` node `27` (`"/MYNAME/ was revived!"`, the now-removed FCS-linked
+  message text, see above) - that misread as "24 is the wrong root" at the time, but the user
+  confirmed the FCS-side restructuring (moving the start point to `24`) was deliberate. The original
+  root cause of the premature-text report is still not fully nailed down - removing the FCS-authored
+  message text (see above) may have already resolved it as a side effect, or FCS-side changes since
+  may have, but this hasn't been independently re-confirmed live. If the premature-text symptom
+  resurfaces, revisit this rather than assuming the ID itself is the problem.
   **CONFIRMED BUG, FIXED — FCS's dialogue editor never creates a standalone `itemType::DIALOGUE`
   GameData object at all.** First live test logged `getReactivateDialogueRoot()` failing on every
   single call (`ou->gamedata.getData(id, DIALOGUE)` always returned null, spamming ~1300
@@ -229,20 +487,17 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   documentation-only situation as `Dialogue::startPlayerConversation` (no real `private:`/
   `protected:` in `ScreenLabel.h`) - moot anyway since `createScreenLabel()` itself is a genuinely
   public factory method.
-  **Notification text is now FCS-authored, not hardcoded** - `SR_REACTIVATE_REVIVED_MESSAGE_ID`
-  (`"18-Skeleton Rebirth.mod"`, same FCS auto-assigned ID situation as the dialogue/reply IDs above)
-  is resolved via the same `GameData` -> `DialogLineData` chain (factored out into a shared
-  `getFcsDialogLine()` helper, reused by `getReactivateDialogueRoot()` too), then
-  `DialogLineData::getText(false)` (`Dialogue.h:246`) gets its raw text and
-  `Dialogue::insertWordSwaps(text, target, swapMeYou, line)` (`Dialogue.h:333`, public) resolves any
-  `/PLACEHOLDER/`-style tokens (this mod's own dialogue text already uses `/MYNAME/`, confirmed via
-  the `.mod` file's string table) against `self` as both speaker and target. **Not yet live-tested**
-  - specifically the `insertWordSwaps()` call, since it's normally invoked internally by the native
-  dialogue flow (`Dialogue::say()`/`sayLine()`), not by plugin code fetching a line's text outside
-  of an active conversation. **No fallback text** - if the FCS line isn't found, the notification is
-  simply skipped entirely (an `ErrorLog` still fires, same "log and no-op" pattern as
-  `getReactivateDialogueRoot()`'s handling of a missing dialogue) rather than showing a hardcoded
-  string that could drift from the FCS-authored wording.
+  **Notification text was briefly FCS-authored, then reverted back to hardcoded.** Tried linking it
+  via `SR_REACTIVATE_REVIVED_MESSAGE_ID` (`"18-Skeleton Rebirth.mod"`), resolved through the same
+  `GameData` -> `DialogLineData` chain as the dialogue root (`getFcsDialogLine()`), with
+  `DialogLineData::getText(false)` (`Dialogue.h:246`) plus
+  `Dialogue::insertWordSwaps(text, target, swapMeYou, line)` (`Dialogue.h:333`, public) to resolve
+  `/PLACEHOLDER/`-style tokens like `/MYNAME/`. Worked mechanically, but **reverted** - the FCS
+  ID-churn problem that also broke the dialogue root (see below) made these auto-assigned IDs feel
+  too fragile for something this minor, and the text isn't important enough to be FCS-editable.
+  `getReactivateRevivedMessage()` is back to a plain hardcoded `"<name> was revived!"` string. The
+  now-unreferenced FCS line (`18-Skeleton Rebirth.mod`) is safe to delete in FCS - nothing in the
+  plugin looks it up anymore.
   Skin/layer name strings from the old panel
   (`"Kenshi_FloatingPanelSkin"`, `"Kenshi_Button2"`, `"Main"`) are no longer used now that the
   native dialogue window handles its own UI.
@@ -293,6 +548,37 @@ in `SkeletonRebirthDiagnostics.cpp`, not just planned. Down to **two** hooks:
   nothing for whatever hidden condition drives that path, so it's expected to immediately re-fire in
   that specific scenario regardless of any dialogue/AI-task changes. Confirmed unrelated once a
   normal low-flesh deactivation reactivated cleanly with the exact same code.
+- **NOT YET LIVE-TESTED — "Yes" now takes an item from the initiator, driven by FCS's own item
+  condition instead of a hardcoded item.** The item requirement isn't on the "Yes" reply line
+  itself (`SR_REACTIVATE_YES_REPLY_ID`, `12-Skeleton Rebirth.mod`, still only used to detect which
+  reply was clicked) - it's on a **separate** FCS line, `SR_REACTIVATE_ITEM_GATE_ID`
+  (`26-Skeleton Rebirth.mod`, confirmed directly by the user, not assumed), whose `hasItem` field
+  (`DialogLineData::hasItem` - `lektor<GameData*>`, the same field `checkConditions()`/`chooseAChild()`
+  use natively) is what actually holds the required item type - "Use a Power Core to revive
+  `/MYNAME/`?" is that item's name showing through in the line's own text. Rather than hardcoding
+  the item's FCS ID separately (which would need to be kept in sync with whatever FCS's condition
+  actually checks), `takeReviveCostItem()` reads `hasItem` directly off that gate line at click
+  time and takes one of whichever required type the initiator actually has, via
+  `Inventory::hasItem()`/`takeOneItemOnly()` (`Inventory.h`) on `initiator->_NV_getInventory()`.
+  Re-checks `hasItem` defensively even though FCS's own condition already gated the reply once, in
+  case the item was lost between the dialogue opening and "Yes" being clicked - if so, logs an
+  error and does **not** reactivate (no free revive).
+  **"initiator" needed a real fix, not just a new field**: `showReactivateDialogue()` previously
+  always passed `ou->player->getAnyPlayerCharacter()` as `startPlayerConversation()`'s target,
+  regardless of who actually used the repair kit - harmless before (nothing depended on exactly
+  *which* character it was), but wrong now that a specific character's inventory is being charged.
+  Fixed by threading `who` (the treater, from `applyFirstAid()`) through
+  `showReactivateDialogue(patient, who)` instead, falling back to any player character only if
+  `who` is somehow unavailable.
+  **Resolving the initiator at reply time hit the same trap as `currentLine`**: `Dialogue::conversationTarget`
+  is captured via `self->conversationTarget.getCharacter()` (`util/hand.h:49`) *before* calling the
+  real `replyClicked()` in both hook overloads, not after - on the same reasoning already confirmed
+  for `currentLine` and the int overload's `replyIds[index]`: don't trust any `Dialogue` state read
+  after the real call returns, since `_endPlayerConversation()` may have already cleared it.
+  **VS2010 toolset note**: a first draft used a C++11 range-based `for` over
+  `DialogLineData::hasItem` (a `lektor<GameData*>`) and failed to compile (`C2143`) - this project's
+  VS2010 (`v100`) toolset predates C++11 range-for entirely; needed a plain indexed loop instead
+  (`lektor` supports `operator[]`/`size()`, see `util/lektor.h`).
 
 **RESOLVED — cleanup (§3, secondary feature):** `Character::updateOnScreenCheck()` is a confirmed
 viable trigger. Over one ~260s test session it logged exactly one clean on/off transition each for
