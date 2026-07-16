@@ -228,7 +228,11 @@ and fast-recruits the patient via `PlayerInterface::recruit()`):
                         { "type": "action", "action": "reactivate" }
                     ]
                 },
-                { "caption": "Reset", "steps": [ { "type": "action", "action": "system_reset" } ] },
+                {
+                    "caption": "Reset",
+                    "excludePlayerFaction": true,
+                    "steps": [ { "type": "action", "action": "system_reset" } ]
+                },
                 { "caption": "Do nothing", "steps": [] }
             ]
         }
@@ -268,9 +272,9 @@ JSON array that might define more, or fewer be eligible.
   gameplay-critical timing - the same relaxed precision the old `delay` override type used, just driven
   by wall clock instead of `Dialogue::update()`'s `frameTime`.
 
-**Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItem`) controls whether a button
-is shown at all, evaluated once when `showDialogueBox()` is called, separately from anything its steps
-do:
+**Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItem`, `excludePlayerFaction`)
+controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
+from anything its steps do:
 - `requiresSkill` (a lowercase `CharStats` field name - see `g_skillFields`, the same skill-name table
   the old `DialogueSkillChecks` feature used) plus `minSkill`/`maxSkill` (at least one required if
   `requiresSkill` is set, Kenshi's native 0-100 scale), checked against `initiator`'s
@@ -284,6 +288,9 @@ do:
   removal, two systems that happened to compose), there's no separate native condition system here to
   lean on, so this file's own gate has to do both jobs, just via two different fields an author sets to
   the same item ID.
+- `excludePlayerFaction` (bool) - hides the button if the *patient* (not the initiator) belongs to the
+  player's faction, checked via `RootObjectBase::getFaction()`/`Faction::isThePlayer()`. Used on "Reset"
+  so it's only offered for a wild/unaffiliated robot, not a recruited squad member.
 - Eligible buttons are **compacted** into `ButtonA`/`ButtonB`/`ButtonC` in JSON order, not left as gaps -
   an ineligible button in the middle of a 3-button JSON array doesn't leave an empty slot where it would
   have been. If gating leaves zero buttons eligible for the current initiator, the box isn't shown at all
@@ -432,6 +439,8 @@ itself being restored is the natural "a load just happened" signal.
   for a DLL) and loads `RE_Kenshi.json`'s `"DialogueBoxes"` object from it (see §4)
 - `Character::getStats()` — Character.h:532, RVA `0xDEE40`, non-virtual — used for `requiresSkill`/
   `minSkill`/`maxSkill` button gating (§4)
+- `RootObjectBase::getFaction() const` / `Faction::isThePlayer() const` — RootObjectBase.h:52,
+  Faction.h:112 — used for `excludePlayerFaction` button gating (§4)
 - `CharStats` skill fields (e.g. `robotics`, `science`, `engineer`, ...) — CharStats.h:103-135, all plain
   `float` members - see `g_skillFields` for the full lowercase-name-to-member-pointer table (§4). Only
   the plain skill floats, not derived attributes like `strengthActual()`

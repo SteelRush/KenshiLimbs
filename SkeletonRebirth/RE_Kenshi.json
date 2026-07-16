@@ -20,7 +20,15 @@
 				},
 				{
 					"caption": "Reset",
+					"requiresSkill": "science",
+					"minSkill": 1,
+					"excludePlayerFaction": true,
+					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
+						{ "type": "take_item", "item": "43392-changes_otto.mod" },
+						{ "type": "show_text", "text": "Used AI Core", "color": "#FF4C4C" },
+						{ "type": "delay", "seconds": 5 },
+						{ "type": "show_text", "text": "{name} has been reset!", "color": "#3399FF" },
 						{ "type": "action", "action": "system_reset" }
 					]
 				},

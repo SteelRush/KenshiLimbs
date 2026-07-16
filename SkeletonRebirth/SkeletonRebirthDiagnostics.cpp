@@ -12,6 +12,7 @@
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/Building/Building.h>
 #include <kenshi/CharStats.h>
+#include <kenshi/Faction.h>
 #include <kenshi/Inventory.h>
 #include <kenshi/PlayerInterface.h>
 #include <kenshi/GameWorld.h>
@@ -378,8 +379,9 @@ struct DialogueBoxButtonDef
 	float minSkill;
 	bool hasMaxSkill;
 	float maxSkill;
+	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false) {}
 };
 
 struct DialogueBoxDef
@@ -495,8 +497,15 @@ static GameData* getGameDataGuarded(const std::string& id, itemType category)
 
 // Gates whether a button is shown, not whether its steps can still run once clicked - the "take_item"
 // step re-checks defensively (the item could be lost between show and click).
-static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character* initiator)
+static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character* patient, Character* initiator)
 {
+	if (btn.excludePlayerFaction)
+	{
+		Faction* faction = patient->_NV_getFaction();
+		if (faction && faction->isThePlayer())
+			return false;
+	}
+
 	if (!btn.requiresSkill.empty())
 	{
 		CharStats* stats = initiator ? initiator->getStats() : nullptr;
@@ -679,7 +688,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 	std::vector<DialogueBoxButtonDef> eligibleButtons;
 	for (size_t i = 0; i < def.buttons.size() && eligibleButtons.size() < 3; ++i)
 	{
-		if (isDialogueButtonEligible(def.buttons[i], initiator))
+		if (isDialogueButtonEligible(def.buttons[i], patient, initiator))
 			eligibleButtons.push_back(def.buttons[i]);
 	}
 	if (eligibleButtons.empty())
@@ -844,6 +853,8 @@ static void loadDialogueBoxesFromJson()
 					btn.hasMaxSkill = true;
 					btn.maxSkill = (*bit)["maxSkill"].GetFloat();
 				}
+				if (bit->HasMember("excludePlayerFaction") && (*bit)["excludePlayerFaction"].IsBool())
+					btn.excludePlayerFaction = (*bit)["excludePlayerFaction"].GetBool();
 
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{

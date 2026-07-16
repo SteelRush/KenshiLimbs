@@ -64,7 +64,11 @@ an ordered list of `"steps"`, run in sequence when clicked:
                         { "type": "action", "action": "reactivate" }
                     ]
                 },
-                { "caption": "Reset", "steps": [ { "type": "action", "action": "system_reset" } ] },
+                {
+                    "caption": "Reset",
+                    "excludePlayerFaction": true,
+                    "steps": [ { "type": "action", "action": "system_reset" } ]
+                },
                 { "caption": "Do nothing", "steps": [] }
             ]
         }
@@ -91,6 +95,10 @@ Separately, `requiresItem` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `Ch
 dialogue, before the box appears. This is deliberately independent of a `take_item` step actually
 consuming the same item - one controls visibility, the other controls what happens on click - so a
 button that both requires and consumes an item lists that item ID in both places.
+
+`excludePlayerFaction: true` hides a button if the *patient* (not the initiator) belongs to the
+player's faction - used on "Reset" so a recruited squad member can't have their skills wiped and be
+re-recruited, only a wild/unaffiliated robot can.
 
 See DESIGN.md §4 for the full design, including why this is a different (and much simpler) system than
 the mod's older, removed FCS `Dialogue`-hooking approach, even though it now covers the same
