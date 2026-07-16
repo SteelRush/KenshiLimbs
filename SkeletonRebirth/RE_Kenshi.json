@@ -3,7 +3,7 @@
 	"DialogueBoxes" : {
 		"system_menu": {
 			"title": "System Menu",
-			"message": "{name} is in a catastrophic shutdown loop. What do you want to do?",
+			"message": "{name} is in a catastrophic shutdown loop. Any additional actions will require an AI Core. What do you want to do?",
 			"buttons": [
 				{
 					"caption": "Repair",

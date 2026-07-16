@@ -438,6 +438,44 @@ static std::map<std::string, float CharStats::*> buildSkillFieldTable()
 }
 static const std::map<std::string, float CharStats::*> g_skillFields = buildSkillFieldTable();
 
+// Subset of g_skillFields with a confident StatsEnumerated match, used by isDialogueButtonEligible()
+// to read via CharStats::getStat(what, /*unmodified*/ true) instead of the raw member - the game's
+// own explicit "base, ignore temporary modifiers" accessor, not an assumption that the raw field never
+// gets modified in place. Deliberately not exhaustive: a few g_skillFields names (arrowdefence, bluff,
+// tracking, climbing, doctor, assassin, unarmed, bows) have no StatsEnumerated entry that's an obvious,
+// confident match, so those fall back to the raw member read unchanged - wrong is worse than skipped.
+static std::map<std::string, StatsEnumerated> buildSkillStatEnumTable()
+{
+	std::map<std::string, StatsEnumerated> table;
+	table["medic"] = STAT_MEDIC;
+	table["masscombat"] = STAT_MASSCOMBAT;
+	table["stealth"] = STAT_STEALTH;
+	table["swimming"] = STAT_SWIMMING;
+	table["thieving"] = STAT_THIEVING;
+	table["lockpicking"] = STAT_LOCKPICKING;
+	table["survival"] = STAT_SURVIVAL;
+	table["engineer"] = STAT_ENGINEERING;
+	table["weaponsmith"] = STAT_SMITHING_WEAPON;
+	table["armoursmith"] = STAT_SMITHING_ARMOUR;
+	table["bowsmith"] = STAT_SMITHING_BOW;
+	table["robotics"] = STAT_ROBOTICS;
+	table["science"] = STAT_SCIENCE;
+	table["labouring"] = STAT_LABOURING;
+	table["farming"] = STAT_FARMING;
+	table["cooking"] = STAT_COOKING;
+	table["dodging"] = STAT_DODGE;
+	table["friendlyfire"] = STAT_FRIENDLY_FIRE;
+	table["katanas"] = STAT_KATANAS;
+	table["sabres"] = STAT_SABRES;
+	table["hackers"] = STAT_HACKERS;
+	table["blunt"] = STAT_BLUNT;
+	table["heavyweapons"] = STAT_HEAVYWEAPONS;
+	table["turrets"] = STAT_TURRETS;
+	table["polearms"] = STAT_POLEARMS;
+	return table;
+}
+static const std::map<std::string, StatsEnumerated> g_skillStatEnums = buildSkillStatEnumTable();
+
 // Used by DialogueAction_SystemReset.
 static std::map<std::string, float CharStats::*> buildAttributeFieldTable()
 {
@@ -758,9 +796,16 @@ static void DialogueAction_Reactivate(Character* patient)
 	g_reactivateDialogueShown.erase(patient);
 }
 
-// editor=true for recruit() - unverified guess at what this flag does; check live.
+// recruit() runs BEFORE the stat reset now, not after - confirmed live that recruit(editor=true)
+// reinitializes the character's CharStats from its original template, which was silently clobbering
+// this function's own reset back to the character's pre-reset (modified) values whenever recruit() ran
+// second. CharStats* is re-fetched after recruit() rather than reusing a pointer captured beforehand,
+// in case recruit() replaces the object rather than mutating it in place.
 static void DialogueAction_SystemReset(Character* patient)
 {
+	if (ou && ou->player)
+		ou->player->recruit(patient, true);
+
 	CharStats* stats = patient->getStats();
 	if (stats)
 	{
@@ -769,9 +814,6 @@ static void DialogueAction_SystemReset(Character* patient)
 		for (auto it = g_attributeFields.begin(); it != g_attributeFields.end(); ++it)
 			stats->*(it->second) = 1.0f;
 	}
-
-	if (ou && ou->player)
-		ou->player->recruit(patient, true);
 }
 
 // Mod DLLs don't get a working directory of their own - this is how the mod locates RE_Kenshi.json,
