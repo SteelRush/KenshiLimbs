@@ -156,3 +156,117 @@ before the player next sees the character.
 - `GameWorld::gamedata` — GameWorld.h:97 (`0x20` member), reached via global `ou`
 - `PlayerInterface::getAnyPlayerCharacter() const` — PlayerInterface.h:177, RVA `0x7F19B0`, via `ou->player`
 - `AITaskSytem::_notifyBodyTaskComplete()` — AI/AITaskSystem.h:219, RVA `0x50BFB0`
+
+**Platform note (see §5 below): every RVA in this index is a GOG-build address.** They do not
+apply directly to a Steam install and were never intended to — they're a snapshot of whichever
+build KenshiLib's header-comment RVAs were captured against, not a live-updated value. Confirmed by
+decoding `RE_Kenshi/RVAs/GOG_1.0.65.br` byte-for-byte against these numbers (exact match on every
+function checked); `Steam_1.0.65.br` disagrees with all of them.
+
+## 5. Version/platform RVA pitfalls (July 2026 investigation)
+
+Investigated whether the Deactivated-state hack (§1) could be replaced with a design that lets
+`Character::declareDead()` run for real — so the engine's own GUI/looting/AI/squad-removal/save
+logic handles death correctly instead of being hand-duplicated in `g_deactivated` — while
+specifically suppressing the corpse-cleanup-on-zone-unload step so a "dead" robot's Deactivated
+corpse survives indefinitely instead of being purged like a normal NPC body. Candidate suppression
+points identified from the headers: `Platoon::declareDead()`/`undeclareDead()` (a **separate**,
+non-virtual `declareDead` on `Platoon` itself, distinct from `Character::declareDead()`),
+`ActivePlatoon::destroyCharacters(bool justUnload)`, and `ActivePlatoon::unloadCheck()` — the
+`justUnload` bool param name strongly suggests this is the "does the character get destroyed
+outright or just the in-memory representation freed" fork.
+
+Testing that redesign needs to know what these functions actually do and where they live — which
+turned into a long detour, worth recording so it isn't repeated:
+
+**The RVA numbers in every `KenshiLib` header comment are GOG-build addresses, not Steam.**
+`RE_Kenshi/RVAs/` ships one `.br` offset table per platform+version
+(`GOG_1.0.65.br`, `Steam_1.0.65.br`) because the two builds are **not** laid out identically —
+diffing the two files byte-for-byte shows 13,959 of 29,636 bytes differ (~47%). Decoding either
+file's raw binary content (`FULL_BUFF_LENGTH` `int`s, one per function slot, slot index computed
+from `_ClassName_base` + the function's position in `Source/kenshi/functions/ClassName.inc`) and
+comparing against the header comments confirms every comment matches `GOG_1.0.65.br` exactly and
+disagrees with `Steam_1.0.65.br`. This makes sense once you look at how `KenshiLib::GetRealAddress()`
+actually resolves an address at runtime (`Functions.cpp`): it's a slot index into a
+`function_pointers[]` array populated from `RE_Kenshi/RVAs/<platform>_<version>.br` at startup — the
+header comment is never consulted at runtime, it's purely a human-readable snapshot of whatever
+build the comment was written against. There's no guarantee it tracks either "the latest KenshiLib
+SDK release" or "the currently-shipped `.br` file" — released SDK versions can (and did, as of this
+writing) still carry comments from years earlier, because regenerating them isn't part of cutting a
+release.
+
+**Even the correct platform doesn't transfer across versions.** The installed game is
+`Steam 1.0.68 (Newland)`; the only RVA data available is for `1.0.65`. Decoding
+`Steam_1.0.65.br`'s real values (not the GOG-matching header comments) for all seven target
+functions and testing them against the 1.0.68 binary in Ghidra: zero hits. Every address landed on
+unrelated code (a weather-description function, hash-table internals, an always-`return 1` stub, STL
+container internals) — three point-release patches was enough to shift the whole layout. Steam's
+depot history doesn't preserve a standalone `1.0.65` branch to diff against either (only `1.0.55`,
+which itself reports as `1.0.46 (Dev Mode)` internally and *also* didn't match on any of the seven
+functions) — so there's no available historical Steam binary at all to propagate addresses from,
+labeled or not.
+
+**What worked: pure static behavioral identification directly against the 1.0.68 binary, no
+historical reference needed.** `KenshiLib`'s own `CopyRVAPlugin`/`CopySymbolPlugin` (Cutter/rizin
+plugins) confirm there's no separate address-generation tool anywhere in this ecosystem — producing
+RVA data has always meant a human in a disassembler identifying functions one at a time, for every
+version, no shortcut. Given that, the fastest path was: use the documented struct offsets
+(`MedicalSystem::dead` at `0x164`, `Platoon::isDead` at `0x1F0`) to scan the *entire* 1.0.68 binary's
+disassembly (not decompiled — a raw instruction scan is fast enough to cover the whole ~36MB exe in
+under a minute) for byte-sized writes at those exact displacements. That narrows ~36MB of code to a
+handful of candidate functions, cheap enough to decompile and read individually. Confirmed two so
+far by content, not just plausibility:
+
+- **`Character::declareDead()` → RVA `0x7A6200`** (Steam 1.0.68) — the candidate at
+  `MedicalSystem::medicalUpdate`'s (RVA `0x652000`, also newly reconfirmed for 1.0.68 by the same
+  method — matches expected signature/field layout exactly) two `dead=1` call sites decompiles to a
+  function containing the literal strings `"{1} is dead."`, `"{1} has died from starvation."`,
+  `"{1} has died from blood loss."`, plus squad/faction-removal calls and object cleanup at the end.
+  Unambiguous.
+- **`Platoon::declareDead()` → RVA `0x797090`** (Steam 1.0.68) — found as a direct callee inside
+  `Character::declareDead()` (called specifically when the dying character is the squad leader,
+  `plVar3[0x14] == param_1`), and independently confirmed by a debug-log string **literally naming
+  itself**: `"Platoon::declareDead: "`, written to `"death.log"`.
+
+**Not yet found for 1.0.68 — parked, real open gap**: `Platoon::undeclareDead()`,
+`ActivePlatoon::destroyCharacters()`, `ActivePlatoon::unloadCheck()`,
+`ActivePlatoon::_checkForUniqueCharactersOnUnload()`, `Platoon::reCheckPersistenceOnUnload()` — these
+are the functions the redesign is actually about (the corpse-cleanup-suppression half), so this is
+unfinished, not a side detail. Five techniques were tried and each hit a real wall, worth recording
+so they aren't retried blind:
+
+1. **Binary string search** for the function names — turned up one orphaned, unreferenced
+   `"@ActivePlatoon::destroyCharacters"` literal with no real code path loading it (a debug string
+   the compiler didn't strip in this build but nothing calls — dead end).
+2. **Cross-reference from `thunk_FUN_1407ebdd0(param_1,0)`**, called right alongside
+   `Platoon::declareDead()` from both declareDead functions — turned out to be a 7-byte
+   `Platoon::setPersistentSquad(bool)` (writes `_persistentSquad` at `0x115`), a real find but not
+   one of the target functions. `ActivePlatoon::destroyCharacters`/`unloadCheck` are **not** called
+   from the death path at all — they're unload-time functions on a separate call path (triggered by
+   zone unloading, not character death), so tracing declareDead's callees can't reach them.
+3. **Offset-scan for `ActivePlatoon::deactivationTimer`** (float, offset `0xB0`) compare
+   instructions — too common a displacement value across the whole binary (436 hits), not
+   discriminating enough to sift by hand.
+4. **RTTI vtable lookup by class name** — Ghidra's RTTI analyzer recovered 6,120 vtable-related
+   symbols but didn't attach class names to any of them (all generic `vftable`/`vftable_meta_ptr`),
+   so `ActivePlatoon::periodicUpdate()`'s documented vtable slot (`0x40`) couldn't be looked up by
+   name directly.
+5. **Manual Complete Object Locator trace** — found the real, non-templated RTTI type descriptor
+   string for the bare class (`.?AVActivePlatoon@@` @ `0x141dd7df0`) and wrote a script to check all
+   3,055 `vftable_meta_ptr` locations Ghidra had already identified, reading each one's presumed
+   Complete Object Locator and comparing its `pTypeDescriptor` field (offset `0xC`, x64 COL layout)
+   against that address. Zero matches — either the offset assumption doesn't hold for this build, or
+   `ActivePlatoon`'s vtable arrangement doesn't follow the plain single-inheritance COL layout
+   assumed (plausible given its multiple base classes).
+
+Next angles worth trying when this is picked back up: chain two offsets instead of one (e.g. find
+functions reading `Platoon::isDead` at `0x1F0` *through* `ActivePlatoon::me` at `0x78`, since
+"check if my platoon is dead, then unload" is exactly what these functions should do); or repeat the
+Complete Object Locator trace with the offset-`0xC` assumption relaxed/verified against a
+known-simpler single-inheritance class first (e.g. re-derive it against `Platoon`'s own type
+descriptor, where the right vtable is already known from `Platoon::declareDead`, to check the
+layout assumption before trusting it against an unverified class).
+
+**Practical note for any future version bump**: since Kenshi is no longer receiving patches (last
+`public` branch update 2024-04-01, per Steam depot metadata), whatever gets nailed down for 1.0.68
+is a permanent, one-time result — not a treadmill that breaks on the next patch.
