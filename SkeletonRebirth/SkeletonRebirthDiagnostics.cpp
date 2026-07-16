@@ -6,16 +6,20 @@
 #include <kenshi/MedicalSystem.h>
 #include <kenshi/RootObjectBase.h>
 #include <kenshi/GameSaveState.h>
+#include <kenshi/HandleManager.h>
+#include <kenshi/SaveManager.h>
 #include <kenshi/util/hand.h>
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/Building/Building.h>
-#include <kenshi/Dialogue.h>
-#include <kenshi/GameWorld.h>
+#include <kenshi/CharStats.h>
+#include <kenshi/Inventory.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/GameWorld.h>
 #include <kenshi/Globals.h>
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
 #include <kenshi/gui/ForgottenGUI.h>
+#include <kenshi/gui/ScreenLabel.h>
 
 #include <mygui/MyGUI_Delegate.h>
 #include <mygui/MyGUI_LayoutManager.h>
@@ -24,6 +28,8 @@
 
 #include <rapidjson/document.h>
 #include <rapidjson/istreamwrapper.h>
+#include <rapidjson/ostreamwrapper.h>
+#include <rapidjson/writer.h>
 #include <rapidjson/error/en.h>
 
 #define WIN32_LEAN_AND_MEAN
@@ -31,6 +37,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -47,17 +54,28 @@ public:
 	AITaskSytem* getTaskSystem() const;
 };
 
-// SkeletonRebirth plugin - see SkeletonRebirth/DESIGN.md for the full design history and
-// rejected approaches. Core mechanism, two hooks: robots never actually die (declareDead), and
-// their medical simulation is completely frozen - health can't change in either direction, and
-// declareDead() can't re-trigger - for as long as they're Deactivated (MedicalSystem::medicalUpdate
-// skipped entirely). Healing only needs to happen after TryReactivate() releases the lock, not
-// before. Reactivation trigger: MedicalSystem::medicalUpdate() also starts the FCS reactivation
-// dialogue once a Deactivated robot is placed in the Skeleton Repair Bed (see that hook's comment).
-// Two more hooks handle the dialogue itself: Dialogue::replyClicked() reads
-// back which reply the player picked and dispatches whatever JSON-configured "conversation
-// overrides" (RE_Kenshi.json, "ConversationOverrides") are attached to that reply - see the comment
-// above ConversationOverride further down for the full picture.
+// SkeletonRebirth plugin - see SkeletonRebirth/DESIGN.md for the full design history and rejected
+// approaches. Core mechanism: robots never actually die (declareDead blocked). MedicalSystem::dead is
+// forced back to false every time (native code sets it true just before calling declareDead(), so this
+// has to be reasserted, not just left alone), and stays false for as long as the robot is Deactivated.
+// "Operationally treated as dead" is NOT implemented by leaning on the native dead flag - an earlier
+// version of this mod did that and found dead=true is read by several independent native systems
+// (zone-unload corpse disposal, party-roster pruning, more likely undiscovered) that each had to be
+// fought individually, one of which caused a real crash - see DESIGN.md for the full history. Instead,
+// a Deactivated robot simply sits inert: vanilla's own knockout state (entered naturally from the
+// combat that would have killed it) has no recovery timer at catastrophic damage, so nothing further is
+// needed to keep it motionless. Health is frozen via MedicalSystem::medicalUpdate being skipped while
+// Deactivated. Reactivation trigger: placing a Deactivated robot in the Skeleton Repair Bed (checked
+// continuously via Character::updateOnScreenCheck) opens a confirmation dialogue box built from Kenshi's
+// own Kenshi_MessageBox.layout; TryReactivate() does the actual state change on confirmation. Dialogue
+// box text and per-button step sequences are data-driven from RE_Kenshi.json's "DialogueBoxes" object,
+// not hardcoded per-dialogue C++ - see showDialogueBox()/dispatchDialogueSteps(). A button can
+// be gated on the initiator's skill level or an item they're carrying (isDialogueButtonEligible()), and
+// its steps can take an item, show floating text, delay, and/or run a registered action
+// (dispatchDialogueSteps()/g_dialogueActions) - JSON-configurable equivalents of features an older,
+// removed version of this mod had via real FCS dialogue trees. Cleanup for unattended random-spawn
+// robots is not implemented yet - deferred until the core mechanism above is fully proven out.
+// Deactivated state survives save/reload via a JSON side-file keyed by save-stable handle strings.
 //
 // Output goes to KenshiLib's own debug log via DebugLog() - see Debug.h. Filter the log for the
 // "SkeletonRebirth:" prefix.
@@ -69,15 +87,168 @@ static bool isRobotRace(Character* c)
 }
 
 // Marks characters blocked from dying (declareDead hook) so the medicalUpdate hook knows to keep
-// them frozen. Pointer-keyed and session-only - the real feature needs a handle-keyed, save-aware
-// version (see DESIGN.md §2), since Character* doesn't survive across sessions.
+// them frozen. Still Character*-keyed and session-only for the hot per-tick lookups (updateOnScreenCheck
+// fires roughly every frame per character, and switching every lookup site to a handle-string key -
+// a string construction per check - isn't worth it for a map that's already gated to near-zero cost
+// for the overwhelming majority of characters). Save/reload survival is handled separately, as a
+// write-through JSON side-file keyed by handle string (see saveDeactivatedState/loadDeactivatedState
+// below) - additive, not a replacement for this map, so none of the already-stabilized per-tick hooks
+// needed to change.
 static std::map<Character*, bool> g_deactivated;
 
-// Set once the reactivation dialogue has been opened for a patient, cleared once that "ask and await
-// an answer" cycle has genuinely concluded (see the clearing site in Dialogue_update_hook). Gates
-// MedicalSystem_medicalUpdate_hook's trigger check so it doesn't reopen the dialogue on top of itself
-// every tick while an answer is still pending.
+// Set once the reactivation dialogue box has been opened for a patient, cleared once the character
+// actually leaves the Skeleton Repair Bed (see Character_updateOnScreenCheck_hook). Gates that same
+// hook's trigger check so it doesn't reopen the box on top of itself every tick while still in the bed.
+// Dismissing the box (any button without a "reactivate" action, e.g. "No") deliberately does NOT clear
+// this itself - the trigger is level-triggered (fires every tick still in the bed), so clearing it on
+// dismiss would let the very next tick reopen the box immediately, making "No" appear to do nothing
+// (live tested - it does exactly this). Only DialogueAction_Reactivate (a real accepted reactivation)
+// or actually leaving the bed clears it.
 static std::map<Character*, bool> g_reactivateDialogueShown;
+
+// --- Save/load persistence -----------------------------------------------------------------------
+// g_deactivated (and friends) are Character*-keyed and don't survive a reload - the same logical
+// character gets a fresh pointer next session. RootObjectBase::getHandle().toString() does survive
+// (round-trips through HandleManager::serialise/restore - see util/hand.h), so that's what gets
+// written to disk instead. No native "attach custom data to this object's own save entry" hook was
+// found in RE_Kenshi's headers, and no save/load *event* exists either - SaveManager only exposes a
+// polled internal state machine (SaveManager.h's Signal enum), nothing subscribable. Practical
+// alternative: a small side-file, next to the active save, written on every g_deactivated mutation
+// and re-read via a hook on the load path (HandleManager::_NV_restore - see that hook's own comment
+// for why the *virtual* HandleManager::restore can't be hooked directly).
+static std::string getPersistenceFilePath()
+{
+	SaveManager* saveManager = SaveManager::getSingleton();
+	if (!saveManager)
+		return "";
+
+	std::string currentGame = saveManager->getCurrentGame();
+	if (currentGame.empty())
+		return ""; // no save loaded yet (e.g. main menu, brand new unsaved game)
+
+	std::string path = saveManager->getSavePath();
+	if (!path.empty() && path.back() != '/' && path.back() != '\\')
+		path += "/";
+	path += currentGame;
+	if (!path.empty() && path.back() != '/' && path.back() != '\\')
+		path += "/";
+	path += "SkeletonRebirth_Deactivated.json";
+	return path;
+}
+
+// Called after every g_deactivated mutation (Deactivation, reactivation, cleanup-sweep-triggered real
+// death) rather than hooking a pre-save event - simpler, and can't be missed by a save trigger that
+// turns out not to fire the way expected. Small, infrequent writes - negligible cost.
+static void saveDeactivatedState()
+{
+	std::string path = getPersistenceFilePath();
+	if (path.empty())
+		return;
+
+	rapidjson::Document doc;
+	doc.SetObject();
+	rapidjson::Document::AllocatorType& alloc = doc.GetAllocator();
+	rapidjson::Value handles(rapidjson::kArrayType);
+	for (auto it = g_deactivated.begin(); it != g_deactivated.end(); ++it)
+	{
+		if (!it->second || !it->first)
+			continue;
+
+		std::string handleStr = it->first->getHandle().toString();
+		handles.PushBack(rapidjson::Value(handleStr.c_str(), alloc), alloc);
+	}
+	doc.AddMember("DeactivatedRobots", handles, alloc);
+
+	std::ofstream out(path.c_str());
+	if (!out.is_open())
+	{
+		ErrorLog("SkeletonRebirth: could not open \"" + path + "\" to persist Deactivated state");
+		return;
+	}
+
+	rapidjson::OStreamWrapper osw(out);
+	rapidjson::Writer<rapidjson::OStreamWrapper> writer(osw);
+	doc.Accept(writer);
+}
+
+// Called from the HandleManager::_NV_restore hook (see that hook's comment) - repopulates
+// g_deactivated after a load by resolving each persisted handle string back to a live Character* via
+// hand::fromString()/getCharacter(). Missing file is normal (no Deactivated robots existed yet for
+// this save) and not logged as an error; a resolution failure per-handle is only a debug log, not an
+// error, since a genuinely destroyed/cleaned-up character between sessions is an expected case, not a
+// bug.
+static void loadDeactivatedState()
+{
+	std::string path = getPersistenceFilePath();
+	if (path.empty())
+		return;
+
+	std::ifstream file(path.c_str());
+	if (!file.is_open())
+		return;
+
+	rapidjson::Document doc;
+	rapidjson::IStreamWrapper isw(file);
+	if (doc.ParseStream(isw).HasParseError())
+	{
+		ErrorLog("SkeletonRebirth: JSON parse error in \"" + path + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
+		return;
+	}
+
+	if (!doc.HasMember("DeactivatedRobots") || !doc["DeactivatedRobots"].IsArray())
+		return;
+
+	int resolved = 0;
+	int failed = 0;
+	const rapidjson::Value& handles = doc["DeactivatedRobots"];
+	for (rapidjson::SizeType i = 0; i < handles.Size(); ++i)
+	{
+		if (!handles[i].IsString())
+			continue;
+
+		hand h;
+		h.fromString(handles[i].GetString());
+		Character* c = h.getCharacter();
+		if (c)
+		{
+			g_deactivated[c] = true;
+			++resolved;
+		}
+		else
+		{
+			++failed;
+		}
+	}
+
+	std::ostringstream ss;
+	ss << "SkeletonRebirth: loaded persisted Deactivated state from \"" << path << "\" - resolved=" << resolved << " failed=" << failed;
+	DebugLog(ss.str());
+}
+
+// --- Hook: HandleManager::_NV_restore() - post-load persistence trigger ---------------------------
+// HandleManager::restore() is virtual - hooking it directly the same way InventoryGUI::show() was
+// attempted earlier would hit the same "enable whole program optimization" crash (taking the address
+// of a virtual method doesn't resolve to a real hookable stub). _NV_restore is the same non-virtual,
+// directly-addressable wrapper convention already relied on for InventoryTraderGUI::_CONSTRUCTOR -
+// same RVA as the real restore() implementation, safe to hook. Fires whenever a save is loaded (the
+// handle table itself is what's being restored here), so it's the natural "a load just happened,
+// re-resolve persisted state" trigger. Always calls orig() first - restoring the real handle table
+// before we try to resolve any handles against it.
+void (*HandleManager_restore_orig)(HandleManager*, std::ifstream&);
+void HandleManager_restore_hook(HandleManager* self, std::ifstream& in)
+{
+	HandleManager_restore_orig(self, in);
+	loadDeactivatedState();
+}
+
+// Native "corpse unloaded" cleanup (HandleManager::destroy()), the party-roster prune
+// (PlayerInterface::update()), and everything downstream of them (ActivePlatoon-level squad
+// bookkeeping, the various HandleList-family destroy() overrides) were all extensively investigated
+// this session as part of an earlier "operationally dead" design that set MedicalSystem::dead=true -
+// see DESIGN.md for the full history, including the crash that design change caused (confirmed via
+// manual minidump parsing) and why it was abandoned. None of that native machinery can fire anymore:
+// Character_declareDead_hook now leaves dead=false unconditionally, so nothing here ever sees these
+// robots as corpses in the first place. No hooks needed for any of it.
 
 // Dumps every entry in MedicalSystem::anatomy (the real, complete part list - see the comment on
 // TryReactivate's nudge loop for why this replaced two hardcoded getPart(PART_HEAD/PART_TORSO) calls:
@@ -157,22 +328,45 @@ static bool isInSkeletonBed(Character* c)
 }
 
 // --- Hook 1: declareDead() -----------------------------------------------------------------
-// Fires right before a character would actually die. For robots, blocks the original call but lets
-// MedicalSystem::dead read as true (matching a real death) - GUI/party-membership/AI/looting logic
-// all read that flag directly, not whether declareDead() ran, so robots are operationally treated as
-// dead (lootable, no longer a live threat/ally) while staying reversible, since declareDead() itself
-// - and whatever undocumented cleanup it triggers - never runs. TryReactivate() below is the only
-// thing that ever clears g_deactivated (and sets dead back to false).
+// Fires right before a character would actually die. For robots, blocks the original call - the real
+// death transition, and whatever undocumented native side effects it has, never runs - but
+// MedicalSystem::dead is left false throughout, not flipped to true.
+//
+// An earlier version of this mod set dead=true here specifically to get AI/looting/party-membership/
+// GUI to treat the character as a corpse "for free", on the theory that everything reads that one flag.
+// Live testing found that's not a single choke point: HandleManager::destroy() destroys any dead=true
+// character when its zone unloads ("corpse unloaded"), and PlayerInterface::update() separately prunes
+// dead=true characters from the player's own party roster - two independent native systems, and there
+// was no confidence a third and fourth wouldn't turn up next (AI corpse-disposal jobs were a live
+// candidate). Fighting each one as it surfaced (blocking destroy(), then fighting to restore roster
+// membership, which itself caused a real crash - see DESIGN.md) proved unsustainable. "Operationally
+// treated as dead" is implemented ourselves instead, narrowly, so nothing native ever sees dead=true for
+// these characters at all: AI is paused below (own task system disabled, so the character doesn't keep
+// acting despite catastrophic health), health stays frozen (MedicalSystem_medicalUpdate_hook), and the
+// GUI tag is overridden directly (DatapanelGUI_setLine hook, unconditionally now rather than only when
+// it spots "dead" text - see that hook's comment for why that had to change too).
 void (*Character_declareDead_orig)(Character*);
 void Character_declareDead_hook(Character* self)
 {
 	if (isRobotRace(self))
 	{
+		// CONFIRMED (live testing, 2026-07-14): MedicalSystem::dead is already true by the time this
+		// hook is reached (logged medDead=1 on entry, before this hook touches anything) - something
+		// upstream of declareDead() (combat/damage resolution) sets it directly; declareDead() is only
+		// the finalize step, not where dead=true originates. Blocking declareDead() alone does NOT stop
+		// dead from becoming true - it has to be forced back to false explicitly here, every time,
+		// otherwise every native system that reads dead (corpse-unload destroy, party-roster pruning,
+		// the corpse-only GUI text) still fires exactly as if this were a real, permanent death.
 		MedicalSystem* med = self->getMedical();
 		if (med)
-			med->dead = true;
+			med->dead = false;
 
+		// No explicit AI pause needed here - confirmed live (2026-07-14) that vanilla's own knockout
+		// state has no recovery timer at the catastrophic damage level that triggers this hook, so the
+		// character is already permanently inert on its own. Tried setJobsEnabled(false)/clearOrders()/
+		// clearJobs() first as a safeguard; removed once confirmed redundant.
 		g_deactivated[self] = true;
+		saveDeactivatedState();
 
 		DebugLog("SkeletonRebirth: declareDead() BLOCKED for robot -> " + describe(self));
 		return;
@@ -234,12 +428,12 @@ bool TryReactivate(Character* self)
 	MedicalSystem* med = self->getMedical();
 	if (med)
 	{
-		med->dead = false; // reverses the declareDead hook's dead=true - matches revival back to "alive"
 		for (auto it = med->anatomy.begin(); it != med->anatomy.end(); ++it)
 			nudgeFleshTowardSurvivable(*it);
 	}
 
 	g_deactivated.erase(self);
+	saveDeactivatedState();
 	DebugLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
 
 	return true;
@@ -270,263 +464,551 @@ bool TryReactivate(Character* self)
 // Widget::findWidget(), captions set via the same generic Widget::setProperty("Caption", ...) the XML
 // <Property> tags compile down to) reuses vanilla's own proven structure instead of reconstructing it
 // from individually-guessed primitives.
-static Character* g_pendingReactivationPatient = nullptr;
-static MyGUI::VectorWidgetPtr g_reactivateLayoutWidgets;
-
-static void closeReactivatePanel()
+// --- JSON-driven dialogue boxes -----------------------------------------------------------------
+// Text, button gating, and button behavior for the mod's custom MyGUI dialogue boxes are data-driven
+// from RE_Kenshi.json's "DialogueBoxes" object, not hardcoded per-dialogue C++ functions - nested in
+// that file rather than a separate one, matching how the old (removed) ConversationOverrides/
+// DialogueSkillChecks system did it too. A button's behavior is an ordered list of "steps" (mirroring
+// that old system's per-reply override list, just attached to a button instead of an FCS dialogue
+// reply) - see
+// DialogueBoxStepDef for the four step types. Adding a new dialogue box means adding a JSON entry and,
+// if it needs a new "action" step type, registering that action in g_dialogueActions below - not
+// writing a new Show*/On*Clicked function pair.
+struct DialogueBoxStepDef
 {
-	if (!g_reactivateLayoutWidgets.empty())
-	{
-		MyGUI::LayoutManager::getInstance().unloadLayout(g_reactivateLayoutWidgets);
-		g_reactivateLayoutWidgets.clear();
-	}
-	g_pendingReactivationPatient = nullptr;
+	std::string type; // "action" | "take_item" | "show_text" | "delay"
+	std::string action; // for "action" - looked up in g_dialogueActions
+	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator
+	std::string text;   // for "show_text" - "{name}" replaced with the patient's name
+	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
+	float seconds;       // for "delay" - pauses the remaining steps this many seconds (wall clock)
+
+	DialogueBoxStepDef() : seconds(0.0f) {}
+};
+
+struct DialogueBoxButtonDef
+{
+	std::string caption;
+	std::vector<DialogueBoxStepDef> steps; // run in order when clicked - see dispatchDialogueSteps()
+	std::string requiresItem;  // FCS/GameData item String ID - hidden unless initiator has one
+	std::string requiresSkill; // lowercase CharStats field name (see g_skillFields) - hidden unless initiator's skill is in range
+	bool hasMinSkill;
+	float minSkill;
+	bool hasMaxSkill;
+	float maxSkill;
+
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f) {}
+};
+
+struct DialogueBoxDef
+{
+	std::string title;
+	std::string message; // "{name}" is replaced with the patient's name
+	std::vector<DialogueBoxButtonDef> buttons; // up to 3 - Kenshi_MessageBox.layout has ButtonA/B/C
+};
+
+static std::map<std::string, DialogueBoxDef> g_dialogueBoxes;
+
+typedef void (*DialogueActionFn)(Character* patient);
+static std::map<std::string, DialogueActionFn> g_dialogueActions;
+
+// Deliberately only the plain "skill" floats (the ones under the Skills tab in-game), not attributes
+// like strength/dexterity/toughness - those are derived through accessor methods rather than plain
+// settable members on some builds, and aren't what "skill check" means here. Keys are the CharStats
+// member name lowercased, not Kenshi's in-game display label, to keep the mapping unambiguous against
+// the header this was written from. Reused verbatim from the old (removed) DialogueSkillChecks feature,
+// which gated real FCS dialogue replies the same way this gates dialogue box buttons.
+static std::map<std::string, float CharStats::*> buildSkillFieldTable()
+{
+	std::map<std::string, float CharStats::*> table;
+	table["medic"] = &CharStats::medic;
+	table["masscombat"] = &CharStats::massCombat;
+	table["arrowdefence"] = &CharStats::arrowDefence;
+	table["stealth"] = &CharStats::stealth;
+	table["swimming"] = &CharStats::swimming;
+	table["thieving"] = &CharStats::thieving;
+	table["lockpicking"] = &CharStats::lockpicking;
+	table["bluff"] = &CharStats::bluff;
+	table["assassin"] = &CharStats::assassin;
+	table["survival"] = &CharStats::survival;
+	table["tracking"] = &CharStats::tracking;
+	table["climbing"] = &CharStats::climbing;
+	table["doctor"] = &CharStats::doctor;
+	table["engineer"] = &CharStats::engineer;
+	table["weaponsmith"] = &CharStats::weaponSmith;
+	table["armoursmith"] = &CharStats::armourSmith;
+	table["bowsmith"] = &CharStats::bowSmith;
+	table["robotics"] = &CharStats::robotics;
+	table["science"] = &CharStats::science;
+	table["labouring"] = &CharStats::labouring;
+	table["farming"] = &CharStats::farming;
+	table["cooking"] = &CharStats::cooking;
+	table["dodging"] = &CharStats::dodging;
+	table["friendlyfire"] = &CharStats::friendlyFire;
+	table["katanas"] = &CharStats::katanas;
+	table["sabres"] = &CharStats::sabres;
+	table["hackers"] = &CharStats::hackers;
+	table["blunt"] = &CharStats::blunt;
+	table["heavyweapons"] = &CharStats::heavyWeapons;
+	table["unarmed"] = &CharStats::unarmed;
+	table["bows"] = &CharStats::bows;
+	table["turrets"] = &CharStats::turrets;
+	table["polearms"] = &CharStats::polearms;
+	return table;
+}
+static const std::map<std::string, float CharStats::*> g_skillFields = buildSkillFieldTable();
+
+static std::string toLowerCopy(const std::string& s)
+{
+	std::string result = s;
+	for (size_t i = 0; i < result.size(); ++i)
+		result[i] = (char)tolower((unsigned char)result[i]);
+	return result;
 }
 
-static void OnReactivateYesClicked(MyGUI::Widget* sender)
+// "#RRGGBB" hex, the common web/paint-tool convention - not MyGUI::Colour's own undocumented string
+// constructor format. Hand-rolled for the same reason the old (removed) show_text override's color
+// parsing was: not worth reverse-engineering a format RE_Kenshi's headers don't document.
+static bool tryParseHexColor(const std::string& value, MyGUI::Colour& outColor)
 {
-	Character* patient = g_pendingReactivationPatient;
-	closeReactivatePanel();
-	if (!patient)
+	std::string hex = (!value.empty() && value[0] == '#') ? value.substr(1) : value;
+	if (hex.size() != 6)
+		return false;
+
+	for (size_t i = 0; i < hex.size(); ++i)
+	{
+		if (!isxdigit((unsigned char)hex[i]))
+			return false;
+	}
+
+	unsigned int r = (unsigned int)strtoul(hex.substr(0, 2).c_str(), nullptr, 16);
+	unsigned int g = (unsigned int)strtoul(hex.substr(2, 2).c_str(), nullptr, 16);
+	unsigned int b = (unsigned int)strtoul(hex.substr(4, 2).c_str(), nullptr, 16);
+	outColor = MyGUI::Colour(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+	return true;
+}
+
+// Item IDs come from JSON (user-supplied, unverified), so this is SEH-guarded the same way the old
+// (removed) take_item override was - MSVC forbids local C++ objects with destructors (std::string
+// included) in a function that also uses __try/__except (C2712), so this stays free of them.
+static GameData* getGameDataGuarded(const std::string& id, itemType category)
+{
+	__try
+	{
+		return ou->gamedata.getData(id, category);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return nullptr;
+	}
+}
+
+// Gates whether a button is even shown - not whether its steps can still run once shown. The
+// "take_item" step re-checks defensively anyway (the item could in principle be lost between show and
+// click).
+static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character* initiator)
+{
+	if (!btn.requiresSkill.empty())
+	{
+		CharStats* stats = initiator ? initiator->getStats() : nullptr;
+		if (!stats)
+			return false;
+
+		auto fieldIt = g_skillFields.find(toLowerCopy(btn.requiresSkill));
+		if (fieldIt != g_skillFields.end())
+		{
+			float value = stats->*(fieldIt->second);
+			if (btn.hasMinSkill && value < btn.minSkill)
+				return false;
+			if (btn.hasMaxSkill && value > btn.maxSkill)
+				return false;
+		}
+		// An unrecognized skill name is logged once at JSON-load time, not here - a typo shouldn't
+		// hide a button on every single show, just be visible once in the log.
+	}
+
+	if (!btn.requiresItem.empty())
+	{
+		Inventory* inv = initiator ? initiator->_NV_getInventory() : nullptr;
+		GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
+		if (!inv || !itemData || !inv->hasItem(itemData, 1))
+			return false;
+	}
+
+	return true;
+}
+
+static Character* g_pendingDialoguePatient = nullptr;
+static Character* g_pendingDialogueInitiator = nullptr;
+static MyGUI::VectorWidgetPtr g_dialogueLayoutWidgets;
+static std::vector<DialogueBoxButtonDef> g_currentDialogueButtons; // parallel to visible ButtonA/B/C, by index
+
+static void closeDialogueBox()
+{
+	if (!g_dialogueLayoutWidgets.empty())
+	{
+		MyGUI::LayoutManager::getInstance().unloadLayout(g_dialogueLayoutWidgets);
+		g_dialogueLayoutWidgets.clear();
+	}
+	g_pendingDialoguePatient = nullptr;
+	g_pendingDialogueInitiator = nullptr;
+	g_currentDialogueButtons.clear();
+}
+
+// "show_text" is a floating rising-text notification (ForgottenGUI::createScreenLabel(), tracking the
+// patient) - independent of, and not tied to, the dialogue box itself (which is already closed by the
+// time any step runs - see OnDialogueButtonClicked). Not a GUI panel/message box.
+static void showFloatingText(Character* patient, const std::string& text, const std::string& colorHex)
+{
+	if (!gui || text.empty())
 		return;
 
-	DebugLog("SkeletonRebirth: reactivate panel - Yes clicked for " + patient->_NV_getName());
-	if (!TryReactivate(patient))
-		ErrorLog("SkeletonRebirth: TryReactivate failed for " + patient->_NV_getName() + " after confirm");
+	std::string resolvedText = text;
+	size_t namePos = resolvedText.find("{name}");
+	if (namePos != std::string::npos)
+		resolvedText.replace(namePos, 6, patient->_NV_getName());
 
-	// Tidiness only - TryReactivate() already erased patient from g_deactivated on success, so the
-	// trigger check in Character_updateOnScreenCheck_hook short-circuits before ever reading this
-	// regardless. On failure, deliberately NOT erased - see the comment on the "No" branch below for
-	// why leaving it set is what prevents an instant re-prompt loop.
-	g_reactivateDialogueShown.erase(patient);
+	MyGUI::Colour color = MyGUI::Colour::White;
+	if (!colorHex.empty() && !tryParseHexColor(colorHex, color))
+		ErrorLog("SkeletonRebirth: dialogue step \"show_text\" has unrecognized color \"" + colorHex + "\" (expected \"#RRGGBB\") - defaulting to white");
+
+	ScreenLabel* label = gui->createScreenLabel(resolvedText, color, ScreenLabel::LS_MEDIUM, ScreenLabel::RS_SLOW);
+	if (label)
+		label->setTracking(patient->getHandle(), Ogre::Vector3(0, 1, 0));
 }
 
-static void OnReactivateNoClicked(MyGUI::Widget* sender)
+// A step sequence paused on a "delay" step resumes here rather than at click time - picked up by
+// Character_updateOnScreenCheck_hook, which already polls every frame per character (see that hook's
+// resume check). GetTickCount64() (wall-clock milliseconds) is used rather than a per-frame delta,
+// since updateOnScreenCheck() doesn't receive one and this is cosmetic UI pacing, not gameplay-critical
+// timing - the same relaxed precision the old (removed) "delay" override type used, just driven by wall
+// clock instead of Dialogue::update()'s frameTime.
+struct PendingDialogueSequence
 {
-	Character* patient = g_pendingReactivationPatient;
-	closeReactivatePanel();
-	if (patient)
-		DebugLog("SkeletonRebirth: reactivate panel - No clicked for " + patient->_NV_getName());
+	std::vector<DialogueBoxStepDef> steps; // copied, not referenced - see dispatchDialogueSteps()
+	size_t nextIndex;
+	Character* initiator;
+	ULONGLONG fireAtTick;
+};
+static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
-	// Deliberately NOT erasing g_reactivateDialogueShown here (unlike the old, event-triggered
-	// version of this flow). The trigger is now level-triggered - it fires every tick the character
-	// is still in the bed (see Character_updateOnScreenCheck_hook) - so clearing the flag here would
-	// let the very next tick re-open the panel immediately, making "No" appear to do nothing (live
-	// tested - it does exactly this). Leaving the flag set means "already asked for this bed-visit";
-	// it only gets cleared once the character actually leaves the bed, in the hook below.
+// Runs `steps` in order starting at `startIndex` for `patient`. A "delay" step suspends the rest of the
+// sequence in g_pendingDialogueSequences and returns immediately, resuming later (see
+// Character_updateOnScreenCheck_hook) rather than blocking. `steps` is copied into the pending entry
+// (not referenced) since it's cheap and avoids any lifetime question about where the caller's vector
+// lives relative to when the delay elapses.
+static void dispatchDialogueSteps(Character* patient, Character* initiator, const std::vector<DialogueBoxStepDef>& steps, size_t startIndex)
+{
+	for (size_t i = startIndex; i < steps.size(); ++i)
+	{
+		const DialogueBoxStepDef& step = steps[i];
+
+		if (step.type == "delay")
+		{
+			if (step.seconds > 0.0f)
+			{
+				PendingDialogueSequence pending;
+				pending.steps = steps;
+				pending.nextIndex = i + 1;
+				pending.initiator = initiator;
+				pending.fireAtTick = GetTickCount64() + (ULONGLONG)(step.seconds * 1000.0f);
+				g_pendingDialogueSequences[patient] = pending;
+				return; // remaining steps resume later
+			}
+			continue;
+		}
+
+		if (step.type == "take_item")
+		{
+			Inventory* inv = initiator ? initiator->_NV_getInventory() : nullptr;
+			GameData* itemData = inv ? getGameDataGuarded(step.item, ITEM) : nullptr;
+			if (!inv || !itemData || !inv->takeOneItemOnly(itemData))
+			{
+				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + step.item + "\") failed for " + patient->_NV_getName() + " - stopping the rest of this sequence");
+				return;
+			}
+			continue;
+		}
+
+		if (step.type == "show_text")
+		{
+			showFloatingText(patient, step.text, step.color);
+			continue;
+		}
+
+		if (step.type == "action")
+		{
+			auto actionIt = g_dialogueActions.find(step.action);
+			if (actionIt != g_dialogueActions.end())
+				actionIt->second(patient);
+			else
+				ErrorLog("SkeletonRebirth: dialogue step action \"" + step.action + "\" has no registered handler");
+			continue;
+		}
+
+		ErrorLog("SkeletonRebirth: unknown dialogue step type \"" + step.type + "\" for " + patient->_NV_getName());
+	}
 }
 
-// initiator is unused now (this panel has no per-character "who's asking" concept) - kept in the
-// signature since callers already have it in hand and it costs nothing to ignore.
-static void showReactivateDialogue(Character* patient, Character* initiator)
+static void OnDialogueButtonClicked(MyGUI::Widget* sender)
 {
-	if (g_pendingReactivationPatient)
-		return; // one at a time - a second bed-placement shouldn't stack a second panel
+	Character* patient = g_pendingDialoguePatient;
+	Character* initiator = g_pendingDialogueInitiator;
 
-	g_pendingReactivationPatient = patient;
+	// Which of ButtonA/B/C fired - looked up by widget identity while the layout is still loaded, since
+	// closeDialogueBox() below unloads it.
+	int index = -1;
+	if (!g_dialogueLayoutWidgets.empty())
+	{
+		MyGUI::Widget* root = g_dialogueLayoutWidgets[0];
+		const std::string prefix = "SkeletonRebirth_";
+		if (sender == root->findWidget(prefix + "ButtonA"))
+			index = 0;
+		else if (sender == root->findWidget(prefix + "ButtonB"))
+			index = 1;
+		else if (sender == root->findWidget(prefix + "ButtonC"))
+			index = 2;
+	}
+
+	DialogueBoxButtonDef btn;
+	bool hasBtn = (index >= 0 && index < (int)g_currentDialogueButtons.size());
+	if (hasBtn)
+		btn = g_currentDialogueButtons[index];
+
+	closeDialogueBox();
+
+	if (!patient || !hasBtn)
+		return;
+
+	dispatchDialogueSteps(patient, initiator, btn.steps, 0);
+}
+
+// Shows the JSON-defined dialogue box `dialogueId` (see RE_Kenshi.json's "DialogueBoxes" object) for
+// `patient`. `initiator` is who a "requiresItem"/"requiresSkill" button (and any "take_item" step) is
+// checked against (e.g. the player character) - null is fine for a dialogue with no gated buttons or
+// item steps.
+static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator)
+{
+	if (g_pendingDialoguePatient)
+		return; // one at a time - a second trigger shouldn't stack a second box
+
+	auto defIt = g_dialogueBoxes.find(dialogueId);
+	if (defIt == g_dialogueBoxes.end())
+	{
+		ErrorLog("SkeletonRebirth: no dialogue box definition for \"" + dialogueId + "\" - is RE_Kenshi.json missing a \"DialogueBoxes\" entry for it?");
+		return;
+	}
+	const DialogueBoxDef& def = defIt->second;
+
+	// Resolve eligible buttons first, before loading the layout - a dialogue with every button gated
+	// out from under the current initiator would otherwise show as an unclosable empty box.
+	std::vector<DialogueBoxButtonDef> eligibleButtons;
+	for (size_t i = 0; i < def.buttons.size() && eligibleButtons.size() < 3; ++i)
+	{
+		if (isDialogueButtonEligible(def.buttons[i], initiator))
+			eligibleButtons.push_back(def.buttons[i]);
+	}
+	if (eligibleButtons.empty())
+	{
+		ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" has no eligible buttons for this initiator - not shown");
+		return;
+	}
+
+	g_pendingDialoguePatient = patient;
+	g_pendingDialogueInitiator = initiator;
 
 	// Prefixing every widget name avoids collisions with a second load of the same layout elsewhere
 	// in the game (MyGUI names should be unique) - "Root"/"ButtonA" etc. become
 	// "SkeletonRebirth_Root"/"SkeletonRebirth_ButtonA" etc. after loading.
 	const std::string prefix = "SkeletonRebirth_";
-	g_reactivateLayoutWidgets = MyGUI::LayoutManager::getInstance().loadLayout("Kenshi_MessageBox.layout", prefix, nullptr);
-	if (g_reactivateLayoutWidgets.empty())
+	g_dialogueLayoutWidgets = MyGUI::LayoutManager::getInstance().loadLayout("Kenshi_MessageBox.layout", prefix, nullptr);
+	if (g_dialogueLayoutWidgets.empty())
 	{
 		ErrorLog("SkeletonRebirth: loadLayout(Kenshi_MessageBox.layout) returned no widgets");
-		g_pendingReactivationPatient = nullptr;
+		g_pendingDialoguePatient = nullptr;
+		g_pendingDialogueInitiator = nullptr;
 		return;
 	}
 
-	MyGUI::Widget* root = g_reactivateLayoutWidgets[0];
-	root->setProperty("Caption", "Reactivate?");
+	MyGUI::Widget* root = g_dialogueLayoutWidgets[0];
+	root->setProperty("Caption", def.title);
+
+	// Kenshi_MessageBox.layout's own Root position_real is "0 0 0.182292 0.148148" - anchored at the
+	// screen's top-left corner by default. No real-size getter exists in this SDK to compute this
+	// dynamically, so the same fixed width/height from the layout file is reused here, just recentered:
+	// left/top = (1 - width/height) / 2.
+	root->setRealCoord(0.408854f, 0.425926f, 0.182292f, 0.148148f);
+
+	std::string message = def.message;
+	size_t namePos = message.find("{name}");
+	if (namePos != std::string::npos)
+		message.replace(namePos, 6, patient->_NV_getName());
 
 	MyGUI::Widget* messageText = root->findWidget(prefix + "MessageText");
 	if (messageText)
-	{
-		std::string message = "Attempt to reactivate " + patient->_NV_getName() + "? It will wake up critically damaged and need immediate treatment.";
 		messageText->setProperty("Caption", message);
+
+	static const char* buttonWidgetNames[3] = { "ButtonA", "ButtonB", "ButtonC" };
+	g_currentDialogueButtons = eligibleButtons;
+	for (int i = 0; i < 3; ++i)
+	{
+		MyGUI::Widget* button = root->findWidget(prefix + buttonWidgetNames[i]);
+		if (!button)
+			continue;
+
+		if (i < (int)eligibleButtons.size())
+		{
+			button->setProperty("Caption", eligibleButtons[i].caption);
+			button->setVisible(true);
+			button->eventMouseButtonClick += MyGUI::newDelegate(OnDialogueButtonClicked);
+		}
+		else
+		{
+			// Fewer than 3 buttons ended up eligible - Kenshi_MessageBox.layout always has all three.
+			button->setVisible(false);
+		}
 	}
 
-	MyGUI::Widget* buttonA = root->findWidget(prefix + "ButtonA");
-	if (buttonA)
-	{
-		buttonA->setProperty("Caption", "Yes");
-		buttonA->eventMouseButtonClick += MyGUI::newDelegate(OnReactivateYesClicked);
-	}
-
-	MyGUI::Widget* buttonB = root->findWidget(prefix + "ButtonB");
-	if (buttonB)
-	{
-		buttonB->setProperty("Caption", "No");
-		buttonB->eventMouseButtonClick += MyGUI::newDelegate(OnReactivateNoClicked);
-	}
-
-	// The layout has a third button (ButtonC) this feature has no use for - only Yes/No are needed.
-	MyGUI::Widget* buttonC = root->findWidget(prefix + "ButtonC");
-	if (buttonC)
-		buttonC->setVisible(false);
-
-	DebugLog("SkeletonRebirth: reactivate panel (Kenshi_MessageBox.layout) shown for " + patient->_NV_getName());
+	DebugLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" shown for " + patient->_NV_getName());
 }
 
-// --- JSON-driven conversation overrides ---------------------------------------------------------
-// What happens when a given FCS reply fires is data-driven (RE_Kenshi.json, "ConversationOverrides"
-// key), not hardcoded per-feature - only *starting* the conversation in the first place
-// (SR_REACTIVATE_DIALOGUE_ID above) stays in the DLL. Any FCS reply/line ID can be tagged with one
-// or more named overrides; the plugin dispatches to whichever handlers are registered for that
-// override's "type" whenever Dialogue::replyClicked reports that ID. Adding a new FCS-authored
-// choice that reuses an existing override type (reactivate_skeleton) needs zero new C++ - just a
-// JSON edit and a game restart.
-struct ConversationOverride
+// The one action a dialogue box "action" step can currently trigger. Registered into g_dialogueActions
+// in startPlugin(). "No"/dismiss buttons just have an empty steps list - see closeDialogueBox()'s
+// unconditional close in OnDialogueButtonClicked.
+static void DialogueAction_Reactivate(Character* patient)
 {
-	std::string type;                          // e.g. "reactivate_skeleton"
-	std::map<std::string, std::string> params;  // empty if none
-};
-static std::map<std::string, std::vector<ConversationOverride> > g_conversationOverrides; // keyed by FCS reply ID
+	if (!TryReactivate(patient))
+		ErrorLog("SkeletonRebirth: TryReactivate failed for " + patient->_NV_getName() + " after confirm");
 
-// dialogueLine is currently always nullptr - no override handler needs the resolved DialogLineData
-// object, so dispatch never resolves it (see dispatchConversationOverrides). Kept in the signature so
-// a future override type that genuinely needs it can add SEH-guarded resolution scoped to just that
-// handler, without forcing every dispatch back into the native lookup.
-typedef bool (*OverrideHandler)(Character* patient, Character* initiator, DialogLineData* dialogueLine, const ConversationOverride&);
-static std::map<std::string, OverrideHandler> g_overrideHandlers; // keyed by override type
-
-static std::string getParam(const ConversationOverride& override, const std::string& key, const std::string& fallback)
-{
-	std::map<std::string, std::string>::const_iterator it = override.params.find(key);
-	return it != override.params.end() ? it->second : fallback;
+	// Tidiness only - TryReactivate() already erased patient from g_deactivated on success, so the
+	// trigger check in Character_updateOnScreenCheck_hook short-circuits before ever reading this
+	// regardless. On failure, deliberately left alone, for the same reason a "No" click leaves it
+	// alone - see g_reactivateDialogueShown's own declaration comment for why.
+	g_reactivateDialogueShown.erase(patient);
 }
 
-// The existing revival logic, unchanged - just relocated behind the generic dispatch instead of
-// being called directly by name from handleDialogueReplyClicked.
-static bool applyReactivateSkeletonOverride(Character* patient, Character* initiator, DialogLineData* dialogueLine, const ConversationOverride& override)
+// Same Win32 "find our own module's path" technique the old (removed) ConversationOverrides system
+// used - mod DLLs don't get a working directory of their own, so this is how a mod locates its own
+// folder to load bundled config from (RE_Kenshi.json, this file, etc. all sit next to the DLL).
+static std::string getOwnModDirectory()
 {
-	bool success = TryReactivate(patient);
-	if (success)
-		g_reactivateDialogueShown.erase(patient); // cycle concluded - being placed in the bed again later may prompt again
+	HMODULE module = NULL;
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)&getOwnModDirectory, &module))
+		return "";
 
-	return success;
+	char modulePath[MAX_PATH];
+	if (GetModuleFileNameA(module, modulePath, sizeof(modulePath)) == 0)
+		return "";
+
+	std::string path(modulePath);
+	size_t lastSlash = path.find_last_of("\\/");
+	return lastSlash != std::string::npos ? path.substr(0, lastSlash + 1) : "";
 }
 
-// Dialogue::replyClicked can report both sides of a mutually-exclusive Yes/No choice for what the
-// player experienced as a single click (a spurious report of the unclicked side, ~1.5s before the
-// real one). Dispatching immediately on the first replyClicked seen would act on the wrong answer, so
-// replies are buffered per-patient instead and only committed once Dialogue::update() (see below)
-// detects the conversation has ended - trust the last reply reported before the conversation
-// genuinely ends, not the first one seen.
-static std::map<Character*, std::string> g_pendingReplyId;
-static std::map<Character*, Character*> g_pendingInitiator;
-
-static void dispatchConversationOverrides(Character* patient, Character* initiator, const std::string& replyId)
+static void loadDialogueBoxesFromJson()
 {
-	std::map<std::string, std::vector<ConversationOverride> >::iterator overridesIt = g_conversationOverrides.find(replyId);
-	if (overridesIt == g_conversationOverrides.end())
+	// Nested under "DialogueBoxes" in RE_Kenshi.json itself, not a separate file - matching the old
+	// (removed) ConversationOverrides/DialogueSkillChecks system, which both lived under their own keys
+	// in this exact same file rather than each getting their own JSON.
+	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
+	std::ifstream file(jsonPath.c_str());
+	if (!file.is_open())
 	{
-		DebugLog("SkeletonRebirth: no ConversationOverrides configured for reply \"" + replyId + "\" - nothing to do");
+		ErrorLog("SkeletonRebirth: could not open \"" + jsonPath + "\" - no dialogue boxes will show");
 		return;
 	}
 
-	// dialogueLine isn't resolved here - no handler needs it (see the OverrideHandler typedef comment
-	// above), so dispatch runs purely off the FCS String ID, never touching the underlying game data
-	// object for content this plugin didn't author.
-	const std::vector<ConversationOverride>& overrides = overridesIt->second;
-	for (size_t i = 0; i < overrides.size(); ++i)
+	rapidjson::IStreamWrapper isw(file);
+	rapidjson::Document doc;
+	if (doc.ParseStream(isw).HasParseError())
 	{
-		const ConversationOverride& override = overrides[i];
+		ErrorLog("SkeletonRebirth: JSON parse error in \"" + jsonPath + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
+		return;
+	}
 
-		std::map<std::string, OverrideHandler>::iterator handlerIt = g_overrideHandlers.find(override.type);
-		if (handlerIt == g_overrideHandlers.end())
-		{
-			ErrorLog("SkeletonRebirth: no handler registered for conversation override type \"" + override.type + "\"");
+	if (!doc.IsObject() || !doc.HasMember("DialogueBoxes") || !doc["DialogueBoxes"].IsObject())
+	{
+		ErrorLog("SkeletonRebirth: \"" + jsonPath + "\" has no \"DialogueBoxes\" object - no dialogue boxes will show");
+		return;
+	}
+	const rapidjson::Value& dialogueBoxes = doc["DialogueBoxes"];
+
+	for (auto it = dialogueBoxes.MemberBegin(); it != dialogueBoxes.MemberEnd(); ++it)
+	{
+		if (!it->value.IsObject())
 			continue;
+
+		const rapidjson::Value& v = it->value;
+		DialogueBoxDef def;
+		def.title = (v.HasMember("title") && v["title"].IsString()) ? v["title"].GetString() : "";
+		def.message = (v.HasMember("message") && v["message"].IsString()) ? v["message"].GetString() : "";
+
+		if (v.HasMember("buttons") && v["buttons"].IsArray())
+		{
+			for (auto bit = v["buttons"].Begin(); bit != v["buttons"].End(); ++bit)
+			{
+				if (!bit->IsObject())
+					continue;
+
+				DialogueBoxButtonDef btn;
+				btn.caption = (bit->HasMember("caption") && (*bit)["caption"].IsString()) ? (*bit)["caption"].GetString() : "";
+				if (bit->HasMember("requiresItem") && (*bit)["requiresItem"].IsString())
+					btn.requiresItem = (*bit)["requiresItem"].GetString();
+				if (bit->HasMember("requiresSkill") && (*bit)["requiresSkill"].IsString())
+				{
+					btn.requiresSkill = (*bit)["requiresSkill"].GetString();
+					if (!g_skillFields.count(toLowerCopy(btn.requiresSkill)))
+						ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has unrecognized requiresSkill \"" + btn.requiresSkill + "\" - this button will show unconditionally (skill part of the check is skipped)");
+				}
+				if (bit->HasMember("minSkill") && (*bit)["minSkill"].IsNumber())
+				{
+					btn.hasMinSkill = true;
+					btn.minSkill = (*bit)["minSkill"].GetFloat();
+				}
+				if (bit->HasMember("maxSkill") && (*bit)["maxSkill"].IsNumber())
+				{
+					btn.hasMaxSkill = true;
+					btn.maxSkill = (*bit)["maxSkill"].GetFloat();
+				}
+
+				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
+				{
+					for (auto sit = (*bit)["steps"].Begin(); sit != (*bit)["steps"].End(); ++sit)
+					{
+						if (!sit->IsObject())
+							continue;
+
+						DialogueBoxStepDef step;
+						step.type = (sit->HasMember("type") && (*sit)["type"].IsString()) ? (*sit)["type"].GetString() : "";
+						if (step.type.empty())
+						{
+							ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has a step with no \"type\" - skipped");
+							continue;
+						}
+						if (sit->HasMember("action") && (*sit)["action"].IsString())
+							step.action = (*sit)["action"].GetString();
+						if (sit->HasMember("item") && (*sit)["item"].IsString())
+							step.item = (*sit)["item"].GetString();
+						if (sit->HasMember("text") && (*sit)["text"].IsString())
+							step.text = (*sit)["text"].GetString();
+						if (sit->HasMember("color") && (*sit)["color"].IsString())
+							step.color = (*sit)["color"].GetString();
+						if (sit->HasMember("seconds") && (*sit)["seconds"].IsNumber())
+							step.seconds = (*sit)["seconds"].GetFloat();
+						btn.steps.push_back(step);
+					}
+				}
+
+				def.buttons.push_back(btn);
+			}
 		}
 
-		if (!handlerIt->second(patient, initiator, nullptr, override))
-			ErrorLog("SkeletonRebirth: conversation override \"" + override.type + "\" failed for reply \"" + replyId + "\"");
+		g_dialogueBoxes[it->name.GetString()] = def;
 	}
-}
 
-// --- Reply detection: Dialogue::replyClicked, both overloads ---------------------------------------
-// The standard dialogue system handles the actual conversation UI end-to-end once
-// startPlayerConversation() has started it (see showReactivateDialogue() above); this hook is only how
-// the plugin finds out which reply the player picked.
-//
-// This fires for every dialogue reply click in the entire game, not just this mod's, so
-// g_conversationOverrides.count(replyId) must stay the very first thing this function does - a plain
-// map lookup, no native calls, no string construction, a true instant no-op for anything unconfigured.
-// Both overloads are hooked because the native dialogue window calls both for a single click, but only
-// the string overload's value is trusted (see the int overload's comment below).
-static void handleDialogueReplyClicked(Dialogue* self, const std::string& replyId, Character* initiator, const char* fromOverload, bool trustworthy)
-{
-	if (!g_conversationOverrides.count(replyId))
-		return;
-
-	Character* patient = self->me;
-	if (!patient)
-		return;
-
-	DebugLog("SkeletonRebirth: replyClicked(" + std::string(fromOverload) + ") fired -> patient=" + patient->_NV_getName() + " reply=\"" + replyId + "\"");
-
-	// The int overload's resolved index->replyIds lookup is known unreliable (live-tested: can report
-	// a different reply than the string overload for the same click) - logged for diagnostics only,
-	// never buffered/dispatched.
-	if (!trustworthy)
-		return;
-
-	g_pendingReplyId[patient] = replyId;
-	g_pendingInitiator[patient] = initiator;
-}
-
-// index here is a position into Dialogue::replyIds, not itself a reply's String ID - resolved to a
-// String ID for the diagnostic log line only. Its value is known unreliable (can report a different
-// reply than the string overload for the same click), so it's never buffered/dispatched, only logged.
-void (*Dialogue_replyClickedInt_orig)(Dialogue*, int);
-void Dialogue_replyClickedInt_hook(Dialogue* self, int index)
-{
-	std::string replyId = (index >= 0 && (size_t)index < self->replyIds.size()) ? self->replyIds[index] : "<index out of range>";
-	Dialogue_replyClickedInt_orig(self, index);
-	handleDialogueReplyClicked(self, replyId, nullptr, "int", false);
-}
-
-void (*Dialogue_replyClickedStr_orig)(Dialogue*, const std::string&);
-void Dialogue_replyClickedStr_hook(Dialogue* self, const std::string& index)
-{
-	Character* initiator = self->conversationTarget.getCharacter(); // capture before orig - same reasoning as currentLine elsewhere in this file
-	Dialogue_replyClickedStr_orig(self, index);
-	handleDialogueReplyClicked(self, index, initiator, "string", true);
-}
-
-// Dialogue::_endPlayerConversation does not fire in this flow, so conversation-end is detected by
-// edge-triggering on Dialogue::conversationHasEnded() inside Dialogue::update() instead - a per-frame,
-// per-character function (same "hot function, hook carefully" category as the deliberately-avoided
-// Character::update()), so a cheap map lookup gates everything else: this only does real work for
-// patients that actually have a pending reply buffered, in practice zero characters almost all the
-// time, one at most while our own dialogue is active.
-void (*Dialogue_update_orig)(Dialogue*, float);
-void Dialogue_update_hook(Dialogue* self, float frameTime)
-{
-	Character* patient = self->me;
-	bool hasPending = patient && g_pendingReplyId.count(patient) != 0;
-
-	Dialogue_update_orig(self, frameTime);
-
-	if (!hasPending || !self->conversationHasEnded())
-		return;
-
-	std::string replyId = g_pendingReplyId[patient];
-	Character* initiator = g_pendingInitiator.count(patient) ? g_pendingInitiator[patient] : nullptr;
-	g_pendingReplyId.erase(patient);
-	g_pendingInitiator.erase(patient);
-
-	DebugLog("SkeletonRebirth: conversation ended for " + patient->_NV_getName() + " - committing last-seen reply \"" + replyId + "\"");
-	dispatchConversationOverrides(patient, initiator, replyId);
-
-	// If dispatch didn't reactivate the patient (e.g. "No", or a reply with no reactivate_skeleton
-	// override at all), this "ask and await an answer" cycle is over: clear g_reactivateDialogueShown
-	// so leaving and re-entering the bed later can prompt again (MedicalSystem_medicalUpdate_hook is
-	// what actually guards against the dialogue reopening every tick while still in the bed).
-	if (g_deactivated.count(patient))
-		g_reactivateDialogueShown.erase(patient);
+	std::ostringstream summary;
+	summary << "SkeletonRebirth: loaded " << g_dialogueBoxes.size() << " dialogue box definition(s) from \"" << jsonPath << "\"";
+	DebugLog(summary.str());
 }
 
 // Character::update() is deliberately NOT hooked. Skipping it entirely (an earlier version did)
@@ -563,26 +1045,27 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 	MedicalSystem_medicalUpdate_orig(self, frameTime);
 }
 
-// Random-spawn robots left Deactivated and unattended eventually complete a real death, matching
-// normal dead-NPC cleanup - Player/Unique robots are permanently exempt (per direct feedback:
-// "Player and Unique should permanently remain"). Continuously tracking a "last seen on screen"
-// timestamp (refreshed every tick while isOnScreen, checked against the threshold only while not)
-// absorbs isOnScreen's frustum/occlusion-boundary flicker for free - DESIGN.md §4's original sketch
-// needed a dedicated edge-detection debounce for this; polling every tick doesn't.
-static std::map<Character*, double> g_lastSeenOnScreen;
-static const float CLEANUP_THRESHOLD_HOURS = 3.0f * 24.0f; // 3 in-game days
-
-// --- Hook: Character::updateOnScreenCheck() - reactivation trigger + cleanup sweep polling point ---
-// Reused from DESIGN.md §4's cleanup-sweep proposal ("fires roughly every frame per character") as
-// the reactivation-trigger polling point too, since medicalUpdate() (the original choice) stopped
-// firing once dead=true - see that hook's comment. Screen-visibility tracking is a different
-// subsystem from medical simulation and keeps running for a corpse (confirmed by live testing -
-// rendering/culling still needs it). Always calls orig() - this only observes, never blocks/alters
-// the real on-screen-check behavior.
+// --- Hook: Character::updateOnScreenCheck() - reactivation trigger polling point -------------------
+// Reused from an earlier cleanup-sweep design ("fires roughly every frame per character") as the
+// reactivation-trigger polling point - a leftover from when medicalUpdate() (the original choice)
+// stopped firing under the old dead=true design; see that hook's comment. No cleanup sweep of any kind
+// lives here (or anywhere in this file currently - see the top-of-file summary comment).
+// Always calls orig() - this only observes, never blocks/alters the real on-screen-check behavior.
 bool (*Character_updateOnScreenCheck_orig)(Character*);
 bool Character_updateOnScreenCheck_hook(Character* self)
 {
 	bool result = Character_updateOnScreenCheck_orig(self);
+
+	// Paused dialogue step sequences (see PendingDialogueSequence) resume from here, regardless of
+	// self's own g_deactivated status - this hook fires every frame for every character, not just
+	// tracked ones, so it doubles as the tick source without needing a new hook.
+	auto delayIt = g_pendingDialogueSequences.find(self);
+	if (delayIt != g_pendingDialogueSequences.end() && GetTickCount64() >= delayIt->second.fireAtTick)
+	{
+		PendingDialogueSequence pending = delayIt->second;
+		g_pendingDialogueSequences.erase(delayIt);
+		dispatchDialogueSteps(self, pending.initiator, pending.steps, pending.nextIndex);
+	}
 
 	auto it = g_deactivated.find(self);
 	if (it == g_deactivated.end() || !it->second)
@@ -592,8 +1075,8 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	{
 		if (!g_reactivateDialogueShown.count(self))
 		{
-			Character* initiator = ou->player ? ou->player->getAnyPlayerCharacter() : nullptr;
-			showReactivateDialogue(self, initiator);
+			Character* initiator = (ou && ou->player) ? ou->player->getAnyPlayerCharacter() : nullptr;
+			showDialogueBox("reactivate_confirm", self, initiator);
 			g_reactivateDialogueShown[self] = true;
 		}
 	}
@@ -601,75 +1084,28 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	{
 		// Left the bed (or never entered it yet) - reset "already asked" so a future bed-placement
 		// prompts again. This is also what makes a "No" answer's dismissal stick instead of an
-		// instant re-prompt loop: see OnReactivateNoClicked's comment - that handler deliberately
-		// does NOT clear this flag itself, only leaving the bed does.
+		// instant re-prompt loop: see g_reactivateDialogueShown's own declaration comment for why
+		// dismissing the box doesn't clear this flag itself, only leaving the bed does.
 		g_reactivateDialogueShown.erase(self);
-	}
-
-	if (self->isOnScreen)
-	{
-		g_lastSeenOnScreen[self] = ou->getTimeStamp_inGameHours().time;
-	}
-	else
-	{
-		auto seenIt = g_lastSeenOnScreen.find(self);
-		if (seenIt != g_lastSeenOnScreen.end() && ou->getTimeFromStamp_inGameHours(seenIt->second) >= CLEANUP_THRESHOLD_HOURS)
-		{
-			if (self->isPlayerCharacter() || self->isUnique())
-			{
-				// Permanently exempt - checked at sweep time (not at the moment of Deactivation), so
-				// a robot that's later recruited/renamed unique is still covered correctly. Keep
-				// tracking its on-screen timestamp regardless (harmless) rather than special-casing
-				// it out of g_lastSeenOnScreen entirely.
-			}
-			else
-			{
-				DebugLog("SkeletonRebirth: cleanup sweep - letting real death proceed for " + describe(self));
-				g_deactivated.erase(self);
-				g_reactivateDialogueShown.erase(self);
-				g_lastSeenOnScreen.erase(seenIt);
-				Character_declareDead_orig(self);
-			}
-		}
 	}
 
 	return result;
 }
 
 // --- Hook: DatapanelGUI::setLine(key,s1,s2,category,last,keyVisible) - status tag override -------
-// The character info panel's "State:" row (category 3) is corpse-only - confirmed via live testing
-// that it never fires while a robot sits Deactivated with dead=false, but fires reliably once dead
-// is left true (see Character_declareDead_hook). Vanilla sets it to an inline-color-tagged "Dead"
-// (dark red, e.g. "#59231aDead"); for a Deactivated robot this overrides it to a distinct color +
-// "Deactivated" instead, so it reads differently from a real death at a glance. A second, separate
-// all-caps "DEAD" banner line goes through this same overload (the word is baked directly into
-// keyValue/s1 with no separate s2) and is overridden the same way.
-static std::string toLowerCopy(const std::string& s)
-{
-	std::string result = s;
-	for (size_t i = 0; i < result.size(); ++i)
-		result[i] = (char)tolower((unsigned char)result[i]);
-	return result;
-}
+// The character info panel's "State:" row (category 3) is overridden unconditionally for any tracked
+// Deactivated character, regardless of what vanilla text it was about to show (see the override's own
+// comment below for why this had to move away from matching literal "Dead" text).
+static const char* DEACTIVATED_COLOR = "#59231a"; // vanilla's own dark red, same as its "Dead" text
 
-// MyGUI inline color tags are a literal '#' + 6 hex digits prefixed directly onto the text with no
-// separator (e.g. "#59231aDead"). Splits that prefix off so the plain word can be compared/rebuilt.
-static void splitColorTag(const std::string& s, std::string* colorOut, std::string* textOut)
-{
-	if (s.size() >= 7 && s[0] == '#')
-	{
-		*colorOut = s.substr(0, 7);
-		*textOut = s.substr(7);
-	}
-	else
-	{
-		*colorOut = "";
-		*textOut = s;
-	}
-}
-
-static const char* DEACTIVATED_COLOR = "#4a6fa5"; // blue/grey - visually distinct from vanilla's dark red "Dead"
-
+// Broadened from matching the word "dead" specifically to overriding unconditionally: now that
+// declareDead_hook leaves MedicalSystem::dead false (see that hook's comment for why), the corpse-only
+// native call that used to set literal "Dead" text never fires for these characters at all - whatever
+// text WOULD show for a character frozen at fatal health while still alive (most likely "Dying" or
+// "Critical") gets overridden unconditionally instead of pattern-matched, so it doesn't matter what the
+// underlying vanilla text actually is. The old text-matching all-caps "DEAD" banner branch is gone -
+// that banner is corpse-only UI and should never fire anymore now that dead stays false; if it somehow
+// does, it'll just show vanilla's own text rather than silently going unhandled.
 DataPanelLine* (*DatapanelGUI_setLine_KeyLastVisible_orig)(DatapanelGUI*, const std::string&, const std::string&, const std::string&, int, bool, bool);
 DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, const std::string& keyValue, const std::string& s1, const std::string& s2, int category, bool last, bool keyVisible)
 {
@@ -677,131 +1113,22 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 	if (!target || !g_deactivated.count(target))
 		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);
 
-	// The "State:" row - value carries the color tag, key/s1 stay "State:".
+	// The "State:" row - value carries the color tag, key/s1 stay "State:". Confirmed live: vanilla's
+	// native KO-state text here is "Rebooting" for robots (organic races apparently show "Recovery
+	// coma") - color-tagged the same dark red (#59231a) vanilla uses for "Dead" elsewhere.
 	if (keyValue == "State:")
 	{
-		std::string color, text;
-		splitColorTag(s2, &color, &text);
-		if (toLowerCopy(text) == "dead")
-		{
-			std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + "Deactivated";
-			return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, overriddenS2, category, last, keyVisible);
-		}
-	}
-
-	// The standalone all-caps banner - the word IS the key/s1, color-tagged, no separate s2.
-	{
-		std::string color, text;
-		splitColorTag(keyValue, &color, &text);
-		if (!color.empty() && s2.empty() && toLowerCopy(text) == "dead")
-		{
-			std::string overriddenKey = color + "DEACTIVATED";
-			return DatapanelGUI_setLine_KeyLastVisible_orig(self, overriddenKey, overriddenKey, s2, category, last, keyVisible);
-		}
+		std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + "POWER FAILURE";
+		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, overriddenS2, category, last, keyVisible);
 	}
 
 	return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);
 }
 
-// --- Loading ConversationOverrides from RE_Kenshi.json -----------------------------------------
-// RE_Kenshi.json already sits next to this DLL in the mod folder and is already parsed with
-// rapidjson by RE_Kenshi's own loader (Plugins.cpp, for "PreloadPlugins"/"Plugins") - reusing that
-// same file/library here instead of a new config file or a new dependency. Extra top-level keys
-// don't interfere with RE_Kenshi's own parsing (it only ever checks for specific expected keys), so
-// adding "ConversationOverrides" alongside "Plugins" is safe.
-
-// No existing KenshiLib helper resolves a plugin's own directory - Debug.cpp's GetModuleName()
-// deliberately strips to just the base filename (confirmed by reading its implementation), which
-// is useless here. Same underlying Win32 technique, keeping the directory instead of stripping it.
-static std::string getOwnModDirectory()
-{
-	HMODULE module = NULL;
-	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)&getOwnModDirectory, &module))
-		return "";
-
-	char modulePath[MAX_PATH];
-	if (GetModuleFileNameA(module, modulePath, sizeof(modulePath)) == 0)
-		return "";
-
-	std::string path(modulePath);
-	size_t lastSlash = path.find_last_of("\\/");
-	return lastSlash != std::string::npos ? path.substr(0, lastSlash + 1) : "";
-}
-
-// Shared by both loaders below - RE_Kenshi.json is only opened/parsed once per startPlugin() now,
-// rather than once per JSON section consumed.
-static bool loadOwnJsonDocument(rapidjson::Document& doc, const std::string& jsonPath)
-{
-	std::ifstream file(jsonPath.c_str());
-	if (!file.is_open())
-	{
-		ErrorLog("SkeletonRebirth: could not open \"" + jsonPath + "\"");
-		return false;
-	}
-
-	rapidjson::IStreamWrapper isw(file);
-	if (doc.ParseStream(isw).HasParseError())
-	{
-		ErrorLog("SkeletonRebirth: JSON parse error in \"" + jsonPath + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
-		return false;
-	}
-
-	return true;
-}
-
-static void loadConversationOverridesFromJson(const rapidjson::Document& doc, const std::string& jsonPath)
-{
-	if (!doc.HasMember("ConversationOverrides") || !doc["ConversationOverrides"].IsObject())
-	{
-		ErrorLog("SkeletonRebirth: \"" + jsonPath + "\" has no \"ConversationOverrides\" object - reactivation dialogue replies will do nothing");
-		return;
-	}
-
-	const rapidjson::Value& conversationOverrides = doc["ConversationOverrides"];
-	for (rapidjson::Value::ConstMemberIterator replyIt = conversationOverrides.MemberBegin(); replyIt != conversationOverrides.MemberEnd(); ++replyIt)
-	{
-		if (!replyIt->value.IsArray())
-		{
-			ErrorLog("SkeletonRebirth: ConversationOverrides[\"" + std::string(replyIt->name.GetString()) + "\"] is not an array - skipped");
-			continue;
-		}
-
-		std::vector<ConversationOverride> overrides;
-		const rapidjson::Value& overrideArray = replyIt->value;
-		for (rapidjson::SizeType i = 0; i < overrideArray.Size(); ++i)
-		{
-			const rapidjson::Value& entry = overrideArray[i];
-			if (!entry.HasMember("type") || !entry["type"].IsString())
-				continue;
-
-			ConversationOverride override;
-			override.type = entry["type"].GetString();
-
-			for (rapidjson::Value::ConstMemberIterator paramIt = entry.MemberBegin(); paramIt != entry.MemberEnd(); ++paramIt)
-			{
-				if (paramIt->value.IsString())
-					override.params[paramIt->name.GetString()] = paramIt->value.GetString();
-			}
-
-			overrides.push_back(override);
-		}
-
-		g_conversationOverrides[replyIt->name.GetString()] = overrides;
-	}
-
-	std::ostringstream countMsg;
-	countMsg << "SkeletonRebirth: loaded ConversationOverrides for " << g_conversationOverrides.size() << " repl(ies) from JSON";
-	DebugLog(countMsg.str());
-}
-
 __declspec(dllexport) void startPlugin()
 {
-	g_overrideHandlers["reactivate_skeleton"] = &applyReactivateSkeletonOverride;
-
-	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
-	rapidjson::Document doc;
-	if (loadOwnJsonDocument(doc, jsonPath))
-		loadConversationOverridesFromJson(doc, jsonPath);
+	g_dialogueActions["reactivate"] = &DialogueAction_Reactivate;
+	loadDialogueBoxesFromJson();
 
 	// CONFIRMED SAFE - each individually isolated via single-variable live testing (removed alone while
 	// the rest of the plugin's hooks stayed active; crash still reproduced identically both times,
@@ -816,16 +1143,11 @@ __declspec(dllexport) void startPlugin()
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Character::updateOnScreenCheck), Character_updateOnScreenCheck_hook, &Character_updateOnScreenCheck_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add Character::updateOnScreenCheck hook!");
 
-	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((void(Dialogue::*)(int))&Dialogue::replyClicked), Dialogue_replyClickedInt_hook, &Dialogue_replyClickedInt_orig))
-		ErrorLog("SkeletonRebirthDiagnostics: Could not add Dialogue::replyClicked(int) hook!");
-
-	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((void(Dialogue::*)(const std::string&))&Dialogue::replyClicked), Dialogue_replyClickedStr_hook, &Dialogue_replyClickedStr_orig))
-		ErrorLog("SkeletonRebirthDiagnostics: Could not add Dialogue::replyClicked(string) hook!");
-
-	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Dialogue::update), Dialogue_update_hook, &Dialogue_update_orig))
-		ErrorLog("SkeletonRebirthDiagnostics: Could not add Dialogue::update hook!");
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&HandleManager::_NV_restore), HandleManager_restore_hook, &HandleManager_restore_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add HandleManager::_NV_restore hook!");
 
 	typedef DataPanelLine* (DatapanelGUI::*SetLineKeyLastVisibleFn)(const std::string&, const std::string&, const std::string&, int, bool, bool);
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((SetLineKeyLastVisibleFn)&DatapanelGUI::setLine), DatapanelGUI_setLine_KeyLastVisible_hook, &DatapanelGUI_setLine_KeyLastVisible_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add DatapanelGUI::setLine(key,last,visible) hook!");
+
 }

@@ -1,8 +1,28 @@
 {
 	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
-	"ConversationOverrides" : {
-		"12-Skeleton Rebirth.mod" : [
-			{ "type" : "reactivate_skeleton" }
-		]
+	"DialogueBoxes" : {
+		"reactivate_confirm": {
+			"title": "Repair",
+			"message": "{name} is in a catastrophic shutdown loop. Do you want to attempt repairs?",
+			"buttons": [
+				{
+					"caption": "Yes",
+					"requiresSkill": "science",
+					"minSkill": 1,
+					"requiresItem": "43392-changes_otto.mod",
+					"steps": [
+						{ "type": "take_item", "item": "43392-changes_otto.mod" },
+						{ "type": "show_text", "text": "Used AI Core", "color": "#FF4C4C" },
+						{ "type": "delay", "seconds": 5 },
+						{ "type": "show_text", "text": "{name} has been successfully revived!", "color": "#3399FF" },
+						{ "type": "action", "action": "reactivate" }
+					]
+				},
+				{
+					"caption": "No",
+					"steps": []
+				}
+			]
+		}
 	}
 }

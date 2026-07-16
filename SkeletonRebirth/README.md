@@ -1,71 +1,105 @@
 # SkeletonRebirth
 
 Robot-race characters (`RaceData::robot == true` — Skeletons, Iron Spiders, Soldierbot Guards,
-Security Spiders, etc.) never enter vanilla Dead state. Instead they collapse into a permanent
-KO/"Rebooting" **Deactivated** state, and can only be brought back by using a Skeleton Repair Kit
-on them while they're in a Skeleton Repair Bed, confirming a prompt, and spending an item (a Power
-Core, per the FCS dialogue's own text and item requirement) from whoever used the kit. See
-[`DESIGN.md`](DESIGN.md) for the full architecture and implementation reference.
+Security Spiders, etc.) never enter vanilla Dead state directly. Instead they collapse into a
+**Deactivated** state - reversibly, since the real death transition never runs, and
+`MedicalSystem::dead` is kept false throughout (deliberately - see DESIGN.md §1 for why an earlier
+version that left `dead=true` for "free" AI/looting/GUI integration was abandoned after it caused a real
+crash). A Deactivated robot goes inert on its own, via vanilla's own permanent-at-catastrophic-damage
+knockout state - no explicit AI pause is needed. Placing a Deactivated robot in a Skeleton Repair Bed
+prompts reactivation via a confirmation dialogue box, whose text and button behavior are data-driven
+from a `"DialogueBoxes"` object nested in [`RE_Kenshi.json`](RE_Kenshi.json) rather than hardcoded C++.
+Survives save/reload. Cleanup of unattended Deactivated robots is **not implemented** - see DESIGN.md
+§5. See [`DESIGN.md`](DESIGN.md) for the full architecture, including three separate rejected
+approaches for both the reactivation trigger and the confirmation box itself, a note on a
+virtual-function hooking pitfall worth knowing about before touching this code, and the two abandoned
+cleanup designs (one of which caused the crash mentioned above).
 
 ## What it does
 
-Six hooks in `SkeletonRebirthDiagnostics.cpp`:
+Hooks in `SkeletonRebirthDiagnostics.cpp`:
 
 | Hook | Purpose |
 |---|---|
-| `Character::declareDead()` | Blocked entirely for robots — clears `MedicalSystem::dead` instead of letting real death proceed, and marks the character Deactivated. |
-| `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely (no healing, no further deterioration, and stops `declareDead()` from re-firing). |
-| `MedicalSystem::applyFirstAid(...)` | The reactivation trigger. When a `ITEM_ROBOTREPAIR` item is used on a Deactivated character in a bed with `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, starts a real FCS dialogue instead of reactivating immediately. |
-| `Dialogue::replyClicked(int)` / `Dialogue::replyClicked(const std::string&)` | Reads back which reply the player picked (both overloads are hooked - the native dialogue window calls both for a single click; only the `string` overload's value is trusted), then dispatches whatever **conversation overrides** are configured for that reply in `RE_Kenshi.json` — see below. |
-| `Dialogue::update(float)` | Detects when a conversation has genuinely ended, to commit the last reply reported (see DESIGN.md — `Dialogue::replyClicked` can report both sides of a Yes/No choice for one click). |
+| `Character::declareDead()` | Blocked entirely for robots — forces `MedicalSystem::dead` back to false (native code sets it true just before calling this, so it has to be reasserted, not just left alone) instead of letting the real transition proceed, and marks the character Deactivated. |
+| `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely. |
+| `Character::updateOnScreenCheck()` | Reactivation trigger only: prompts when a Deactivated robot is in the Skeleton Repair Bed. |
+| `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` | Overrides the "State:" GUI tag (vanilla shows "Rebooting" for a robot in this state) to "POWER FAILURE" in vanilla's own dead-red, unconditionally, for tracked robots. |
+| `HandleManager::_NV_restore(std::ifstream&)` | Post-load trigger: re-resolves the persisted Deactivated-robot list after a save loads. |
 
-The confirmation prompt is a real interactive conversation opened via `Dialogue::startPlayerConversation()` — the actual native "start a player conversation with choices" entry point.
+The confirmation box is a real instance of Kenshi's own `Kenshi_MessageBox.layout`, loaded via
+`MyGUI::LayoutManager` and recentered on screen - not a hand-built widget tree, and not the FCS dialogue
+system (both were tried under an earlier `dead=true` design; see DESIGN.md for why they didn't work once
+a robot was genuinely `dead=true`).
 
 `Character::update()` is deliberately **not** hooked — see DESIGN.md for why.
 
 Debug output goes through KenshiLib's `DebugLog()` (see `Debug.h`) with a `SkeletonRebirth:` prefix.
 
-## Configuring reactivation via `RE_Kenshi.json`
+## Dialogue boxes
 
-Only *which* FCS dialogue to start (on the repair-kit-in-bed trigger) is hardcoded
-(`SR_REACTIVATE_DIALOGUE_ID`). What happens when a given reply fires is data-driven — any FCS
-reply/line String ID can be tagged in `RE_Kenshi.json` with one or more named **conversation
-overrides**, dispatched generically whenever that reply is clicked:
+A `"DialogueBoxes"` object nested inside `RE_Kenshi.json` itself (not a separate file) defines every
+custom dialogue box's title, message, button gating, and button behavior - not hardcoded per-dialogue
+C++. `{name}` is replaced with the patient character's name wherever it appears. A button's behavior is
+an ordered list of `"steps"`, run in sequence when clicked:
 
 ```json
 {
-    "Plugins": ["SkeletonRebirthDiagnostics.dll"],
-    "ConversationOverrides": {
-        "12-Skeleton Rebirth.mod": [
-            { "type": "reactivate_skeleton" }
-        ]
+    "Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
+    "DialogueBoxes" : {
+        "reactivate_confirm": {
+            "title": "Repair",
+            "message": "{name} is in a catastrophic shutdown loop. Do you want to attempt repairs?",
+            "buttons": [
+                {
+                    "caption": "Yes",
+                    "requiresSkill": "science",
+                    "minSkill": 1,
+                    "requiresItem": "43392-changes_otto.mod",
+                    "steps": [
+                        { "type": "take_item", "item": "43392-changes_otto.mod" },
+                        { "type": "show_text", "text": "Used AI Core" },
+                        { "type": "delay", "seconds": 5 },
+                        { "type": "show_text", "text": "{name} has been successfully revived!" },
+                        { "type": "action", "action": "reactivate" }
+                    ]
+                },
+                { "caption": "No", "steps": [] }
+            ]
+        }
     }
 }
 ```
 
-One override type exists:
+Four step types:
+- `"action"` — dispatches a named action from a small `std::map<std::string, DialogueActionFn>`
+  registry (populated in `startPlugin()`). `"reactivate"` is the only one registered right now. A button
+  with no steps at all (e.g. "No") just closes the box - there's no separate close-only step type, since
+  closing already happens on any click before its steps run.
+- `"take_item"` — consumes one of `item` from whoever triggered the dialogue's inventory; stops the rest
+  of that button's steps if it fails.
+- `"show_text"` — a floating rising-text notification tracking the patient, **not** a GUI panel and not
+  tied to the dialogue box (which is already closed by the time steps run). Optional `"color"`:
+  `"#RRGGBB"` hex, defaults to white.
+- `"delay"` — pauses the *remaining* steps for `seconds`, then resumes them automatically. The box itself
+  doesn't wait - it's already closed.
 
-| `type` | Params | Purpose |
-|---|---|---|
-| `reactivate_skeleton` | *(none)* | The core revival logic — flesh nudge, un-Deactivate. |
+Separately, `requiresItem` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `CharStats` skill name,
+0-100 scale) on a button gate whether it's even *shown* - checked once, against whoever triggered the
+dialogue, before the box appears. This is deliberately independent of a `take_item` step actually
+consuming the same item - one controls visibility, the other controls what happens on click - so a
+button that both requires and consumes an item lists that item ID in both places.
 
-Attaching an existing override type to a new or changed FCS reply only needs a JSON edit and a
-restart — no rebuild. Adding a genuinely new override *type* still needs new C++ (a handler function
-registered in `startPlugin()`), but from then on it's reusable by any conversation, not just this one.
+See DESIGN.md §4 for the full design, including why this is a different (and much simpler) system than
+the mod's older, removed FCS `Dialogue`-hooking approach, even though it now covers the same
+item/skill/delay/text-notification features that older system had.
 
-**Works on any FCS dialogue reply, including stock/vanilla content** — not limited to this mod's own
-dialogue tree.
+## Persistence
 
-Item-consumption effects, floating notification text, delayed sequencing, and skill-gated dialogue
-conditions used to be implemented here too (`take_item`/`show_text`/`delay` overrides,
-`DialogueSkillChecks`). All were removed in favor of
-[BFrizz_Extra_Extensions](https://github.com/BFrizzleFoShizzle/BFrizz_Extra_Extensions/wiki), a
-community-supported FCS extension that already provides native item, notification, and stat-level
-dialogue effects/conditions — author those directly in FCS using that extension instead of through
-`RE_Kenshi.json`.
-
-Parsed with **rapidjson** (vendored into `KenshiLib_Examples_deps/rapidjson` — see Build below),
-reusing the same file RE_Kenshi's own loader already reads for `"Plugins"`.
+Which robots are Deactivated survives save/reload via a small JSON side-file
+(`SkeletonRebirth_Deactivated.json`, an array of handle strings) written next to the active save on
+every state change, and re-read on load. No `RE_Kenshi.json` configuration is needed for this - it's
+automatic. See DESIGN.md §6 for why a side-file rather than a native save-data hook.
 
 ## Build
 
@@ -91,4 +125,6 @@ FCS to produce (not something to hand-author blind).
 
 Carrier mod: **`Skeleton Rebirth`** (an empty mod created via FCS's "New Mod" button). Drop the
 built `SkeletonRebirthDiagnostics.dll` and this `RE_Kenshi.json` into `mods/Skeleton Rebirth/` next
-to its `.mod` file, then enable **Skeleton Rebirth** in Kenshi's Mods tab.
+to its `.mod` file, then enable **Skeleton Rebirth** in Kenshi's Mods tab. `RE_Kenshi.json`'s
+`"DialogueBoxes"` object is read at startup (see "Dialogue boxes" above) - if it's missing or empty,
+dialogue boxes silently fail to show (logged, not a crash).
