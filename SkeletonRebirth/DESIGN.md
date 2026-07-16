@@ -203,18 +203,20 @@ A button's behavior is an ordered list of **steps**, not a single action - direc
 system's per-reply override list (`reactivate_skeleton`/`take_item`/`show_text`/`delay` types), just
 attached to a dialogue box button instead of an FCS dialogue reply. Reimplemented from scratch rather
 than restored verbatim, since there's no `Dialogue`/`DialogLineData` object here to hook into - the
-shipped `reactivate_confirm` entry exercises all four step types:
+shipped `system_menu` entry exercises all four step types, plus a second registered action
+(`system_reset` - see `DialogueAction_SystemReset()`, which wipes every skill and core attribute to 1
+and fast-recruits the patient via `PlayerInterface::recruit()`):
 
 ```json
 {
     "Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
     "DialogueBoxes" : {
-        "reactivate_confirm": {
-            "title": "Repair",
-            "message": "{name} is in a catastrophic shutdown loop. Do you want to attempt repairs?",
+        "system_menu": {
+            "title": "System Menu",
+            "message": "{name} is in a catastrophic shutdown loop. What do you want to do?",
             "buttons": [
                 {
-                    "caption": "Yes",
+                    "caption": "Repair",
                     "requiresSkill": "science",
                     "minSkill": 1,
                     "requiresItem": "43392-changes_otto.mod",
@@ -226,7 +228,8 @@ shipped `reactivate_confirm` entry exercises all four step types:
                         { "type": "action", "action": "reactivate" }
                     ]
                 },
-                { "caption": "No", "steps": [] }
+                { "caption": "Reset", "steps": [ { "type": "action", "action": "system_reset" } ] },
+                { "caption": "Do nothing", "steps": [] }
             ]
         }
     }

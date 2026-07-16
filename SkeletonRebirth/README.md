@@ -47,12 +47,12 @@ an ordered list of `"steps"`, run in sequence when clicked:
 {
     "Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
     "DialogueBoxes" : {
-        "reactivate_confirm": {
-            "title": "Repair",
-            "message": "{name} is in a catastrophic shutdown loop. Do you want to attempt repairs?",
+        "system_menu": {
+            "title": "System Menu",
+            "message": "{name} is in a catastrophic shutdown loop. What do you want to do?",
             "buttons": [
                 {
-                    "caption": "Yes",
+                    "caption": "Repair",
                     "requiresSkill": "science",
                     "minSkill": 1,
                     "requiresItem": "43392-changes_otto.mod",
@@ -64,7 +64,8 @@ an ordered list of `"steps"`, run in sequence when clicked:
                         { "type": "action", "action": "reactivate" }
                     ]
                 },
-                { "caption": "No", "steps": [] }
+                { "caption": "Reset", "steps": [ { "type": "action", "action": "system_reset" } ] },
+                { "caption": "Do nothing", "steps": [] }
             ]
         }
     }
@@ -73,9 +74,10 @@ an ordered list of `"steps"`, run in sequence when clicked:
 
 Four step types:
 - `"action"` — dispatches a named action from a small `std::map<std::string, DialogueActionFn>`
-  registry (populated in `startPlugin()`). `"reactivate"` is the only one registered right now. A button
-  with no steps at all (e.g. "No") just closes the box - there's no separate close-only step type, since
-  closing already happens on any click before its steps run.
+  registry (populated in `startPlugin()`). `"reactivate"` releases the patient from Deactivated state;
+  `"system_reset"` wipes every skill and core attribute to 1 and fast-recruits the patient into the
+  player faction. A button with no steps at all (e.g. "Do nothing") just closes the box - there's no
+  separate close-only step type, since closing already happens on any click before its steps run.
 - `"take_item"` — consumes one of `item` from whoever triggered the dialogue's inventory; stops the rest
   of that button's steps if it fails.
 - `"show_text"` — a floating rising-text notification tracking the patient, **not** a GUI panel and not

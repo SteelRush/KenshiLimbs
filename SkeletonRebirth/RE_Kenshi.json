@@ -1,12 +1,12 @@
 {
 	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
 	"DialogueBoxes" : {
-		"reactivate_confirm": {
-			"title": "Repair",
-			"message": "{name} is in a catastrophic shutdown loop. Do you want to attempt repairs?",
+		"system_menu": {
+			"title": "System Menu",
+			"message": "{name} is in a catastrophic shutdown loop. What do you want to do?",
 			"buttons": [
 				{
-					"caption": "Yes",
+					"caption": "Repair",
 					"requiresSkill": "science",
 					"minSkill": 1,
 					"requiresItem": "43392-changes_otto.mod",
@@ -19,7 +19,13 @@
 					]
 				},
 				{
-					"caption": "No",
+					"caption": "Reset",
+					"steps": [
+						{ "type": "action", "action": "system_reset" }
+					]
+				},
+				{
+					"caption": "Do nothing",
 					"steps": []
 				}
 			]
