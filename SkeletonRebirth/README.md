@@ -100,6 +100,11 @@ button that both requires and consumes an item lists that item ID in both places
 player's faction - used on "Reset" so a recruited squad member can't have their skills wiped and be
 re-recruited, only a wild/unaffiliated robot can.
 
+**Keep button `caption`s short (~10 characters or less).** `Kenshi_MessageBox.layout`'s buttons have a
+fixed width, sized for short captions like the layout's own placeholder "A"/"B"/"C" - text doesn't wrap
+or shrink to fit, it just clips on both sides once centered text overflows. Confirmed live: "Do nothing"
+(10 characters) rendered fully; "Run Diagnostics" (15 characters) rendered as "un Diagnostic".
+
 See DESIGN.md §4 for the full design, including why this is a different (and much simpler) system than
 the mod's older, removed FCS `Dialogue`-hooking approach, even though it now covers the same
 item/skill/delay/text-notification features that older system had.

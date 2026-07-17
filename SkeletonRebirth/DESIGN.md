@@ -148,15 +148,35 @@ were abandoned in favour of dynamic (live) diagnostic hooking throughout the res
   vanilla reasons, so simply checking "is this Deactivated robot now in the bed" on it needs no new hook
   site at all, and was adopted instead.
 
-**Confirmation UI**: a real dialogue box loaded from Kenshi's own `Kenshi_MessageBox.layout` via
-`MyGUI::LayoutManager::getInstance().loadLayout(...)`, recentered on screen (the layout's own
-`position_real` anchors it top-left by default - `Widget::setRealCoord()` with the same fixed
-width/height from the layout file, just recentered: `left/top = (1 - width/height) / 2`; no real-size
-getter exists in this SDK to compute that dynamically). Its content is data-driven, not hardcoded per
-dialogue - see "JSON-driven dialogue boxes" below - with `MessageText`/`ButtonA`/`ButtonB`/`ButtonC`
-widgets found by name and relabeled via the generic `Widget::setProperty("Caption", ...)`, any button
-beyond however many the JSON entry defines hidden. Three earlier approaches to the box itself (as
-opposed to what drives its content, which came later) were tried and rejected:
+**Confirmation UI**: a real dialogue box built via `MessageBoxManager::createMessageBox()` - the same
+native function the game itself uses for its own confirmation popups - rather than manually
+`MyGUI::LayoutManager::getInstance().loadLayout("Kenshi_MessageBox.layout", ...)`-ing the layout
+directly (an earlier version did this, and worked, but there was no way to confirm from inside this
+mod alone whether its window chrome genuinely matched the rest of the game's UI or merely looked
+plausible - going through the native entry point removes that doubt, since it's the same code path
+rather than a lookalike). `createMessageBox()`'s real mangled name is too long for MASM's identifier
+limit, so KenshiLib's `.inc` generator exports it under an arbitrary placeholder symbol
+(`MessageBoxManager_createMessageBox_PLACEHOLDER`) instead of its true name - a recurring pattern
+across ~24 functions in KenshiLib, not specific to this one - so it's called via an `extern "C"`
+redeclaration under that literal exported name rather than the header's own declaration (which compiles
+but fails to link). `MessageBoxManager` owns the resulting `MyGUI::Window`'s entire lifecycle -
+creation, positioning, and teardown on click - so there's no layout to manually unload the way the
+`loadLayout()` version needed; this file only tracks which patient/initiator/buttons a pending box
+belongs to, for its `IDelegate1<int>` callback to use once a button's clicked (the `int` is the
+button's index into the eligible-buttons list, not a widget lookup).
+
+**Button captions have a real, confirmed character limit.** `Kenshi_MessageBox.layout`'s buttons
+(`Kenshi_Button2` skin) have a fixed width, sized for short captions like the layout's own placeholder
+"A"/"B"/"C" - text doesn't wrap or shrink to fit, it just clips on both sides once centered text
+overflows. Confirmed live via screenshot: "Do nothing" (10 characters) rendered fully; "Run
+Diagnostics" (15 characters) rendered as "un Diagnostic" - both ends clipped. `RE_Kenshi.json`'s
+button captions were shortened accordingly ("Diagnose"/"Repair"/"Reset"/"Cancel"/"Do nothing"). Keep
+future captions at roughly "Do nothing"'s length (~10 characters) or shorter.
+
+Its content is data-driven, not hardcoded per dialogue - see "JSON-driven dialogue boxes" below - with
+each eligible button's caption and an integer id passed straight to `createMessageBox()`, any button
+beyond however many the JSON entry defines simply not included in that list. Three earlier approaches
+to the box itself (as opposed to what drives its content, which came later) were tried and rejected:
 - `Dialogue::startPlayerConversation()` (the original design) stopped working once an earlier design's
   `dead=true` took effect - live testing showed the game suppresses dialogue entirely for a dead
   character. Moot now, for the same reason as `applyFirstAid()` above.
@@ -422,18 +442,14 @@ itself being restored is the natural "a load just happened" signal.
   comparison; not hooked in the shipped version. `MedicalDatapanel` itself is forward-declared only, no
   full definition anywhere in RE_Kenshi's headers
 - `hand::getCharacter() const` / `fromString(const std::string&)` / `toString() const` — util/hand.h:49/39/38
-- `MyGUI::LayoutManager::loadLayout(file, prefix, parent)` / `unloadLayout(widgets)` —
-  mygui/MyGUI_LayoutManager.h:38/41 — loads `data/gui/layout/Kenshi_MessageBox.layout`
-- `MyGUI::Widget::setProperty(key, value)` — mygui/MyGUI_Widget.h:257 — generic property setter, what
-  the layout XML's `<Property>` tags compile down to; used instead of type-specific `setCaption()` so no
-  casting from the generic `Widget*` `findWidget()` returns is needed
-- `MyGUI::Widget::findWidget(const std::string&)` — mygui/MyGUI_Widget.h:206
+- `MessageBoxManager::createMessageBox(title, message, buttons, modal, callback)` —
+  gui/MessageBoxManager.h:30 — real mangled name too long for MASM, exported as
+  `MessageBoxManager_createMessageBox_PLACEHOLDER` instead (see MessageBoxManager.inc); redeclared
+  `extern "C"` under that literal name since the header's own declaration compiles but doesn't link
 - `MyGUI::newDelegate(void(*)(Args...))` — mygui/MyGUI_DelegateImplement.h (via mygui/MyGUI_Delegate.h -
-  `MyGUI_DelegateImplement.h` is a macro-driven template generator, not includable directly)
-- `MyGUI::Widget::setRealCoord(float, float, float, float)` / `setRealPosition` —
-  mygui/MyGUI_Widget.h:130/137 — normalized 0.0-1.0 screen-fraction positioning, matching `position_real`
-  in `.layout` XML; used to recenter the dialogue box (§3/§4). No matching real-size *getter* exists in
-  this SDK.
+  `MyGUI_DelegateImplement.h` is a macro-driven template generator, not includable directly) — used here
+  for the `MyGUI::delegates::IDelegate1<int>*` callback `createMessageBox()` invokes with the clicked
+  button's id
 - `getOwnModDirectory()` / `loadDialogueBoxesFromJson()` — this file, not RE_Kenshi/KenshiLib - locates
   the mod's own folder (Win32 `GetModuleHandleExA`/`GetModuleFileNameA`, no working directory of its own
   for a DLL) and loads `RE_Kenshi.json`'s `"DialogueBoxes"` object from it (see §4)

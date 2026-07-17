@@ -20,10 +20,11 @@
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
 #include <kenshi/gui/ForgottenGUI.h>
+#include <kenshi/gui/MessageBoxManager.h>
 #include <kenshi/gui/ScreenLabel.h>
 
 #include <mygui/MyGUI_Delegate.h>
-#include <mygui/MyGUI_LayoutManager.h>
+#include <mygui/MyGUI_Window.h>
 
 #include <core/Functions.h>
 
@@ -43,6 +44,7 @@
 #include <sstream>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 // AI/AI.h forward-declares CharacterMessage as a class while Character.h defines it as an enum,
@@ -53,6 +55,23 @@ class AI
 public:
 	AITaskSytem* getTaskSystem() const;
 };
+
+// MessageBoxManager::createMessageBox() as declared in MessageBoxManager.h fails to link
+// ("unresolved external symbol") - confirmed via the build error, then confirmed why via
+// MessageBoxManager.inc: its real mangled name (five template-heavy parameters) is too long for
+// MASM's identifier limit, so KenshiLib's .inc generator falls back to exporting it under an
+// arbitrary placeholder name instead of its true mangled one - a documented, recurring pattern for
+// ~24 functions across KenshiLib (e.g. AnimalInventoryLayout::setupSections and others hit the same
+// limit), not something specific to this function. The placeholder is a plain `jmp` to the real
+// function's address, so it's calling-convention-transparent - redeclaring it here with matching
+// parameter types under its literal exported name (extern "C" to skip C++ name mangling on our side)
+// calls the exact same native function the header's declaration was meant to reach.
+extern "C" MyGUI::Window* MessageBoxManager_createMessageBox_PLACEHOLDER(
+	const std::string& title,
+	const std::string& message,
+	const Ogre::vector<std::pair<std::string, int> >::type& buttons,
+	bool modal,
+	MyGUI::delegates::IDelegate1<int>* callback);
 
 // SkeletonRebirth plugin - see DESIGN.md for full history and rejected approaches. Robots never
 // actually die (declareDead blocked, MedicalSystem::dead kept false); a Deactivated robot sits inert
@@ -346,11 +365,22 @@ bool TryReactivate(Character* self)
 	return true;
 }
 
-// Custom MyGUI box rather than Dialogue::startPlayerConversation() (dialogue was suppressed while
+// Custom dialogue box rather than Dialogue::startPlayerConversation() (dialogue was suppressed while
 // this mod was still using MedicalSystem::dead=true - see DESIGN.md) or hand-built widgets
 // (ForgottenGUI::createPanel/createButton render nothing usable without a ResourceLayout template).
-// Kenshi_MessageBox.layout is loaded via MyGUI::LayoutManager and its widgets repurposed by name -
-// see DESIGN.md for the full rejected-approaches history.
+//
+// Built via MessageBoxManager::createMessageBox() - the same native function the game itself uses for
+// its own confirmation popups - rather than manually MyGUI::LayoutManager::loadLayout()-ing
+// Kenshi_MessageBox.layout directly (an earlier version did this). The hand-loaded version rendered
+// with only a plain dark background instead of the game's real window chrome, even though it
+// referenced the identical skin ("Kenshi_WindowC", the same Kenshi_GenericWindowSkin/
+// Kenshi_GenericWindowHeaderSkin body every other window in the game uses) - going through the native
+// entry point instead guarantees the box looks and positions itself exactly like every other message
+// box in the game, since it's the same code path rather than a lookalike. This also means
+// MessageBoxManager owns the box's entire lifecycle - creation, positioning, and teardown on click -
+// so there's no layout to manually unload the way there was before; this file only needs to track
+// which patient/initiator/buttons a pending box belongs to for when its callback fires.
+// See DESIGN.md for the full rejected-approaches history.
 //
 // --- JSON-driven dialogue boxes -----------------------------------------------------------------
 // Box text and button behavior are data-driven from RE_Kenshi.json's "DialogueBoxes" object rather
@@ -379,6 +409,11 @@ struct DialogueBoxStepDef
 
 struct DialogueBoxButtonDef
 {
+	// Kenshi_MessageBox.layout's buttons (Kenshi_Button2 skin) have a fixed width sized for short
+	// captions like the layout's own placeholder "A"/"B"/"C" - text doesn't wrap or shrink to fit, it
+	// just clips on both sides once centered text overflows the button. Confirmed live: "Do nothing"
+	// (10 characters) rendered fully; "Run Diagnostics" (15 characters) rendered as "un Diagnostic" -
+	// both ends clipped. Keep captions at "Do nothing"'s length or shorter (~10 characters) to be safe.
 	std::string caption;
 	std::vector<DialogueBoxStepDef> steps; // run in order when clicked - see dispatchDialogueSteps()
 	std::string requiresItem;  // FCS/GameData item String ID - hidden unless initiator has one
@@ -388,8 +423,9 @@ struct DialogueBoxButtonDef
 	bool hasMaxSkill;
 	float maxSkill;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
+	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresDeactivated(false) {}
 };
 
 struct DialogueBoxDef
@@ -494,6 +530,8 @@ static std::map<std::string, float CharStats::*> buildAttributeFieldTable()
 	table["perception"] = &CharStats::perception;
 	table["toughness"] = &CharStats::_toughness;
 	table["athletics"] = &CharStats::_athletics;
+	table["meleeattack"] = &CharStats::__meleeAttack;
+	table["meleedefence"] = &CharStats::_meleeDefence;
 	return table;
 }
 static const std::map<std::string, float CharStats::*> g_attributeFields = buildAttributeFieldTable();
@@ -552,6 +590,13 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 			return false;
 	}
 
+	if (btn.requiresDeactivated)
+	{
+		auto deactivatedIt = g_deactivated.find(patient);
+		if (deactivatedIt == g_deactivated.end() || !deactivatedIt->second)
+			return false;
+	}
+
 	if (!btn.requiresSkill.empty())
 	{
 		CharStats* stats = initiator ? initiator->getStats() : nullptr;
@@ -583,16 +628,12 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 
 static Character* g_pendingDialoguePatient = nullptr;
 static Character* g_pendingDialogueInitiator = nullptr;
-static MyGUI::VectorWidgetPtr g_dialogueLayoutWidgets;
-static std::vector<DialogueBoxButtonDef> g_currentDialogueButtons; // parallel to visible ButtonA/B/C, by index
+static std::vector<DialogueBoxButtonDef> g_currentDialogueButtons; // parallel to the button ids passed to createMessageBox
 
+// MessageBoxManager owns the actual MyGUI::Window's lifecycle - this only clears our own bookkeeping
+// of which patient/initiator/buttons a pending box belongs to, for OnMessageBoxButtonClicked() to use.
 static void closeDialogueBox()
 {
-	if (!g_dialogueLayoutWidgets.empty())
-	{
-		MyGUI::LayoutManager::getInstance().unloadLayout(g_dialogueLayoutWidgets);
-		g_dialogueLayoutWidgets.clear();
-	}
 	g_pendingDialoguePatient = nullptr;
 	g_pendingDialogueInitiator = nullptr;
 	g_currentDialogueButtons.clear();
@@ -687,8 +728,9 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 		{
 			// Terminal, like "delay" and a failed "take_item" - by the time a submenu is up and waiting
 			// on the player's next click, any further steps from this sequence have no clear meaning.
-			// The box that triggered this step is already closed (OnDialogueButtonClicked closes it
-			// before dispatching), so showDialogueBox()'s one-at-a-time guard doesn't block this.
+			// The box that triggered this step is already gone (MessageBoxManager destroys it as part
+			// of the click that led here, before OnMessageBoxButtonClicked ever dispatches), so
+			// showDialogueBox()'s one-at-a-time guard doesn't block this.
 			showDialogueBox(step.menu, patient, initiator);
 			return;
 		}
@@ -697,29 +739,19 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 	}
 }
 
-static void OnDialogueButtonClicked(MyGUI::Widget* sender)
+// IDelegate1<int> callback for MessageBoxManager::createMessageBox() - buttonId is whichever int we
+// paired each button's caption with in showDialogueBox() below (its index into g_currentDialogueButtons).
+// MessageBoxManager has already destroyed the box's native Window by the time this fires, so there's
+// no widget teardown to do here - just our own bookkeeping and dispatching the clicked button's steps.
+static void OnMessageBoxButtonClicked(int buttonId)
 {
 	Character* patient = g_pendingDialoguePatient;
 	Character* initiator = g_pendingDialogueInitiator;
 
-	// Looked up by widget identity before closeDialogueBox() unloads the layout below.
-	int index = -1;
-	if (!g_dialogueLayoutWidgets.empty())
-	{
-		MyGUI::Widget* root = g_dialogueLayoutWidgets[0];
-		const std::string prefix = "SkeletonRebirth_";
-		if (sender == root->findWidget(prefix + "ButtonA"))
-			index = 0;
-		else if (sender == root->findWidget(prefix + "ButtonB"))
-			index = 1;
-		else if (sender == root->findWidget(prefix + "ButtonC"))
-			index = 2;
-	}
-
 	DialogueBoxButtonDef btn;
-	bool hasBtn = (index >= 0 && index < (int)g_currentDialogueButtons.size());
+	bool hasBtn = (buttonId >= 0 && buttonId < (int)g_currentDialogueButtons.size());
 	if (hasBtn)
-		btn = g_currentDialogueButtons[index];
+		btn = g_currentDialogueButtons[buttonId];
 
 	closeDialogueBox();
 
@@ -744,7 +776,9 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 	}
 	const DialogueBoxDef& def = defIt->second;
 
-	// Resolved before loading the layout - every button gated out would otherwise show an unclosable box.
+	// Capped at 3 - Kenshi_MessageBox.layout (which createMessageBox() almost certainly still builds
+	// on internally, going by its fixed-size ButtonA/B/C widgets) only ever had 3 button slots, and
+	// createMessageBox()'s generic vector<pair<string,int>> signature doesn't confirm it supports more.
 	std::vector<DialogueBoxButtonDef> eligibleButtons;
 	for (size_t i = 0; i < def.buttons.size() && eligibleButtons.size() < 3; ++i)
 	{
@@ -757,54 +791,27 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	g_pendingDialoguePatient = patient;
-	g_pendingDialogueInitiator = initiator;
-
-	// Prefix avoids MyGUI widget-name collisions with any other load of the same layout.
-	const std::string prefix = "SkeletonRebirth_";
-	g_dialogueLayoutWidgets = MyGUI::LayoutManager::getInstance().loadLayout("Kenshi_MessageBox.layout", prefix, nullptr);
-	if (g_dialogueLayoutWidgets.empty())
-	{
-		ErrorLog("SkeletonRebirth: loadLayout(Kenshi_MessageBox.layout) returned no widgets");
-		g_pendingDialoguePatient = nullptr;
-		g_pendingDialogueInitiator = nullptr;
-		return;
-	}
-
-	MyGUI::Widget* root = g_dialogueLayoutWidgets[0];
-	root->setProperty("Caption", def.title);
-
-	// Recenters Kenshi_MessageBox.layout's fixed width/height (0.182292 x 0.148148, top-left by default) -
-	// no real-size getter exists in this SDK to compute this dynamically.
-	root->setRealCoord(0.408854f, 0.425926f, 0.182292f, 0.148148f);
-
 	std::string message = def.message;
 	size_t namePos = message.find("{name}");
 	if (namePos != std::string::npos)
 		message.replace(namePos, 6, patient->_NV_getName());
 
-	MyGUI::Widget* messageText = root->findWidget(prefix + "MessageText");
-	if (messageText)
-		messageText->setProperty("Caption", message);
+	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
+	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.
+	Ogre::vector<std::pair<std::string, int> >::type buttons;
+	for (size_t i = 0; i < eligibleButtons.size(); ++i)
+		buttons.push_back(std::make_pair(eligibleButtons[i].caption, (int)i));
 
-	static const char* buttonWidgetNames[3] = { "ButtonA", "ButtonB", "ButtonC" };
+	g_pendingDialoguePatient = patient;
+	g_pendingDialogueInitiator = initiator;
 	g_currentDialogueButtons = eligibleButtons;
-	for (int i = 0; i < 3; ++i)
-	{
-		MyGUI::Widget* button = root->findWidget(prefix + buttonWidgetNames[i]);
-		if (!button)
-			continue;
 
-		if (i < (int)eligibleButtons.size())
-		{
-			button->setProperty("Caption", eligibleButtons[i].caption);
-			button->setVisible(true);
-			button->eventMouseButtonClick += MyGUI::newDelegate(OnDialogueButtonClicked);
-		}
-		else
-		{
-			button->setVisible(false); // fewer than 3 buttons eligible
-		}
+	MyGUI::Window* window = MessageBoxManager_createMessageBox_PLACEHOLDER(def.title, message, buttons, /*modal*/ true, MyGUI::newDelegate(OnMessageBoxButtonClicked));
+	if (!window)
+	{
+		ErrorLog("SkeletonRebirth: MessageBoxManager::createMessageBox() returned null for \"" + dialogueId + "\"");
+		closeDialogueBox();
+		return;
 	}
 
 	DebugLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" shown for " + patient->_NV_getName());
@@ -939,6 +946,8 @@ static void loadDialogueBoxesFromJson()
 				}
 				if (bit->HasMember("excludePlayerFaction") && (*bit)["excludePlayerFaction"].IsBool())
 					btn.excludePlayerFaction = (*bit)["excludePlayerFaction"].GetBool();
+				if (bit->HasMember("requiresDeactivated") && (*bit)["requiresDeactivated"].IsBool())
+					btn.requiresDeactivated = (*bit)["requiresDeactivated"].GetBool();
 
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{
