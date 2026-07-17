@@ -29,6 +29,7 @@
 						{ "type": "show_text", "text": "Used AI Core", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 5 },
 						{ "type": "show_text", "text": "{name} has been reset!", "color": "#3399FF" },
+						{ "type": "action", "action": "join_squad_fast" },
 						{ "type": "action", "action": "system_reset" }
 					]
 				},

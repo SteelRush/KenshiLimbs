@@ -796,16 +796,36 @@ static void DialogueAction_Reactivate(Character* patient)
 	g_reactivateDialogueShown.erase(patient);
 }
 
-// recruit() runs BEFORE the stat reset now, not after - confirmed live that recruit(editor=true)
-// reinitializes the character's CharStats from its original template, which was silently clobbering
-// this function's own reset back to the character's pre-reset (modified) values whenever recruit() ran
-// second. CharStats* is re-fetched after recruit() rather than reusing a pointer captured beforehand,
-// in case recruit() replaces the object rather than mutating it in place.
-static void DialogueAction_SystemReset(Character* patient)
+// Split out from DialogueAction_SystemReset so a dialogue button can join the patient to the player's
+// squad independently of resetting its stats (e.g. joining without a reset, or a reset that doesn't
+// join). This is recruit()'s "with edit" mode (editor=true) - matches the native DA_JOIN_SQUAD_WITH_EDIT
+// dialogue action - and it's this exact mode that reinitializes the character's CharStats from its
+// original template, which is why it must run BEFORE system_reset whenever a button uses both (see that
+// function's comment). Use DialogueAction_JoinSquadFast below instead if a button just wants the
+// character in the squad without touching its stats. JSON authors are responsible for step order;
+// "join_squad" needs to be listed ahead of "system_reset" in the steps array for the reset to stick.
+static void DialogueAction_JoinSquad(Character* patient)
 {
 	if (ou && ou->player)
 		ou->player->recruit(patient, true);
+}
 
+// recruit()'s "fast" mode (editor=false) - matches the native DA_JOIN_SQUAD_FAST dialogue action -
+// skips the character-editing reinitialization DialogueAction_JoinSquad's editor=true triggers, so
+// unlike that one, this has no known ordering interaction with system_reset.
+static void DialogueAction_JoinSquadFast(Character* patient)
+{
+	if (ou && ou->player)
+		ou->player->recruit(patient, false);
+}
+
+// Must run AFTER DialogueAction_JoinSquad if a button uses both (see that function's comment) -
+// recruit(editor=true) reinitializes CharStats from the character's original template, which would
+// silently clobber this reset back to the character's pre-reset (modified) values if it ran second.
+// CharStats* is fetched fresh here rather than passed in from JoinSquad, in case recruit() replaces
+// the object rather than mutating it in place.
+static void DialogueAction_SystemReset(Character* patient)
+{
 	CharStats* stats = patient->getStats();
 	if (stats)
 	{
@@ -1024,6 +1044,8 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 __declspec(dllexport) void startPlugin()
 {
 	g_dialogueActions["reactivate"] = &DialogueAction_Reactivate;
+	g_dialogueActions["join_squad"] = &DialogueAction_JoinSquad;
+	g_dialogueActions["join_squad_fast"] = &DialogueAction_JoinSquadFast;
 	g_dialogueActions["system_reset"] = &DialogueAction_SystemReset;
 	loadDialogueBoxesFromJson();
 
