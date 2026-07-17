@@ -91,6 +91,18 @@ static bool isRobotRace(Character* c)
 	return race != nullptr && race->robot;
 }
 
+// Whether this character's own FCS "Character" template is categorized as ANIMAL_CHARACTER (vs
+// HUMAN_CHARACTER) - itemType is the same category enum already used elsewhere in this file (ITEM,
+// DIALOGUE_LINE, ...), just read off this character's own defining GameData instead of looked up by
+// String ID. Character::isAnimal() was tried first and rejected: it reflects the CharacterAnimal
+// AI/movement component, not this FCS category, and returned false for a live Iron Spider even though
+// its FCS entry is authored as ANIMAL_CHARACTER - confirmed live, not a guess.
+static bool isAnimalCharacterType(Character* c)
+{
+	GameData* data = c->_NV_getGameData();
+	return data && data->type == ANIMAL_CHARACTER;
+}
+
 // Character*-keyed and session-only (doesn't survive reload - see saveDeactivatedState/
 // loadDeactivatedState below for the handle-string-keyed side-file that does).
 static std::map<Character*, bool> g_deactivated;
@@ -594,10 +606,10 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 			return false;
 	}
 
-	if (btn.requiresAnimal && !patient->_NV_isAnimal())
+	if (btn.requiresAnimal && !isAnimalCharacterType(patient))
 		return false;
 
-	if (btn.excludeAnimal && patient->_NV_isAnimal())
+	if (btn.excludeAnimal && isAnimalCharacterType(patient))
 		return false;
 
 	if (btn.requiresDeactivated)
@@ -864,12 +876,12 @@ static void DialogueAction_JoinSquadFast(Character* patient)
 // CharStats* is fetched fresh here rather than passed in from JoinSquad, in case recruit() replaces
 // the object rather than mutating it in place.
 //
-// Animal-type robots (Character::isAnimal() non-null - e.g. Iron Spiders) don't get their skills and
-// attributes wiped to 1 like humanoid robots do - age, not CharStats, is what actually governs an
+// ANIMAL_CHARACTER-type robots (isAnimalCharacterType() - e.g. Iron Spiders) don't get their skills
+// and attributes wiped to 1 like humanoid robots do - age, not CharStats, is what actually governs an
 // animal's growth stage, so "reset" means taking that to its minimum (0.3) instead, and nothing else.
 static void DialogueAction_SystemReset(Character* patient)
 {
-	if (patient->_NV_isAnimal())
+	if (isAnimalCharacterType(patient))
 	{
 		patient->_NV_setAge(0.3f);
 		return;
