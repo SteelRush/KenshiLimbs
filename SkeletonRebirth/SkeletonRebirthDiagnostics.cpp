@@ -3,7 +3,9 @@
 #include <kenshi/Character.h>
 #include <kenshi/RaceData.h>
 #include <kenshi/GameData.h>
+#include <kenshi/Item.h>
 #include <kenshi/MedicalSystem.h>
+#include <kenshi/RootObject.h>
 #include <kenshi/RootObjectBase.h>
 #include <kenshi/GameSaveState.h>
 #include <kenshi/HandleManager.h>
@@ -1074,6 +1076,47 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 	return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);
 }
 
+// --- Robot limb race-lock (merged in from the former "The Limbless (Type 2)" mod) --------------
+// Unrelated to the Deactivated/reactivation system above - this is a standalone fix for vanilla
+// robot limbs being equippable onto any race. Kept as its own self-contained section (own map, own
+// two hooks) rather than woven into the reactivation code, since the two features share no state.
+//
+// Vanilla stores each item's FCS "Race Limiter" (racesInclude/racesExclude) in RaceLimiter's
+// singleton, populated lazily via addLimit() the first time something looks the item up - nothing on
+// the robot-limb equip path ever calls that, so the cache stays empty and canEquip() always sees
+// "unrestricted" for limbs. RobotLimbs::inventory is a cached "interface" RootObject* representing a
+// character's limb-slot section in the GUI - this is exactly the object vanilla passes as "who"
+// during the drag/equip race-check, but its getName() is a generic "ROBOTICS" label, not tied to the
+// owning character. getInventoryInterface() is hooked to record interface-pointer -> owning-character
+// every time one is (re)built, so canEquip()'s hook can look up the true recipient from "who" later -
+// correct in all cases, including multi-character trades, no guessing needed.
+static std::map<RootObject*, Character*> g_limbInterfaceOwners;
+
+RootObject* (*RobotLimbs_getInventoryInterface_orig)(RobotLimbs*, bool);
+RootObject* RobotLimbs_getInventoryInterface_hook(RobotLimbs* self, bool create)
+{
+	RootObject* result = RobotLimbs_getInventoryInterface_orig(self, create);
+	if (result && self->character)
+		g_limbInterfaceOwners[result] = self->character;
+	return result;
+}
+
+// Primes the RaceLimiter cache for this item (see comment above), then substitutes "who" for the
+// item's true owning Character* before deferring to vanilla's own equip validation, which then
+// enforces the race restriction correctly on its own.
+bool (*RaceLimiter_canEquip2_orig)(RaceLimiter*, GameData*, RootObject*);
+bool RaceLimiter_canEquip2_hook(RaceLimiter* self, GameData* item, RootObject* who)
+{
+	RaceLimiter::getSingleton()->addLimit(item);
+
+	RootObject* correctedWho = who;
+	auto it = g_limbInterfaceOwners.find(who);
+	if (it != g_limbInterfaceOwners.end())
+		correctedWho = (RootObject*)it->second;
+
+	return RaceLimiter_canEquip2_orig(self, item, correctedWho);
+}
+
 __declspec(dllexport) void startPlugin()
 {
 	g_dialogueActions["reactivate"] = &DialogueAction_Reactivate;
@@ -1097,4 +1140,13 @@ __declspec(dllexport) void startPlugin()
 	typedef DataPanelLine* (DatapanelGUI::*SetLineKeyLastVisibleFn)(const std::string&, const std::string&, const std::string&, int, bool, bool);
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((SetLineKeyLastVisibleFn)&DatapanelGUI::setLine), DatapanelGUI_setLine_KeyLastVisible_hook, &DatapanelGUI_setLine_KeyLastVisible_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add DatapanelGUI::setLine(key,last,visible) hook!");
+
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&RobotLimbs::getInventoryInterface), RobotLimbs_getInventoryInterface_hook, &RobotLimbs_getInventoryInterface_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add RobotLimbs::getInventoryInterface hook!");
+
+	// canEquip is virtual, so this goes through the exported _NV_ (non-virtual) stub - GetRealAddress
+	// doesn't work on &Class::VirtualMethod directly (see DESIGN.md's hooking-virtual-functions
+	// pitfall). It's overloaded, hence the cast.
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((bool(RaceLimiter::*)(GameData*, RootObject*))&RaceLimiter::_NV_canEquip), RaceLimiter_canEquip2_hook, &RaceLimiter_canEquip2_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add RaceLimiter::canEquip(item,who) hook!");
 }
