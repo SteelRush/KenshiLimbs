@@ -357,14 +357,22 @@ bool TryReactivate(Character* self)
 // than hardcoded per-dialogue C++. A button's behavior is an ordered list of "steps" - see
 // DialogueBoxStepDef for the step types. A new dialogue box needs only a JSON entry; a new "action"
 // step type needs registering in g_dialogueActions.
+//
+// Nested/multi-level menus are just another dialogue box: an "open_menu" step opens a different
+// "DialogueBoxes" entry by ID, the same way the reactivation trigger opens the first one (see
+// showDialogueBox()). A "back" button is nothing special either - just a button in the submenu whose
+// steps open the parent menu's ID. There's no dedicated menu-stack/breadcrumb tracking; each box only
+// ever knows the one ID it was opened with, so "back" has to name its target explicitly rather than
+// popping an implicit history.
 struct DialogueBoxStepDef
 {
-	std::string type; // "action" | "take_item" | "show_text" | "delay"
+	std::string type; // "action" | "take_item" | "show_text" | "delay" | "open_menu"
 	std::string action; // for "action" - looked up in g_dialogueActions
 	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator
 	std::string text;   // for "show_text" - "{name}" replaced with the patient's name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
 	float seconds;       // for "delay" - pauses the remaining steps this many seconds (wall clock)
+	std::string menu;    // for "open_menu" - a "DialogueBoxes" key to open, e.g. a submenu or "back" target
 
 	DialogueBoxStepDef() : seconds(0.0f) {}
 };
@@ -620,6 +628,10 @@ struct PendingDialogueSequence
 };
 static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
+// Forward-declared - showDialogueBox() is defined further down (it needs isDialogueButtonEligible()
+// and the layout-loading machinery below), but "open_menu" steps here need to call back into it.
+static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator);
+
 // A "delay" step suspends the rest of `steps` in g_pendingDialogueSequences and returns rather than
 // blocking; resumed later from Character_updateOnScreenCheck_hook.
 static void dispatchDialogueSteps(Character* patient, Character* initiator, const std::vector<DialogueBoxStepDef>& steps, size_t startIndex)
@@ -669,6 +681,16 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 			else
 				ErrorLog("SkeletonRebirth: dialogue step action \"" + step.action + "\" has no registered handler");
 			continue;
+		}
+
+		if (step.type == "open_menu")
+		{
+			// Terminal, like "delay" and a failed "take_item" - by the time a submenu is up and waiting
+			// on the player's next click, any further steps from this sequence have no clear meaning.
+			// The box that triggered this step is already closed (OnDialogueButtonClicked closes it
+			// before dispatching), so showDialogueBox()'s one-at-a-time guard doesn't block this.
+			showDialogueBox(step.menu, patient, initiator);
+			return;
 		}
 
 		ErrorLog("SkeletonRebirth: unknown dialogue step type \"" + step.type + "\" for " + patient->_NV_getName());
@@ -942,6 +964,8 @@ static void loadDialogueBoxesFromJson()
 							step.color = (*sit)["color"].GetString();
 						if (sit->HasMember("seconds") && (*sit)["seconds"].IsNumber())
 							step.seconds = (*sit)["seconds"].GetFloat();
+						if (sit->HasMember("menu") && (*sit)["menu"].IsString())
+							step.menu = (*sit)["menu"].GetString();
 						btn.steps.push_back(step);
 					}
 				}
