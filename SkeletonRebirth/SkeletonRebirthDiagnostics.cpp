@@ -426,8 +426,10 @@ struct DialogueBoxButtonDef
 	float maxSkill;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
+	bool requiresAnimal; // hidden unless Character::isAnimal() - lets an animal-only button require a different item than the humanoid one
+	bool excludeAnimal; // hidden if Character::isAnimal() - the humanoid-only counterpart to requiresAnimal
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresDeactivated(false) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
 
 struct DialogueBoxDef
@@ -591,6 +593,12 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 		if (faction && faction->isThePlayer())
 			return false;
 	}
+
+	if (btn.requiresAnimal && !patient->_NV_isAnimal())
+		return false;
+
+	if (btn.excludeAnimal && patient->_NV_isAnimal())
+		return false;
 
 	if (btn.requiresDeactivated)
 	{
@@ -855,8 +863,18 @@ static void DialogueAction_JoinSquadFast(Character* patient)
 // silently clobber this reset back to the character's pre-reset (modified) values if it ran second.
 // CharStats* is fetched fresh here rather than passed in from JoinSquad, in case recruit() replaces
 // the object rather than mutating it in place.
+//
+// Animal-type robots (Character::isAnimal() non-null - e.g. Iron Spiders) don't get their skills and
+// attributes wiped to 1 like humanoid robots do - age, not CharStats, is what actually governs an
+// animal's growth stage, so "reset" means taking that to its minimum (0.3) instead, and nothing else.
 static void DialogueAction_SystemReset(Character* patient)
 {
+	if (patient->_NV_isAnimal())
+	{
+		patient->_NV_setAge(0.3f);
+		return;
+	}
+
 	CharStats* stats = patient->getStats();
 	if (stats)
 	{
@@ -950,6 +968,10 @@ static void loadDialogueBoxesFromJson()
 					btn.excludePlayerFaction = (*bit)["excludePlayerFaction"].GetBool();
 				if (bit->HasMember("requiresDeactivated") && (*bit)["requiresDeactivated"].IsBool())
 					btn.requiresDeactivated = (*bit)["requiresDeactivated"].GetBool();
+				if (bit->HasMember("requiresAnimal") && (*bit)["requiresAnimal"].IsBool())
+					btn.requiresAnimal = (*bit)["requiresAnimal"].GetBool();
+				if (bit->HasMember("excludeAnimal") && (*bit)["excludeAnimal"].IsBool())
+					btn.excludeAnimal = (*bit)["excludeAnimal"].GetBool();
 
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{

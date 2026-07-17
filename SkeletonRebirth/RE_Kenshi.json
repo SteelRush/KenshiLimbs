@@ -7,12 +7,26 @@
 			"buttons": [
 				{
 					"caption": "Diagnostics",
+					"excludeAnimal": true,
 					"requiresSkill": "science",
 					"minSkill": 1,
 					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43392-changes_otto.mod" },
 						{ "type": "show_text", "text": "AI Core inserted - running diagnostics...", "color": "#FF4C4C" },
+						{ "type": "delay", "seconds": 3 },
+						{ "type": "open_menu", "menu": "diagnostic_menu" }
+					]
+				},
+				{
+					"caption": "Diagnostics",
+					"requiresAnimal": true,
+					"requiresSkill": "science",
+					"minSkill": 1,
+					"requiresItem": "43398-changes_otto.mod",
+					"steps": [
+						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "show_text", "text": "Power Core inserted - running diagnostics...", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
