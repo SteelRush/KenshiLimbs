@@ -73,6 +73,21 @@ Fighting each native system as it surfaced this way, with no guarantee a third w
 was abandoned as unsustainable. `dead` is now never set true for a Deactivated robot at all, so none of
 this native machinery has any reason to ever engage.
 
+**The same "hammered every call" pattern bit this hook too, later, in a different way.**
+`declareDead()` doesn't fire once per character death - it fires *repeatedly*, for as long as an
+already-Deactivated robot keeps taking damage (some upstream system keeps re-setting `dead=true` and
+re-invoking it, same as the `medDead=1`-on-entry finding above). The hook originally did its full work
+- `g_deactivated[self] = true`, `saveDeactivatedState()` (a real disk write), and a `DebugLog(describe(self))`
+call - unconditionally on every single call, with no guard for "this character is already recorded".
+Confirmed live via a real crash: the debug log showed 250k+ lines (82% of the entire session's log,
+~550 calls/second sustained) from a handful of robots ("Weak Thrall") under continuous combat damage,
+immediately preceding an ~67-minute timestamp gap and then `Unhandled Exception Filter called`/emergency
+save - consistent with the sustained disk I/O and string-building load destabilizing the game over a
+long session. Fixed by gating everything except the `med->dead` reset (still genuinely needed every
+call) behind `if (g_deactivated.count(self)) return;` - the same "cheap gate first" discipline used
+throughout this file's other hot-path hooks, applied here only after it had already caused a real
+crash instead of before.
+
 **Why a Deactivated robot doesn't just get up and walk away**: nothing explicit makes it inert.
 Vanilla's own knockout state (`Character::ProneState::PS_KO`, entered naturally as part of the same
 combat sequence that would otherwise have killed it) has no recovery timer at the catastrophic damage

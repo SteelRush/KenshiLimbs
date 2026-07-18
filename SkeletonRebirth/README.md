@@ -109,6 +109,14 @@ See DESIGN.md §4 for the full design, including why this is a different (and mu
 the mod's older, removed FCS `Dialogue`-hooking approach, even though it now covers the same
 item/skill/delay/text-notification features that older system had.
 
+## Debug logging
+
+`RE_Kenshi.json`'s top-level `"Debug"` (bool, default `false`) gates every `DebugLog()` call this mod
+makes (dialogue boxes opening, reactivations succeeding, JSON-load summaries, etc.) - off by default so
+`RE_Kenshi_log.txt` doesn't grow indefinitely during normal play, since even routine events add up over
+a long session. Set it to `true` and restart to get that logging back for troubleshooting. `ErrorLog()`
+calls are never gated - real problems are always logged regardless of this setting.
+
 ## Persistence
 
 Which robots are Deactivated survives save/reload via a small JSON side-file

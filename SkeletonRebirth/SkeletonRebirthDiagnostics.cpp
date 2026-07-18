@@ -83,11 +83,26 @@ extern "C" MyGUI::Window* MessageBoxManager_createMessageBox_PLACEHOLDER(
 // object (see showDialogueBox()/dispatchDialogueSteps()). Deactivated state survives save/reload via a
 // JSON side-file keyed by handle string.
 //
-// DebugLog() output (see Debug.h) is prefixed "SkeletonRebirth:".
+// DebugLog() output (see Debug.h) is prefixed "SkeletonRebirth:" - gated behind verboseLog() below,
+// off by default.
+
+// Gates every DebugLog() call in this file behind RE_Kenshi.json's "Debug" (bool, default false, see
+// loadDebugSettingFromJson()). Regular play still generates real ongoing log volume even with
+// declareDead() debounced (dialogue boxes opening, reactivations succeeding, JSON reload summaries,
+// ...) - keeping that off by default avoids growing RE_Kenshi_log.txt indefinitely for players who
+// never need it, while leaving it available for troubleshooting without a rebuild. ErrorLog() is
+// deliberately NOT gated anywhere in this file - those indicate real problems/misconfigurations and
+// should always be visible regardless of this setting.
+static bool g_debugLoggingEnabled = false;
+static void verboseLog(const std::string& message)
+{
+	if (g_debugLoggingEnabled)
+		DebugLog(message);
+}
 
 static bool isRobotRace(Character* c)
 {
-	RaceData* race = c->_NV_getRace();
+	RaceData* race = c->getRace();
 	return race != nullptr && race->robot;
 }
 
@@ -98,7 +113,7 @@ static bool isRobotRace(Character* c)
 // e.g. an Iron Spider even though its FCS entry is authored as ANIMAL_CHARACTER.
 static bool isAnimalCharacterType(Character* c)
 {
-	GameData* data = c->_NV_getGameData();
+	GameData* data = c->getGameData();
 	return data && data->type == ANIMAL_CHARACTER;
 }
 
@@ -106,11 +121,27 @@ static bool isAnimalCharacterType(Character* c)
 // loadDeactivatedState below for the handle-string-keyed side-file that does).
 static std::map<Character*, bool> g_deactivated;
 
-// Gates Character_updateOnScreenCheck_hook's trigger so it doesn't reopen the dialogue box every tick
-// while still in the bed. Dismissing the box (e.g. "No") deliberately does NOT clear this - the trigger
-// is level-triggered, so clearing on dismiss would reopen the box the very next tick, making "No"
-// appear to do nothing. Only a real reactivation or leaving the bed clears it.
-static std::map<Character*, bool> g_reactivateDialogueShown;
+// Gates Character_updateOnScreenCheck_hook's trigger loop so a matched trigger doesn't reopen its box
+// every tick while conditions still hold. Dismissing a box (e.g. "No") deliberately does NOT clear
+// this - the trigger is level-triggered, so clearing on dismiss would reopen the box the very next
+// tick, making "No" appear to do nothing. Only a real state change (leaving the building, or an action
+// like reactivation clearing g_deactivated) clears it. Keyed by (character, trigger index) rather than
+// just character, since DialogueTriggers (see below) supports more than one trigger.
+static std::map<std::pair<Character*, size_t>, bool> g_triggerShown;
+
+// Drops every pending trigger-shown entry for one character, regardless of which trigger set it -
+// called after an action (like reactivation) that could invalidate more than one trigger's
+// requiredStates at once. A handful of linear scans over what's normally a tiny map costs nothing.
+static void clearTriggerShownFor(Character* c)
+{
+	for (auto it = g_triggerShown.begin(); it != g_triggerShown.end(); )
+	{
+		if (it->first.first == c)
+			it = g_triggerShown.erase(it);
+		else
+			++it;
+	}
+}
 
 // --- Save/load persistence -----------------------------------------------------------------------
 // g_deactivated is Character*-keyed and doesn't survive reload; RootObjectBase::getHandle().toString()
@@ -217,7 +248,7 @@ static void loadDeactivatedState()
 
 	std::ostringstream ss;
 	ss << "SkeletonRebirth: loaded persisted Deactivated state from \"" << path << "\" - resolved=" << resolved << " failed=" << failed;
-	DebugLog(ss.str());
+	verboseLog(ss.str());
 }
 
 // --- Hook: HandleManager::_NV_restore() - post-load persistence trigger ---------------------------
@@ -279,14 +310,14 @@ static std::string describe(Character* c)
 	MedicalSystem* med = c->getMedical();
 
 	std::ostringstream ss;
-	ss << "name=\"" << c->_NV_getName() << "\""
+	ss << "name=\"" << c->getName() << "\""
 	   << " ptr=" << (void*)c
 	   << " handle=" << c->getHandle().toString()
-	   << " race=" << (c->_NV_getRace() ? c->_NV_getRace()->data->stringID : "<none>")
+	   << " race=" << (c->getRace() ? c->getRace()->data->stringID : "<none>")
 	   << " robot=" << isRobotRace(c)
 	   << " isDead=" << c->isDead()
 	   << " medDead=" << (med ? med->dead : false)
-	   << " proneState=" << (int)c->_NV_getProneState()
+	   << " proneState=" << (int)c->getProneState()
 	   << " knockoutTimer=" << (med ? med->knockoutTimer : -1.0f)
 	   << " blood=" << (med ? med->blood : -1.0f)
 	   << " " << describeAnatomy(med)
@@ -294,17 +325,6 @@ static std::string describe(Character* c)
 	   << " isVisibleAndNear=" << c->isVisibleAndNear
 	   << " goalString=\"" << getCurrentGoalStringSafe(c) << "\"";
 	return ss.str();
-}
-
-// BF_SKELETON_BED == 25, confirmed via live testing (not the FCS-adjacent guess of 150).
-static bool isInSkeletonBed(Character* c)
-{
-	if (c->inSomething != IN_BED)
-		return false;
-
-	RootObject* obj = c->inWhat.getRootObject();
-	Building* bed = obj ? static_cast<Building*>(obj) : nullptr;
-	return bed && bed->_NV_getSpecialFunction() == BF_SKELETON_BED;
 }
 
 // --- Hook 1: declareDead() -----------------------------------------------------------------
@@ -326,12 +346,23 @@ void Character_declareDead_hook(Character* self)
 		if (med)
 			med->dead = false;
 
+		// This fires repeatedly - confirmed live via a 250k+ line log spike (~550 calls/second
+		// sustained) from a handful of robots taking continuous damage in combat - since some upstream
+		// system keeps re-setting dead=true and re-invoking this for as long as a Deactivated robot
+		// keeps getting hit, not just once at the moment of "death". Only the first call for a given
+		// character needs to touch disk (saveDeactivatedState()) or build the describe() log string;
+		// every repeat call skips straight past both once the character's already recorded, which is
+		// what actually keeps this genuinely hot path cheap. The med->dead reset above still has to run
+		// unconditionally every time regardless.
+		if (g_deactivated.count(self))
+			return;
+
 		// No explicit AI pause needed - vanilla's own knockout state has no recovery timer at the
 		// catastrophic damage level that triggers this hook, so the character is already inert.
 		g_deactivated[self] = true;
 		saveDeactivatedState();
 
-		DebugLog("SkeletonRebirth: declareDead() BLOCKED for robot -> " + describe(self));
+		verboseLog("SkeletonRebirth: declareDead() BLOCKED for robot -> " + describe(self));
 		return;
 	}
 
@@ -373,7 +404,7 @@ bool TryReactivate(Character* self)
 
 	g_deactivated.erase(self);
 	saveDeactivatedState();
-	DebugLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
+	verboseLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
 
 	return true;
 }
@@ -411,8 +442,9 @@ struct DialogueBoxStepDef
 {
 	std::string type; // "action" | "take_item" | "show_text" | "delay" | "open_menu"
 	std::string action; // for "action" - looked up in g_dialogueActions
-	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator
-	std::string text;   // for "show_text" - "{name}" replaced with the patient's name
+	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator;
+	                    // also usable on "show_text" purely to resolve "{item}" in its text, no consuming
+	std::string text;   // for "show_text" - "{name}"/"{item}" replaced with the patient's name / item's display name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
 	float seconds;       // for "delay" - pauses the remaining steps this many seconds (wall clock)
 	std::string menu;    // for "open_menu" - a "DialogueBoxes" key to open, e.g. a submenu or "back" target
@@ -436,21 +468,61 @@ struct DialogueBoxButtonDef
 	bool hasMaxSkill;
 	float maxSkill;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
+	bool requiresPlayerFaction; // hidden unless the patient belongs to the player's faction - the counterpart to excludePlayerFaction
 	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
 	bool requiresAnimal; // hidden unless isAnimalCharacterType() - lets an animal-only button require a different item than the humanoid one
 	bool excludeAnimal; // hidden if isAnimalCharacterType() - the humanoid-only counterpart to requiresAnimal
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
 
 struct DialogueBoxDef
 {
 	std::string title;
-	std::string message; // "{name}" is replaced with the patient's name
+	std::string message; // "{name}"/"{item}" replaced with the patient's name / this box's item's display name
+	std::string item;    // optional - FCS/GameData item String ID, resolved only for "{item}" in message
 	std::vector<DialogueBoxButtonDef> buttons; // up to 3 - Kenshi_MessageBox.layout has ButtonA/B/C
 };
 
 static std::map<std::string, DialogueBoxDef> g_dialogueBoxes;
+
+// --- JSON-driven dialogue triggers ---------------------------------------------------------------
+// "When does a dialogue box open" is data-driven the same way "what does a button do" already is -
+// RE_Kenshi.json's "DialogueTriggers" array, each entry an AND of "requiredStates" (named, registered
+// bool(Character*) checks - see g_triggerStateChecks, all must pass) and "buildings" (the used
+// building's own FCS String ID must be in this list), opening "menu" once both hold. Deliberately flat
+// named checks AND'd together, not a general boolean expression language - covers "deactivated AND
+// animal"-style combinations without the parsing/fragility risk a real expression syntax would add.
+//
+// Character_updateOnScreenCheck_hook evaluates every trigger for every on-screen character every
+// frame, so requiredStates are checked before buildings, and short-circuit on the first failing check
+// - the same "cheap gate first" discipline used everywhere else in this file (e.g.
+// handleDialogueReplyClicked's g_conversationOverrides.count() in the old ConversationOverrides
+// system). Individual state checks vary in cost (isDeactivatedState is a map lookup;
+// isAnimalCharacterType calls the virtual getGameData() on the character itself) but all of them are
+// still far cheaper than resolving and querying the RootObject/Building the character is standing in -
+// requiredStates failing early means that never happens at all for an irrelevant character.
+struct DialogueTriggerDef
+{
+	std::vector<std::string> requiredStates; // all looked up in g_triggerStateChecks, all must pass
+	std::vector<std::string> buildings; // FCS building String IDs - any one match is enough
+	std::string menu; // a "DialogueBoxes" key to open once requiredStates and buildings both match
+};
+static std::vector<DialogueTriggerDef> g_dialogueTriggers;
+
+typedef bool (*TriggerStateCheckFn)(Character*);
+static std::map<std::string, TriggerStateCheckFn> g_triggerStateChecks;
+
+static bool isDeactivatedState(Character* c)
+{
+	auto it = g_deactivated.find(c);
+	return it != g_deactivated.end() && it->second;
+}
+
+static bool isHumanoidState(Character* c)
+{
+	return !isAnimalCharacterType(c);
+}
 
 typedef void (*DialogueActionFn)(Character* patient);
 static std::map<std::string, DialogueActionFn> g_dialogueActions;
@@ -600,8 +672,15 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 {
 	if (btn.excludePlayerFaction)
 	{
-		Faction* faction = patient->_NV_getFaction();
+		Faction* faction = patient->getFaction();
 		if (faction && faction->isThePlayer())
+			return false;
+	}
+
+	if (btn.requiresPlayerFaction)
+	{
+		Faction* faction = patient->getFaction();
+		if (!faction || !faction->isThePlayer())
 			return false;
 	}
 
@@ -638,7 +717,7 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 
 	if (!btn.requiresItem.empty())
 	{
-		Inventory* inv = initiator ? initiator->_NV_getInventory() : nullptr;
+		Inventory* inv = initiator ? initiator->getInventory() : nullptr;
 		GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
 		if (!inv || !itemData || !inv->hasItem(itemData, 1))
 			return false;
@@ -660,7 +739,9 @@ static void closeDialogueBox()
 	g_currentDialogueButtons.clear();
 }
 
-static void showFloatingText(Character* patient, const std::string& text, const std::string& colorHex)
+// itemId is optional - only resolved (via the same SEH-guarded lookup take_item uses) if the text
+// actually references "{item}", so a plain "{name}"-only show_text step pays nothing extra.
+static void showFloatingText(Character* patient, const std::string& text, const std::string& colorHex, const std::string& itemId)
 {
 	if (!gui || text.empty())
 		return;
@@ -668,7 +749,17 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 	std::string resolvedText = text;
 	size_t namePos = resolvedText.find("{name}");
 	if (namePos != std::string::npos)
-		resolvedText.replace(namePos, 6, patient->_NV_getName());
+		resolvedText.replace(namePos, 6, patient->getName());
+
+	size_t itemPos = resolvedText.find("{item}");
+	if (itemPos != std::string::npos)
+	{
+		GameData* itemData = itemId.empty() ? nullptr : getGameDataGuarded(itemId, ITEM);
+		if (itemData)
+			resolvedText.replace(itemPos, 6, itemData->name);
+		else
+			ErrorLog("SkeletonRebirth: dialogue step \"show_text\" has \"{item}\" in its text but no resolvable \"item\" (\"" + itemId + "\") - left as-is");
+	}
 
 	MyGUI::Colour color = MyGUI::Colour::White;
 	if (!colorHex.empty() && !tryParseHexColor(colorHex, color))
@@ -686,7 +777,10 @@ struct PendingDialogueSequence
 	std::vector<DialogueBoxStepDef> steps; // copied, not referenced - see dispatchDialogueSteps()
 	size_t nextIndex;
 	Character* initiator;
+	bool waitForEditorClose; // if true, fireAtTick is unused - resumes once gui->isCharacterEditorMode() clears instead
 	ULONGLONG fireAtTick;
+
+	PendingDialogueSequence() : nextIndex(0), initiator(nullptr), waitForEditorClose(false), fireAtTick(0) {}
 };
 static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
@@ -719,11 +813,11 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 
 		if (step.type == "take_item")
 		{
-			Inventory* inv = initiator ? initiator->_NV_getInventory() : nullptr;
+			Inventory* inv = initiator ? initiator->getInventory() : nullptr;
 			GameData* itemData = inv ? getGameDataGuarded(step.item, ITEM) : nullptr;
 			if (!inv || !itemData || !inv->takeOneItemOnly(itemData))
 			{
-				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + step.item + "\") failed for " + patient->_NV_getName() + " - stopping the rest of this sequence");
+				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + step.item + "\") failed for " + patient->getName() + " - stopping the rest of this sequence");
 				return;
 			}
 			continue;
@@ -731,7 +825,7 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 
 		if (step.type == "show_text")
 		{
-			showFloatingText(patient, step.text, step.color);
+			showFloatingText(patient, step.text, step.color, step.item);
 			continue;
 		}
 
@@ -742,6 +836,22 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 				actionIt->second(patient);
 			else
 				ErrorLog("SkeletonRebirth: dialogue step action \"" + step.action + "\" has no registered handler");
+
+			// join_squad specifically (the "with edit" recruit path, as opposed to join_squad_fast)
+			// opens the character editor - implicit, not a JSON-authored step, so a JSON author can't
+			// forget it and have a later step (e.g. system_reset) run while the editor's still open and
+			// possibly about to change the very things that step just set.
+			if (step.action == "join_squad" && gui && gui->isCharacterEditorMode())
+			{
+				PendingDialogueSequence pending;
+				pending.steps = steps;
+				pending.nextIndex = i + 1;
+				pending.initiator = initiator;
+				pending.waitForEditorClose = true;
+				g_pendingDialogueSequences[patient] = pending;
+				return;
+			}
+
 			continue;
 		}
 
@@ -756,7 +866,7 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 			return;
 		}
 
-		ErrorLog("SkeletonRebirth: unknown dialogue step type \"" + step.type + "\" for " + patient->_NV_getName());
+		ErrorLog("SkeletonRebirth: unknown dialogue step type \"" + step.type + "\" for " + patient->getName());
 	}
 }
 
@@ -815,7 +925,17 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 	std::string message = def.message;
 	size_t namePos = message.find("{name}");
 	if (namePos != std::string::npos)
-		message.replace(namePos, 6, patient->_NV_getName());
+		message.replace(namePos, 6, patient->getName());
+
+	size_t itemPos = message.find("{item}");
+	if (itemPos != std::string::npos)
+	{
+		GameData* itemData = def.item.empty() ? nullptr : getGameDataGuarded(def.item, ITEM);
+		if (itemData)
+			message.replace(itemPos, 6, itemData->name);
+		else
+			ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" has \"{item}\" in its message but no resolvable \"item\" (\"" + def.item + "\") - left as-is");
+	}
 
 	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
 	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.
@@ -835,15 +955,15 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	DebugLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" shown for " + patient->_NV_getName());
+	verboseLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" shown for " + patient->getName());
 }
 
 static void DialogueAction_Reactivate(Character* patient)
 {
 	if (!TryReactivate(patient))
-		ErrorLog("SkeletonRebirth: TryReactivate failed for " + patient->_NV_getName() + " after confirm");
+		ErrorLog("SkeletonRebirth: TryReactivate failed for " + patient->getName() + " after confirm");
 
-	g_reactivateDialogueShown.erase(patient);
+	clearTriggerShownFor(patient);
 }
 
 // Split out from DialogueAction_SystemReset so a dialogue button can join the patient to the player's
@@ -917,6 +1037,27 @@ static std::string getOwnModDirectory()
 	return lastSlash != std::string::npos ? path.substr(0, lastSlash + 1) : "";
 }
 
+// Sets g_debugLoggingEnabled from RE_Kenshi.json's top-level "Debug" (bool, default false/absent).
+// Must run before the other loaders below, so their own verboseLog() summary lines respect it. Silent
+// on a missing file or parse error - the other loaders open the same file and already report those;
+// no need to say it three times. A missing/absent "Debug" key just means logging stays off, the safe
+// default, not an error worth reporting.
+static void loadDebugSettingFromJson()
+{
+	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
+	std::ifstream file(jsonPath.c_str());
+	if (!file.is_open())
+		return;
+
+	rapidjson::IStreamWrapper isw(file);
+	rapidjson::Document doc;
+	if (doc.ParseStream(isw).HasParseError())
+		return;
+
+	if (doc.IsObject() && doc.HasMember("Debug") && doc["Debug"].IsBool())
+		g_debugLoggingEnabled = doc["Debug"].GetBool();
+}
+
 static void loadDialogueBoxesFromJson()
 {
 	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
@@ -951,6 +1092,7 @@ static void loadDialogueBoxesFromJson()
 		DialogueBoxDef def;
 		def.title = (v.HasMember("title") && v["title"].IsString()) ? v["title"].GetString() : "";
 		def.message = (v.HasMember("message") && v["message"].IsString()) ? v["message"].GetString() : "";
+		def.item = (v.HasMember("item") && v["item"].IsString()) ? v["item"].GetString() : "";
 
 		if (v.HasMember("buttons") && v["buttons"].IsArray())
 		{
@@ -981,6 +1123,8 @@ static void loadDialogueBoxesFromJson()
 				}
 				if (bit->HasMember("excludePlayerFaction") && (*bit)["excludePlayerFaction"].IsBool())
 					btn.excludePlayerFaction = (*bit)["excludePlayerFaction"].GetBool();
+				if (bit->HasMember("requiresPlayerFaction") && (*bit)["requiresPlayerFaction"].IsBool())
+					btn.requiresPlayerFaction = (*bit)["requiresPlayerFaction"].GetBool();
 				if (bit->HasMember("requiresDeactivated") && (*bit)["requiresDeactivated"].IsBool())
 					btn.requiresDeactivated = (*bit)["requiresDeactivated"].GetBool();
 				if (bit->HasMember("requiresAnimal") && (*bit)["requiresAnimal"].IsBool())
@@ -1027,7 +1171,88 @@ static void loadDialogueBoxesFromJson()
 
 	std::ostringstream summary;
 	summary << "SkeletonRebirth: loaded " << g_dialogueBoxes.size() << " dialogue box definition(s) from \"" << jsonPath << "\"";
-	DebugLog(summary.str());
+	verboseLog(summary.str());
+}
+
+static void loadDialogueTriggersFromJson()
+{
+	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
+	std::ifstream file(jsonPath.c_str());
+	if (!file.is_open())
+	{
+		ErrorLog("SkeletonRebirth: could not open \"" + jsonPath + "\" - no dialogue triggers will fire");
+		return;
+	}
+
+	rapidjson::IStreamWrapper isw(file);
+	rapidjson::Document doc;
+	if (doc.ParseStream(isw).HasParseError())
+	{
+		ErrorLog("SkeletonRebirth: JSON parse error in \"" + jsonPath + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
+		return;
+	}
+
+	if (!doc.IsObject() || !doc.HasMember("DialogueTriggers") || !doc["DialogueTriggers"].IsArray())
+	{
+		ErrorLog("SkeletonRebirth: \"" + jsonPath + "\" has no \"DialogueTriggers\" array - no dialogue triggers will fire");
+		return;
+	}
+
+	const rapidjson::Value& triggers = doc["DialogueTriggers"];
+	for (rapidjson::SizeType i = 0; i < triggers.Size(); ++i)
+	{
+		const rapidjson::Value& t = triggers[i];
+		std::ostringstream label;
+		label << "DialogueTriggers[" << i << "]";
+
+		if (!t.IsObject())
+		{
+			ErrorLog("SkeletonRebirth: " + label.str() + " is not an object - skipped");
+			continue;
+		}
+
+		DialogueTriggerDef trigger;
+		trigger.menu = (t.HasMember("menu") && t["menu"].IsString()) ? t["menu"].GetString() : "";
+
+		if (t.HasMember("requiredStates") && t["requiredStates"].IsArray())
+		{
+			const rapidjson::Value& states = t["requiredStates"];
+			for (rapidjson::SizeType j = 0; j < states.Size(); ++j)
+			{
+				if (states[j].IsString())
+					trigger.requiredStates.push_back(states[j].GetString());
+			}
+		}
+
+		if (trigger.requiredStates.empty() || trigger.menu.empty())
+		{
+			ErrorLog("SkeletonRebirth: " + label.str() + " missing \"requiredStates\" or \"menu\" - skipped");
+			continue;
+		}
+		for (size_t j = 0; j < trigger.requiredStates.size(); ++j)
+		{
+			if (!g_triggerStateChecks.count(trigger.requiredStates[j]))
+				ErrorLog("SkeletonRebirth: " + label.str() + " references unknown requiredState \"" + trigger.requiredStates[j] + "\" - will never fire");
+		}
+
+		if (t.HasMember("buildings") && t["buildings"].IsArray())
+		{
+			const rapidjson::Value& buildings = t["buildings"];
+			for (rapidjson::SizeType j = 0; j < buildings.Size(); ++j)
+			{
+				if (buildings[j].IsString())
+					trigger.buildings.push_back(buildings[j].GetString());
+			}
+		}
+		if (trigger.buildings.empty())
+			ErrorLog("SkeletonRebirth: " + label.str() + " has no \"buildings\" - will never fire");
+
+		g_dialogueTriggers.push_back(trigger);
+	}
+
+	std::ostringstream summary;
+	summary << "SkeletonRebirth: loaded " << g_dialogueTriggers.size() << " dialogue trigger(s) from \"" << jsonPath << "\"";
+	verboseLog(summary.str());
 }
 
 // Character::update() is deliberately NOT hooked - skipping it breaks position syncing while carried
@@ -1055,9 +1280,56 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 	MedicalSystem_medicalUpdate_orig(self, frameTime);
 }
 
-// --- Hook: Character::updateOnScreenCheck() - reactivation trigger polling point -------------------
+// requiredStates are checked (in order, short-circuiting on the first failure) before touching
+// inSomething/RootObject/Building at all - see the comment on DialogueTriggerDef for why that
+// ordering is load-bearing, not stylistic. Clears this trigger's shown flag on any early-out, so a
+// later re-match (re-entering the state(s), or re-entering the building) can prompt again - mirrors
+// the old single-trigger "leaving the bed clears it" behavior, just per-trigger.
+static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const DialogueTriggerDef& trigger)
+{
+	std::pair<Character*, size_t> shownKey(self, triggerIndex);
+
+	for (size_t i = 0; i < trigger.requiredStates.size(); ++i)
+	{
+		TriggerStateCheckFn stateCheck = g_triggerStateChecks.count(trigger.requiredStates[i]) ? g_triggerStateChecks[trigger.requiredStates[i]] : nullptr;
+		if (!stateCheck || !stateCheck(self))
+		{
+			g_triggerShown.erase(shownKey);
+			return;
+		}
+	}
+
+	if (self->inSomething != IN_BED)
+	{
+		g_triggerShown.erase(shownKey);
+		return;
+	}
+
+	RootObject* obj = self->inWhat.getRootObject();
+	Building* building = obj ? static_cast<Building*>(obj) : nullptr;
+	GameData* buildingData = building ? building->getGameData() : nullptr;
+
+	bool buildingMatches = false;
+	for (size_t i = 0; !buildingMatches && buildingData && i < trigger.buildings.size(); ++i)
+		buildingMatches = (trigger.buildings[i] == buildingData->stringID);
+
+	if (!buildingMatches)
+	{
+		g_triggerShown.erase(shownKey);
+		return;
+	}
+
+	if (g_triggerShown.count(shownKey))
+		return; // already shown, waiting on the player to act or leave
+
+	Character* initiator = (ou && ou->player) ? ou->player->getAnyPlayerCharacter() : nullptr;
+	showDialogueBox(trigger.menu, self, initiator);
+	g_triggerShown[shownKey] = true;
+}
+
+// --- Hook: Character::updateOnScreenCheck() - dialogue trigger polling point -------------------
 // Fires every frame per character - also doubles as the tick source for resuming paused dialogue
-// step sequences below, regardless of self's own g_deactivated status.
+// step sequences below, regardless of self's own trigger status.
 bool (*Character_updateOnScreenCheck_orig)(Character*);
 
 bool Character_updateOnScreenCheck_hook(Character* self)
@@ -1065,30 +1337,22 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	bool result = Character_updateOnScreenCheck_orig(self);
 
 	auto delayIt = g_pendingDialogueSequences.find(self);
-	if (delayIt != g_pendingDialogueSequences.end() && GetTickCount64() >= delayIt->second.fireAtTick)
+	if (delayIt != g_pendingDialogueSequences.end())
 	{
-		PendingDialogueSequence pending = delayIt->second;
-		g_pendingDialogueSequences.erase(delayIt);
-		dispatchDialogueSteps(self, pending.initiator, pending.steps, pending.nextIndex);
-	}
+		bool ready = delayIt->second.waitForEditorClose
+			? !(gui && gui->isCharacterEditorMode())
+			: GetTickCount64() >= delayIt->second.fireAtTick;
 
-	auto it = g_deactivated.find(self);
-	if (it == g_deactivated.end() || !it->second)
-		return result;
-
-	if (isInSkeletonBed(self))
-	{
-		if (!g_reactivateDialogueShown.count(self))
+		if (ready)
 		{
-			Character* initiator = (ou && ou->player) ? ou->player->getAnyPlayerCharacter() : nullptr;
-			showDialogueBox("system_menu", self, initiator);
-			g_reactivateDialogueShown[self] = true;
+			PendingDialogueSequence pending = delayIt->second;
+			g_pendingDialogueSequences.erase(delayIt);
+			dispatchDialogueSteps(self, pending.initiator, pending.steps, pending.nextIndex);
 		}
 	}
-	else
-	{
-		g_reactivateDialogueShown.erase(self); // left the bed - a future bed-placement should prompt again
-	}
+
+	for (size_t i = 0; i < g_dialogueTriggers.size(); ++i)
+		evaluateDialogueTrigger(self, i, g_dialogueTriggers[i]);
 
 	return result;
 }
@@ -1161,7 +1425,12 @@ __declspec(dllexport) void startPlugin()
 	g_dialogueActions["join_squad"] = &DialogueAction_JoinSquad;
 	g_dialogueActions["join_squad_fast"] = &DialogueAction_JoinSquadFast;
 	g_dialogueActions["system_reset"] = &DialogueAction_SystemReset;
+	g_triggerStateChecks["deactivated"] = &isDeactivatedState;
+	g_triggerStateChecks["animal"] = &isAnimalCharacterType;
+	g_triggerStateChecks["humanoid"] = &isHumanoidState;
+	loadDebugSettingFromJson();
 	loadDialogueBoxesFromJson();
+	loadDialogueTriggersFromJson();
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Character::declareDead), Character_declareDead_hook, &Character_declareDead_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add declareDead hook!");
