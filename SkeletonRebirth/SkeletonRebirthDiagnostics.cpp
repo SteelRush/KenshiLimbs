@@ -22,10 +22,12 @@
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
 #include <kenshi/gui/ForgottenGUI.h>
+#include <kenshi/gui/MainBarGUI.h>
 #include <kenshi/gui/MessageBoxManager.h>
 #include <kenshi/gui/ScreenLabel.h>
 
 #include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
 #include <core/Functions.h>
@@ -1358,6 +1360,69 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	g_triggerShown[shownKey] = true;
 }
 
+// --- Persistent HUD health-status text (MedicalPanel/MedicalPanel_Front/StatusPanel/*_HealthText) ----
+// A second, separate status label from the "State:" row below - part of MainBarGUI's always-visible
+// medical panel (shows vanilla text like "Recovery coma"/"Dying"/"Critical" for the selected character),
+// found live via a one-shot widget-tree dump gated on Debug (see git history for that diagnostic) rather
+// than guessed: MyGUI::Widget::castType<T>(false) is RTTI-checked (typeid comparison) and returns nullptr
+// on a type mismatch instead of crashing, so walking the unnamed MainBarGUI tree was safe to do. The
+// widget's own name carries a per-session instance-specific numeric prefix (MainBarGUI's BaseLayout
+// prefix), so it's located once by matching the stable "_HealthText" suffix and the resulting pointer is
+// cached - MainBarGUI is a persistent singleton for the life of the game session, so this is safe to
+// resolve once rather than re-walking the tree every frame.
+//
+// This widget belongs to MedicalDatapanel, not DatapanelGUI (confirmed in DESIGN.md §2's original
+// investigation - MedicalDatapanel never calls DatapanelGUI::setLine), and refreshes on its own cadence
+// independent of the DatapanelGUI hook below, which is why forcing it from that hook didn't stick (it
+// kept getting overwritten back to vanilla text). It needs its own per-frame force instead, anchored on
+// Character::updateOnScreenCheck() - confirmed firing every frame per character already - and gated to
+// only the character currently selected (PlayerInterface::selectedCharacter), since this is a single
+// shared HUD widget, not one per character.
+static const char* DEACTIVATED_COLOR = "#59231a"; // vanilla's own dark red, same as its "Dead" text
+static MyGUI::TextBox* g_healthTextWidget = nullptr;
+static bool g_healthTextWidgetSearched = false;
+static MyGUI::TextBox* findHealthTextWidget(MyGUI::Widget* widget)
+{
+	if (!widget)
+		return nullptr;
+
+	static const std::string suffix = "_HealthText";
+	const std::string& name = widget->getName();
+	if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+	{
+		MyGUI::TextBox* textBox = widget->castType<MyGUI::TextBox>(false);
+		if (textBox)
+			return textBox;
+	}
+
+	size_t count = widget->getChildCount();
+	for (size_t i = 0; i < count; ++i)
+	{
+		MyGUI::TextBox* found = findHealthTextWidget(widget->getChildAt(i));
+		if (found)
+			return found;
+	}
+
+	return nullptr;
+}
+
+static void updateHealthTextOverride(Character* self)
+{
+	if (!ou || !ou->player || ou->player->selectedCharacter.getCharacter() != self)
+		return;
+
+	if (!g_healthTextWidgetSearched && gui && gui->mainbar)
+	{
+		g_healthTextWidgetSearched = true;
+		g_healthTextWidget = findHealthTextWidget(gui->mainbar->getWidget());
+		if (!g_healthTextWidget)
+			ErrorLog("SkeletonRebirthDiagnostics: Could not find MainBarGUI's *_HealthText widget - persistent HUD health status will not be overridden for Deactivated robots.");
+	}
+
+	if (g_healthTextWidget)
+		g_healthTextWidget->setCaption(std::string(DEACTIVATED_COLOR) + "Deactivated");
+}
+
 // --- Hook: Character::updateOnScreenCheck() - dialogue trigger polling point -------------------
 // Fires every frame per character - also doubles as the tick source for resuming paused dialogue
 // step sequences below, regardless of self's own trigger status.
@@ -1366,6 +1431,9 @@ bool (*Character_updateOnScreenCheck_orig)(Character*);
 bool Character_updateOnScreenCheck_hook(Character* self)
 {
 	bool result = Character_updateOnScreenCheck_orig(self);
+
+	if (g_deactivated.count(self))
+		updateHealthTextOverride(self);
 
 	auto delayIt = g_pendingDialogueSequences.find(self);
 	if (delayIt != g_pendingDialogueSequences.end())
@@ -1392,7 +1460,7 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 // The "State:" row is overridden unconditionally for any tracked Deactivated character - since dead
 // stays false, the corpse-only native "Dead" text never fires, so whatever text a fatally-frozen-but-
 // alive character would show (likely "Dying"/"Critical") is replaced regardless of its actual content.
-static const char* DEACTIVATED_COLOR = "#59231a"; // vanilla's own dark red, same as its "Dead" text
+// (DEACTIVATED_COLOR is declared above, next to the HealthText override this shares its color with.)
 DataPanelLine* (*DatapanelGUI_setLine_KeyLastVisible_orig)(DatapanelGUI*, const std::string&, const std::string&, const std::string&, int, bool, bool);
 DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, const std::string& keyValue, const std::string& s1, const std::string& s2, int category, bool last, bool keyVisible)
 {
