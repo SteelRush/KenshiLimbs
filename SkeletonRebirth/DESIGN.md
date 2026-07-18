@@ -24,9 +24,22 @@ with `InventoryGUI::show`). The fix every time was the same: use the class's own
 prefixed wrapper instead (e.g. `HandleManager::_NV_restore`, `InventoryTraderGUI::_CONSTRUCTOR`) - same
 RVA as the real implementation, safe to hook. This convention exists precisely for this reason; check
 for a `_NV_` (or plain non-`virtual`-marked) sibling before hooking anything whose header comment says
-`vtable offset`. Calling a virtual method *normally* on a live object (e.g.
-`result->_NV_getCallbackCharacter()`) is unaffected by any of this - the problem is specific to taking
-the address for hooking, not to virtual dispatch itself.
+`vtable offset`.
+
+**A second, easy-to-miss pitfall in the opposite direction**: `_NV_` wrappers are *not* generally safe
+for normal (non-hooking) calls either, if the method is actually overridden somewhere relevant. An
+`_NV_` wrapper is a non-virtual, RVA-direct thunk for one specific class's own implementation - calling
+`someObject->_NV_setAge(...)` always runs *that exact class's* code, regardless of `someObject`'s real
+dynamic type, because there's no vtable indirection involved at all. This bit the animal-reset feature
+(§4): `Character::_NV_setAge()`/`_NV_getAge()` were called on patients that were actually
+`CharacterAnimal` instances, which override `setAge`/`getAge`/`getAge0to1` with real backing fields at
+their own separate RVAs (`CharacterAnimal.h`) - the `_NV_` calls silently ran `Character`'s own base
+implementation instead, with zero effect, confirmed live across three independent read-backs (raw age,
+0-1 fraction, growth-stage string) and multiple species. The fix was to call the plain virtual method
+(`patient->setAge(...)`, not `patient->_NV_setAge(...)`) so real dynamic dispatch picks the correct
+override. Rule of thumb: `_NV_` is for taking an address (hooking); a normal call on a live object should
+use the plain virtual name unless there's a specific reason to pin it to one exact class's
+implementation regardless of the object's real type.
 
 ## Architecture
 
@@ -483,6 +496,23 @@ itself being restored is the natural "a load just happened" signal.
   version - `dead` never becomes true, so this never fires for a Deactivated robot regardless
 - `SaveManager::getSingleton()` / `getSavePath() const` / `getCurrentGame()` — SaveManager.h:26/47/44
 - `RootObjectBase::getHandle()` — RootObjectBase.h:63/78
+- `RootObjectBase::getGameData() const` — RootObjectBase.h:36, virtual, `Character` inherits this via
+  `RootObject` - `isAnimalCharacterType()` reads `->type == ANIMAL_CHARACTER` off the result
+- `GameData::type` (`itemType`) — GameData.h:91 - same category enum already used for `ITEM`/
+  `DIALOGUE_LINE` elsewhere in this file; `HUMAN_CHARACTER`/`ANIMAL_CHARACTER` are FCS's own Character-template
+  categories, unrelated to `Character::isAnimal()` (see below) and unrelated to `RaceData`/`RACE_GROUP`
+- `Character::isAnimal()` / `_NV_isAnimal()` — Character.h:204-205, virtual, RVA `0x5E51D0` (base) -
+  reflects the `CharacterAnimal` AI/movement component, **not** FCS's Human/Animal Character category;
+  returned `false` live for an Iron Spider authored as `ANIMAL_CHARACTER` in FCS. Not used by this mod;
+  documented here so a future reader doesn't reach for it expecting FCS's category
+- `CharacterAnimal : public Character` — CharacterAnimal.h:25 - overrides `setAge`/`getAge`/
+  `getAge0to1`/`getAgeInverse`/`isAnimal` at its own RVAs, with real backing fields (`age`,
+  `lastUpdatedAge`, `ageSizeMin`/`Max`, `lifespanInDays`). `getAgeString()` is *not* overridden, so
+  `_NV_getAgeString()` is fine to call directly - unlike the others, see the pitfall note above
+- `Character::setAge(float zeroToOne)` / `getAge() const` / `getAge0to1() const` — Character.h:516-524,
+  all virtual - **call these normally, not via `_NV_`**, so `CharacterAnimal`'s override actually runs
+  (see the pitfall note above). `getAge0to1()` is the reliable unit (confirmed via `getAgeString()`
+  live: `0.3` → `"Pup"`, matching Kenshi's own Pup/Teen/Adult/Elder growth-stage milestones)
 
 ## A note on the RE_Kenshi SDK itself
 

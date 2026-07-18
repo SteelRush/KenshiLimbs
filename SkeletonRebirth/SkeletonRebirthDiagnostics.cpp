@@ -93,10 +93,9 @@ static bool isRobotRace(Character* c)
 
 // Whether this character's own FCS "Character" template is categorized as ANIMAL_CHARACTER (vs
 // HUMAN_CHARACTER) - itemType is the same category enum already used elsewhere in this file (ITEM,
-// DIALOGUE_LINE, ...), just read off this character's own defining GameData instead of looked up by
-// String ID. Character::isAnimal() was tried first and rejected: it reflects the CharacterAnimal
-// AI/movement component, not this FCS category, and returned false for a live Iron Spider even though
-// its FCS entry is authored as ANIMAL_CHARACTER - confirmed live, not a guess.
+// DIALOGUE_LINE, ...), just read off this character's own defining GameData. Not Character::isAnimal():
+// that reflects the CharacterAnimal AI/movement component, not this FCS category, and returns false for
+// e.g. an Iron Spider even though its FCS entry is authored as ANIMAL_CHARACTER.
 static bool isAnimalCharacterType(Character* c)
 {
 	GameData* data = c->_NV_getGameData();
@@ -438,8 +437,8 @@ struct DialogueBoxButtonDef
 	float maxSkill;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
-	bool requiresAnimal; // hidden unless Character::isAnimal() - lets an animal-only button require a different item than the humanoid one
-	bool excludeAnimal; // hidden if Character::isAnimal() - the humanoid-only counterpart to requiresAnimal
+	bool requiresAnimal; // hidden unless isAnimalCharacterType() - lets an animal-only button require a different item than the humanoid one
+	bool excludeAnimal; // hidden if isAnimalCharacterType() - the humanoid-only counterpart to requiresAnimal
 
 	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
@@ -877,13 +876,17 @@ static void DialogueAction_JoinSquadFast(Character* patient)
 // the object rather than mutating it in place.
 //
 // ANIMAL_CHARACTER-type robots (isAnimalCharacterType() - e.g. Iron Spiders) don't get their skills
-// and attributes wiped to 1 like humanoid robots do - age, not CharStats, is what actually governs an
-// animal's growth stage, so "reset" means taking that to its minimum (0.3) instead, and nothing else.
+// and attributes wiped to 1 like humanoid robots do - age is what governs an animal's growth stage, so
+// "reset" means taking that to its minimum instead. setAge()/getAge() must be called through true
+// virtual dispatch (patient->setAge(...), not patient->_NV_setAge(...)) - CharacterAnimal overrides
+// both with its own backing fields at separate RVAs, and the _NV_ variants silently no-op by running
+// Character's base implementation regardless of the object's real type - see DESIGN.md's virtual-
+// function pitfall note.
 static void DialogueAction_SystemReset(Character* patient)
 {
 	if (isAnimalCharacterType(patient))
 	{
-		patient->_NV_setAge(0.3f);
+		patient->setAge(0.3f);
 		return;
 	}
 
@@ -1056,6 +1059,7 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 // Fires every frame per character - also doubles as the tick source for resuming paused dialogue
 // step sequences below, regardless of self's own g_deactivated status.
 bool (*Character_updateOnScreenCheck_orig)(Character*);
+
 bool Character_updateOnScreenCheck_hook(Character* self)
 {
 	bool result = Character_updateOnScreenCheck_orig(self);
