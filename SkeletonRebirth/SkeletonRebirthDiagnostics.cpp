@@ -362,6 +362,15 @@ void Character_declareDead_hook(Character* self)
 		g_deactivated[self] = true;
 		saveDeactivatedState();
 
+		// Player-squad robots getting Deactivated is otherwise silent - no native "X is dead" message
+		// fires, since dead never actually becomes true. Uses Kenshi's own player-notification queue
+		// (see showGameNotification()'s comment further down) directly rather than through that
+		// helper, since this is a fixed, hook-triggered message, not JSON-authored dialogue text - no
+		// {name}/{item} substitution machinery needed for a string built right here.
+		Faction* faction = self->getFaction();
+		if (faction && faction->isThePlayer() && ou)
+			ou->showPlayerAMessage_withLog(self->getName() + " has died.", true);
+
 		verboseLog("SkeletonRebirth: declareDead() BLOCKED for robot -> " + describe(self));
 		return;
 	}
@@ -440,11 +449,11 @@ bool TryReactivate(Character* self)
 // popping an implicit history.
 struct DialogueBoxStepDef
 {
-	std::string type; // "action" | "take_item" | "show_text" | "delay" | "open_menu"
+	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu"
 	std::string action; // for "action" - looked up in g_dialogueActions
 	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator;
-	                    // also usable on "show_text" purely to resolve "{item}" in its text, no consuming
-	std::string text;   // for "show_text" - "{name}"/"{item}" replaced with the patient's name / item's display name
+	                    // also usable on "show_text"/"notify" purely to resolve "{item}" in text, no consuming
+	std::string text;   // for "show_text"/"notify" - "{name}"/"{item}" replaced with the patient's name / item's display name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
 	float seconds;       // for "delay" - pauses the remaining steps this many seconds (wall clock)
 	std::string menu;    // for "open_menu" - a "DialogueBoxes" key to open, e.g. a submenu or "back" target
@@ -741,12 +750,16 @@ static void closeDialogueBox()
 
 // itemId is optional - only resolved (via the same SEH-guarded lookup take_item uses) if the text
 // actually references "{item}", so a plain "{name}"-only show_text step pays nothing extra.
-static void showFloatingText(Character* patient, const std::string& text, const std::string& colorHex, const std::string& itemId)
+// Shared by the dialogue box message, "show_text", and "notify" - all three support "{name}" (the
+// patient's name) and, given a resolvable item String ID, "{item}" (that item's display name,
+// GameData::name - not its FCS stringID). itemId is optional; {item} is only resolved (via the same
+// SEH-guarded lookup take_item uses) if the text actually references it, so plain "{name}"-only text
+// pays nothing extra. callerLabel is only used in the {item}-unresolvable error message, to say which
+// of the three callers hit it.
+static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, const std::string& callerLabel)
 {
-	if (!gui || text.empty())
-		return;
-
 	std::string resolvedText = text;
+
 	size_t namePos = resolvedText.find("{name}");
 	if (namePos != std::string::npos)
 		resolvedText.replace(namePos, 6, patient->getName());
@@ -758,8 +771,18 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 		if (itemData)
 			resolvedText.replace(itemPos, 6, itemData->name);
 		else
-			ErrorLog("SkeletonRebirth: dialogue step \"show_text\" has \"{item}\" in its text but no resolvable \"item\" (\"" + itemId + "\") - left as-is");
+			ErrorLog("SkeletonRebirth: " + callerLabel + " has \"{item}\" in its text but no resolvable \"item\" (\"" + itemId + "\") - left as-is");
 	}
+
+	return resolvedText;
+}
+
+static void showFloatingText(Character* patient, const std::string& text, const std::string& colorHex, const std::string& itemId)
+{
+	if (!gui || text.empty())
+		return;
+
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, "dialogue step \"show_text\"");
 
 	MyGUI::Colour color = MyGUI::Colour::White;
 	if (!colorHex.empty() && !tryParseHexColor(colorHex, color))
@@ -768,6 +791,21 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 	ScreenLabel* label = gui->createScreenLabel(resolvedText, color, ScreenLabel::LS_MEDIUM, ScreenLabel::RS_SLOW);
 	if (label)
 		label->setTracking(patient->getHandle(), Ogre::Vector3(0, 1, 0));
+}
+
+// Kenshi's own native player-notification system - the corner text queue used for things like "<name>
+// is dead" - distinct from show_text's ScreenLabel (floating over the character) and from the
+// dialogue box itself. showPlayerAMessage_withLog() (vs. the plain non-"_withLog" variant) also
+// records it into whatever history/log that notification queue keeps, matching how a native message
+// like that would normally behave. queued=true so it takes its place behind any other pending
+// notification instead of replacing one that's still showing.
+static void showGameNotification(Character* patient, const std::string& text, const std::string& itemId)
+{
+	if (!ou || text.empty())
+		return;
+
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, "dialogue step \"notify\"");
+	ou->showPlayerAMessage_withLog(resolvedText, true);
 }
 
 // Resumed from Character_updateOnScreenCheck_hook, which already polls every frame per character.
@@ -826,6 +864,12 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 		if (step.type == "show_text")
 		{
 			showFloatingText(patient, step.text, step.color, step.item);
+			continue;
+		}
+
+		if (step.type == "notify")
+		{
+			showGameNotification(patient, step.text, step.item);
 			continue;
 		}
 
@@ -922,20 +966,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	std::string message = def.message;
-	size_t namePos = message.find("{name}");
-	if (namePos != std::string::npos)
-		message.replace(namePos, 6, patient->getName());
-
-	size_t itemPos = message.find("{item}");
-	if (itemPos != std::string::npos)
-	{
-		GameData* itemData = def.item.empty() ? nullptr : getGameDataGuarded(def.item, ITEM);
-		if (itemData)
-			message.replace(itemPos, 6, itemData->name);
-		else
-			ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" has \"{item}\" in its message but no resolvable \"item\" (\"" + def.item + "\") - left as-is");
-	}
+	std::string message = resolvePlaceholders(def.message, patient, def.item, "dialogue box \"" + dialogueId + "\"");
 
 	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
 	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.

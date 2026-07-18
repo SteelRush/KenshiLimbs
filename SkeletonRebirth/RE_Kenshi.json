@@ -72,7 +72,7 @@
 					"requiresPlayerFaction": true,
 					"steps": [
 						{ "type": "delay", "seconds": 5 },
-						{ "type": "show_text", "text": "{name} has been successfully revived!", "color": "#3399FF" },
+						{ "type": "notify", "text": "{name} has been successfully revived!" },
 						{ "type": "action", "action": "reactivate" },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
