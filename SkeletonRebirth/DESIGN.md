@@ -271,7 +271,11 @@ Requested explicitly: dialogue box *content and button behavior* shouldn't be ha
 old, removed `ConversationOverrides`/`DialogueSkillChecks` system nested its own config in that same
 file) defines each dialogue box's title, message, and per-button gating + behavior; a generic
 `showDialogueBox(dialogueId, patient, initiator)` loads the entry and wires it up, instead of a
-dedicated `Show*`/`On*Clicked` function pair per dialogue.
+dedicated `Show*`/`On*Clicked` function pair per dialogue. `initiator` (who `requiresSkill`/`requiresItem`/
+`take_item` check against) is `PlayerInterface::selectedCharacter` - not `getAnyPlayerCharacter()`, which
+returns an arbitrary squad member unrelated to who's actually carrying the required item. Safe to use here
+specifically because the initiator is always the player's own humanoid character, unlike the patient - see
+"A second pitfall" for why `selectedCharacter` is unreliable when the *target* is an `ANIMAL_CHARACTER`.
 
 A button's behavior is an ordered list of **steps**, not a single action - directly mirroring that old
 system's per-reply override list (`reactivate_skeleton`/`take_item`/`show_text`/`delay` types), just
@@ -544,9 +548,11 @@ nothing that can go stale.
 - `hasDeactivatedSignature()` — this file, not RE_Kenshi/KenshiLib - re-derives `g_deactivated`
   membership from native `MedicalSystem::dead`/`HealthPartStatus::isDead()` instead of any persisted ID
   (see §6 and "A second pitfall")
-- `PlayerInterface::selectedCharacter` (`hand`) — PlayerInterface.h:191 - does not reliably resolve for
-  `ANIMAL_CHARACTER`; superseded by `g_lastInspectedCharacter` (this file) for identity checks - see "A
-  second pitfall"
+- `PlayerInterface::selectedCharacter` (`hand`) — PlayerInterface.h:191 - safe for identifying a humanoid
+  *initiator* (§4). Not reliable when the object being checked could be an `ANIMAL_CHARACTER` - superseded
+  by `g_lastInspectedCharacter` (this file) for that case - see "A second pitfall"
+- `PlayerInterface::getAnyPlayerCharacter() const` — PlayerInterface.h:177, RVA `0x7F19B0` - returns an
+  arbitrary squad member; not used for dialogue `initiator` (§4) since that must be predictable
 - `RootObjectBase::getHandle()` — RootObjectBase.h:63/78
 - `RootObjectBase::getGameData() const` — RootObjectBase.h:36, virtual, `Character` inherits this via
   `RootObject` - `isAnimalCharacterType()` reads `->type == ANIMAL_CHARACTER` off the result

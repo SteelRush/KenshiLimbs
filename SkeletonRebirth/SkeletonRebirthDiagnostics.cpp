@@ -850,8 +850,41 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 	std::vector<DialogueBoxButtonDef> eligibleButtons;
 	for (size_t i = 0; i < def.buttons.size() && eligibleButtons.size() < 3; ++i)
 	{
-		if (isDialogueButtonEligible(def.buttons[i], patient, initiator))
-			eligibleButtons.push_back(def.buttons[i]);
+		const DialogueBoxButtonDef& btn = def.buttons[i];
+		bool eligible = isDialogueButtonEligible(btn, patient, initiator);
+		{
+			Faction* patientFaction = patient->getFaction();
+			std::ostringstream ss;
+			ss << "SkeletonRebirth: dialogue button \"" << btn.caption << "\" eligible=" << eligible
+			   << " excludePlayerFaction=" << btn.excludePlayerFaction
+			   << " requiresPlayerFaction=" << btn.requiresPlayerFaction
+			   << " patientFactionPtr=" << (void*)patientFaction
+			   << " patientFactionIsPlayer=" << (patientFaction ? patientFaction->isThePlayer() : false);
+
+			if (!btn.requiresSkill.empty())
+			{
+				CharStats* stats = initiator ? initiator->getStats() : nullptr;
+				auto fieldIt = g_skillFields.find(toLowerCopy(btn.requiresSkill));
+				float value = (stats && fieldIt != g_skillFields.end()) ? stats->*(fieldIt->second) : -1.0f;
+				ss << " requiresSkill=\"" << btn.requiresSkill << "\" initiatorStatsNull=" << (stats == nullptr)
+				   << " skillRecognized=" << (fieldIt != g_skillFields.end()) << " skillValue=" << value
+				   << " minSkill=" << (btn.hasMinSkill ? btn.minSkill : -1.0f);
+			}
+
+			if (!btn.requiresItem.empty())
+			{
+				Inventory* inv = initiator ? initiator->getInventory() : nullptr;
+				GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
+				ss << " requiresItem=\"" << btn.requiresItem << "\" initiatorInvNull=" << (inv == nullptr)
+				   << " itemDataResolved=" << (itemData != nullptr)
+				   << " itemDataName=\"" << (itemData ? itemData->name : "") << "\""
+				   << " hasItem=" << (inv && itemData ? inv->hasItem(itemData, 1) : false);
+			}
+
+			verboseLog(ss.str());
+		}
+		if (eligible)
+			eligibleButtons.push_back(btn);
 	}
 	if (eligibleButtons.empty())
 	{
@@ -1246,7 +1279,8 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	if (g_triggerShown.count(shownKey))
 		return; // already shown, waiting on the player to act or leave
 
-	Character* initiator = (ou && ou->player) ? ou->player->getAnyPlayerCharacter() : nullptr;
+	// initiator = player's current selection, not getAnyPlayerCharacter() - see DESIGN.md §4.
+	Character* initiator = (ou && ou->player) ? ou->player->selectedCharacter.getCharacter() : nullptr;
 	showDialogueBox(trigger.menu, self, initiator);
 	g_triggerShown[shownKey] = true;
 }
