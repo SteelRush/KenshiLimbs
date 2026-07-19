@@ -8,8 +8,6 @@
 #include <kenshi/RootObject.h>
 #include <kenshi/RootObjectBase.h>
 #include <kenshi/GameSaveState.h>
-#include <kenshi/HandleManager.h>
-#include <kenshi/SaveManager.h>
 #include <kenshi/util/hand.h>
 #include <kenshi/AI/AITaskSystem.h>
 #include <kenshi/Building/Building.h>
@@ -34,8 +32,6 @@
 
 #include <rapidjson/document.h>
 #include <rapidjson/istreamwrapper.h>
-#include <rapidjson/ostreamwrapper.h>
-#include <rapidjson/writer.h>
 #include <rapidjson/error/en.h>
 
 #define WIN32_LEAN_AND_MEAN
@@ -47,6 +43,7 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -119,8 +116,7 @@ static bool isAnimalCharacterType(Character* c)
 	return data && data->type == ANIMAL_CHARACTER;
 }
 
-// Character*-keyed and session-only (doesn't survive reload - see saveDeactivatedState/
-// loadDeactivatedState below for the handle-string-keyed side-file that does).
+// Character*-keyed and session-only - no persistence file needed, see DESIGN.md §6.
 static std::map<Character*, bool> g_deactivated;
 
 // Gates Character_updateOnScreenCheck_hook's trigger loop so a matched trigger doesn't reopen its box
@@ -145,123 +141,21 @@ static void clearTriggerShownFor(Character* c)
 	}
 }
 
-// --- Save/load persistence -----------------------------------------------------------------------
-// g_deactivated is Character*-keyed and doesn't survive reload; RootObjectBase::getHandle().toString()
-// does. No native "attach data to this object's save entry" hook exists, and SaveManager exposes no
-// subscribable save/load event - so state is written to a small side-file next to the active save and
-// re-read on load via HandleManager::_NV_restore (see that hook's comment for why not the virtual
-// HandleManager::restore).
-static std::string getPersistenceFilePath()
+// Re-derives g_deactivated membership from native data instead of a persisted ID - see DESIGN.md §6.
+static bool hasDeactivatedSignature(Character* self)
 {
-	SaveManager* saveManager = SaveManager::getSingleton();
-	if (!saveManager)
-		return "";
+	MedicalSystem* med = self->getMedical();
+	if (!med || med->dead)
+		return false;
 
-	std::string currentGame = saveManager->getCurrentGame();
-	if (currentGame.empty())
-		return ""; // no save loaded yet (e.g. main menu, brand new unsaved game)
-
-	std::string path = saveManager->getSavePath();
-	if (!path.empty() && path.back() != '/' && path.back() != '\\')
-		path += "/";
-	path += currentGame;
-	if (!path.empty() && path.back() != '/' && path.back() != '\\')
-		path += "/";
-	path += "SkeletonRebirth_Deactivated.json";
-	return path;
-}
-
-static void saveDeactivatedState()
-{
-	std::string path = getPersistenceFilePath();
-	if (path.empty())
-		return;
-
-	rapidjson::Document doc;
-	doc.SetObject();
-	rapidjson::Document::AllocatorType& alloc = doc.GetAllocator();
-	rapidjson::Value handles(rapidjson::kArrayType);
-	for (auto it = g_deactivated.begin(); it != g_deactivated.end(); ++it)
+	for (auto it = med->anatomy.begin(); it != med->anatomy.end(); ++it)
 	{
-		if (!it->second || !it->first)
-			continue;
-
-		std::string handleStr = it->first->getHandle().toString();
-		handles.PushBack(rapidjson::Value(handleStr.c_str(), alloc), alloc);
-	}
-	doc.AddMember("DeactivatedRobots", handles, alloc);
-
-	std::ofstream out(path.c_str());
-	if (!out.is_open())
-	{
-		ErrorLog("SkeletonRebirth: could not open \"" + path + "\" to persist Deactivated state");
-		return;
+		MedicalSystem::HealthPartStatus* part = *it;
+		if (part && part->isDead())
+			return true;
 	}
 
-	rapidjson::OStreamWrapper osw(out);
-	rapidjson::Writer<rapidjson::OStreamWrapper> writer(osw);
-	doc.Accept(writer);
-}
-
-// Missing file is normal (no Deactivated robots yet this save); a per-handle resolution failure is only
-// debug-logged, since a character destroyed between sessions is expected, not a bug.
-static void loadDeactivatedState()
-{
-	std::string path = getPersistenceFilePath();
-	if (path.empty())
-		return;
-
-	std::ifstream file(path.c_str());
-	if (!file.is_open())
-		return;
-
-	rapidjson::Document doc;
-	rapidjson::IStreamWrapper isw(file);
-	if (doc.ParseStream(isw).HasParseError())
-	{
-		ErrorLog("SkeletonRebirth: JSON parse error in \"" + path + "\": " + rapidjson::GetParseError_En(doc.GetParseError()));
-		return;
-	}
-
-	if (!doc.HasMember("DeactivatedRobots") || !doc["DeactivatedRobots"].IsArray())
-		return;
-
-	int resolved = 0;
-	int failed = 0;
-	const rapidjson::Value& handles = doc["DeactivatedRobots"];
-	for (rapidjson::SizeType i = 0; i < handles.Size(); ++i)
-	{
-		if (!handles[i].IsString())
-			continue;
-
-		hand h;
-		h.fromString(handles[i].GetString());
-		Character* c = h.getCharacter();
-		if (c)
-		{
-			g_deactivated[c] = true;
-			++resolved;
-		}
-		else
-		{
-			++failed;
-		}
-	}
-
-	std::ostringstream ss;
-	ss << "SkeletonRebirth: loaded persisted Deactivated state from \"" << path << "\" - resolved=" << resolved << " failed=" << failed;
-	verboseLog(ss.str());
-}
-
-// --- Hook: HandleManager::_NV_restore() - post-load persistence trigger ---------------------------
-// HandleManager::restore() is virtual; hooking it directly (taking &Class::Method) resolves to an
-// MSVC vtable thunk, not a real stub, and crashes. _NV_restore is the non-virtual wrapper, same RVA,
-// safe to hook - see DESIGN.md's "hooking virtual functions" pitfall section.
-void (*HandleManager_restore_orig)(HandleManager*, std::ifstream&);
-void HandleManager_restore_hook(HandleManager* self, std::ifstream& in)
-{
-	HandleManager_restore_orig(self, in);
-	loadDeactivatedState();
+	return false;
 }
 
 // Do not set MedicalSystem::dead=true to get native corpse/roster cleanup "for free" - see
@@ -352,17 +246,15 @@ void Character_declareDead_hook(Character* self)
 		// sustained) from a handful of robots taking continuous damage in combat - since some upstream
 		// system keeps re-setting dead=true and re-invoking this for as long as a Deactivated robot
 		// keeps getting hit, not just once at the moment of "death". Only the first call for a given
-		// character needs to touch disk (saveDeactivatedState()) or build the describe() log string;
-		// every repeat call skips straight past both once the character's already recorded, which is
-		// what actually keeps this genuinely hot path cheap. The med->dead reset above still has to run
-		// unconditionally every time regardless.
+		// character needs to build the describe() log string; every repeat call skips straight past it
+		// once the character's already recorded, which is what actually keeps this genuinely hot path
+		// cheap. The med->dead reset above still has to run unconditionally every time regardless.
 		if (g_deactivated.count(self))
 			return;
 
 		// No explicit AI pause needed - vanilla's own knockout state has no recovery timer at the
 		// catastrophic damage level that triggers this hook, so the character is already inert.
 		g_deactivated[self] = true;
-		saveDeactivatedState();
 
 		// Player-squad robots getting Deactivated is otherwise silent - no native "X is dead" message
 		// fires, since dead never actually becomes true. Uses Kenshi's own player-notification queue
@@ -414,7 +306,6 @@ bool TryReactivate(Character* self)
 	}
 
 	g_deactivated.erase(self);
-	saveDeactivatedState();
 	verboseLog("SkeletonRebirth: TryReactivate() SUCCEEDED -> " + describe(self));
 
 	return true;
@@ -1406,9 +1297,13 @@ static MyGUI::TextBox* findHealthTextWidget(MyGUI::Widget* widget)
 	return nullptr;
 }
 
+// Tracks "which character's panel is currently shown", set by DatapanelGUI_setLine_KeyLastVisible_hook -
+// deliberately not PlayerInterface::selectedCharacter, see DESIGN.md §2 and "A second pitfall".
+static Character* g_lastInspectedCharacter = nullptr;
+
 static void updateHealthTextOverride(Character* self)
 {
-	if (!ou || !ou->player || ou->player->selectedCharacter.getCharacter() != self)
+	if (g_lastInspectedCharacter != self)
 		return;
 
 	if (!g_healthTextWidgetSearched && gui && gui->mainbar)
@@ -1431,6 +1326,14 @@ bool (*Character_updateOnScreenCheck_orig)(Character*);
 bool Character_updateOnScreenCheck_hook(Character* self)
 {
 	bool result = Character_updateOnScreenCheck_orig(self);
+
+	// g_deactivated.count() checked first (cheap) so hasDeactivatedSignature's anatomy scan only runs
+	// for not-yet-tracked characters - see DESIGN.md §6.
+	if (!g_deactivated.count(self) && isRobotRace(self) && hasDeactivatedSignature(self))
+	{
+		g_deactivated[self] = true;
+		verboseLog("SkeletonRebirth: re-derived Deactivated state from native signature -> " + describe(self));
+	}
 
 	if (g_deactivated.count(self))
 		updateHealthTextOverride(self);
@@ -1465,6 +1368,11 @@ DataPanelLine* (*DatapanelGUI_setLine_KeyLastVisible_orig)(DatapanelGUI*, const 
 DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, const std::string& keyValue, const std::string& s1, const std::string& s2, int category, bool last, bool keyVisible)
 {
 	Character* target = self->getObject().getCharacter();
+
+	// Feeds g_lastInspectedCharacter (DESIGN.md §2) - kept fresh for any open panel, not just Deactivated.
+	if (target)
+		g_lastInspectedCharacter = target;
+
 	if (!target || !g_deactivated.count(target))
 		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);
 
@@ -1539,9 +1447,6 @@ __declspec(dllexport) void startPlugin()
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Character::updateOnScreenCheck), Character_updateOnScreenCheck_hook, &Character_updateOnScreenCheck_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add Character::updateOnScreenCheck hook!");
-
-	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&HandleManager::_NV_restore), HandleManager_restore_hook, &HandleManager_restore_orig))
-		ErrorLog("SkeletonRebirthDiagnostics: Could not add HandleManager::_NV_restore hook!");
 
 	typedef DataPanelLine* (DatapanelGUI::*SetLineKeyLastVisibleFn)(const std::string&, const std::string&, const std::string&, int, bool, bool);
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((SetLineKeyLastVisibleFn)&DatapanelGUI::setLine), DatapanelGUI_setLine_KeyLastVisible_hook, &DatapanelGUI_setLine_KeyLastVisible_orig))

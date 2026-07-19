@@ -1,6 +1,6 @@
 {
 	"Plugins" : [ "SkeletonRebirthDiagnostics.dll" ],
-	"Debug" : false,
+	"Debug" : true,
 	"DialogueTriggers" : [
 		{
 			"requiredStates" : [ "deactivated", "humanoid" ],
@@ -9,7 +9,7 @@
 		},
 		{
 			"requiredStates" : [ "deactivated", "animal" ],
-			"buildings" : [ "32-Skeleton Rebirth.mod" ],
+			"buildings" : [ "33-Skeleton Rebirth.mod" ],
 			"menu" : "system_menu_animal"
 		}
 	],

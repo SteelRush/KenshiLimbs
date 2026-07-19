@@ -41,6 +41,38 @@ override. Rule of thumb: `_NV_` is for taking an address (hooking); a normal cal
 use the plain virtual name unless there's a specific reason to pin it to one exact class's
 implementation regardless of the object's real type.
 
+## A second pitfall: `hand`/selection resolution silently breaks for animals
+
+Two independent things stopped working correctly for `ANIMAL_CHARACTER`-type robots (Iron Spiders etc. -
+this is FCS's Human/Animal Character category, not the `CharacterAnimal` C++ class; see the `isAnimal()`
+reference-index note) while working fine for humanoid robots, and both trace back to the same root cause:
+`hand`-based identity resolution isn't reliable for this class of object.
+
+**Persistence** (see §6 for the full history): the original JSON side-file persistence serialised
+`RootObjectBase::getHandle().toString()` and resolved it back via `hand::fromString()` +
+`hand::getCharacter()` on load. Confirmed live this fails completely for these characters - a real
+save/reload logged `resolved=0 failed=8`. Separately confirmed `hand` values for this class of character
+aren't even stable *within a single session*, no reload involved: the same live `Character*` reported two
+different handle strings 36 seconds apart, three of five fields changed. `hand` isn't a durable identifier
+for these characters regardless of whether a reload happens in between.
+
+**Selection**: `PlayerInterface::selectedCharacter` (a `hand`) was used to check "is this my current
+selection" for the persistent HUD text override (§2). Confirmed live that clicking directly on a wild
+`ANIMAL_CHARACTER` left `selectedCharacter` resolving to a different, unrelated character the whole
+time - not stale data, verified two independent ways (`hand::getCharacter()` and
+`hand::getRootObjectBase()` agreed, and the resolved object's own live name was logged). Also confirmed
+this isn't about squad membership either way - a wild, never-recruited *humanoid* robot updates
+`selectedCharacter` correctly on click, so the split really is animal-vs-humanoid. Best working theory:
+Kenshi's core selection model (giving orders, combat targeting) is built around humanoid interaction, and
+clicking an animal may only open its inspect panel without ever making it a real `PlayerInterface`
+selection.
+
+**Lesson**: don't trust `hand`-based resolution (`getCharacter()`, `PlayerInterface::selectedCharacter`,
+anything serialised through `hand::toString()`) for `ANIMAL_CHARACTER`-tagged objects, for either
+persistence or live identity checks. Where a `hand`-free alternative already exists and is proven working
+for both types - e.g. `DatapanelGUI::getObject().getCharacter()` - prefer reusing it over continuing to
+debug the `hand`-based path.
+
 ## Architecture
 
 ### 1. Deactivated state
@@ -128,23 +160,17 @@ variants, all now confirmed logged live and excluded: `setLineStatInfo` only car
 `setLineFaction` never fires at all for this row, none of the remaining `setLine(...)` skin/bar-value/
 no-key variants carry it either).
 
-**Known gap, not fixed, deprioritized**: there's a second, separate "overall health status" text (also
-showing `"Dying"`/`"Recovery coma"`), visible without opening any panel - part of the persistent HUD,
-directly right of the always-visible name+faction display. It does not go through any
-`DatapanelGUI::setLine*` overload - exhaustively ruled out live, including specifically on
-`MainBarGUI::getMedicalPanel()`'s own `MedicalDatapanel*` instance (compared by raw pointer address
-against every `self` seen in the hooked overload; zero matches, ever). `MedicalDatapanel` only exists as
-a forward declaration anywhere in RE_Kenshi's headers - none of its own methods have ever been reverse
-engineered, so there's no RVA to hook directly, and the pointer-comparison result confirms it either
-doesn't inherit `DatapanelGUI` at all, or never calls `setLine` on this content specifically. It's
-updated via some other mechanism - most likely a raw MyGUI widget outside the `DataPanelLine`
-abstraction entirely (`MainBarGUI` has several plain `MyGUI::TextBox*` members like `dayText`/
-`moneyText`/`biomePanelText` set this way). Finding it from here would mean a live widget-tree walk
-(`MyGUI::Widget::getChildCount()`/`getChildAt()`) with speculative type-casting to read captions -
-`Widget`'s base class only exposes a generic *setter* (`setProperty`), not a getter, so reading an
-arbitrary widget's caption means guessing its concrete type and casting to it, which risks a crash on a
-wrong guess. Judged not worth that risk for a second cosmetic label once the panel-level "POWER FAILURE"
-override was in place - closed out, not pursued further.
+**Second override - persistent HUD health-status text**: a separate, always-visible label
+(`MainBarGUI`'s `*_HealthText` widget, located once via a name-suffix widget-tree walk -
+`findHealthTextWidget()`/`updateHealthTextOverride()`) shows vanilla text like `"Recovery coma"`/`"Dying"`
+without any panel open, and does not go through `DatapanelGUI::setLine` at all (ruled out live, including
+`MainBarGUI::getMedicalPanel()`'s `MedicalDatapanel*` - forward-declared only in RE_Kenshi's headers, no
+reversed methods, so no RVA to hook directly there). Forcing its caption (`"Deactivated"`, same
+`DEACTIVATED_COLOR`) requires knowing which character it's currently showing - originally checked via
+`PlayerInterface::selectedCharacter.getCharacter()`, which does not reliably resolve for animals (see "A
+second pitfall" above); fixed by reusing `g_lastInspectedCharacter`, tracked from the
+`DatapanelGUI::getObject().getCharacter()` resolution already proven correct for the row above, instead
+of depending on `selectedCharacter` at all.
 
 Finding the *original* status-tag logic (back when this was still a `dead=true` design) required static
 analysis of the shipped `kenshi_x64.exe`, not just the headers: `MedicalSystem::getMedicalGUIData`'s RVA
@@ -414,22 +440,22 @@ that was never marked dead to begin with).
 `g_deactivated` (and `g_reactivateDialogueShown`) stay `Character*`-keyed and session-only for the hot
 per-tick lookups - `updateOnScreenCheck` fires roughly every frame per character, and switching every
 lookup site to a handle-string key (a string construction per check) isn't worth it for maps already
-gated to near-zero cost for the overwhelming majority of characters. Save/reload survival is handled
-additively instead, as a write-through JSON side-file keyed by
-`RootObjectBase::getHandle().toString()` (confirmed to round-trip correctly across save/reload via
-`HandleManager::serialise`/`restore`) - none of the already-stabilized per-tick hooks needed to change.
+gated to near-zero cost for the overwhelming majority of characters.
 
-No native "attach custom data to this object's own save entry" hook was found in RE_Kenshi's headers
-(`GameData`'s `bdata`/`idata` maps are a plausible but unverified candidate - not worth betting on), and
-no save/load *event* exists either (`SaveManager` only exposes a polled internal state machine, nothing
-subscribable). Practical alternative: `saveDeactivatedState()` writes `SkeletonRebirth_Deactivated.json`
-(array of handle strings) next to the active save (`SaveManager::getSingleton()->getSavePath()` +
-`getCurrentGame()`) on every `g_deactivated` mutation (Deactivation, reactivation) rather than hooking a
-pre-save event, so it can't be missed by a save trigger that turns out not to fire the way expected.
-`loadDeactivatedState()` reads it back and resolves each handle string to a live `Character*` via
-`hand::fromString()`/`hand::getCharacter()`, called from a hook on `HandleManager::_NV_restore` (see the
-virtual-function pitfall note above for why not the virtual `restore()` directly) - the handle table
-itself being restored is the natural "a load just happened" signal.
+**No custom persistence file exists** (an earlier design's write-through JSON side-file, keyed by
+`RootObjectBase::getHandle().toString()`, was removed - see "A second pitfall" above for why: `hand`
+round-trip resolution failed completely, `resolved=0 failed=8` on a real save/reload, and separately
+`hand` values for this class of character aren't even stable within one session). Instead,
+`hasDeactivatedSignature()` re-derives `g_deactivated` membership every time from data Kenshi's own save
+system already persists reliably: `MedicalSystem::dead` and `HealthPartStatus::flesh`/`isDead()`, the
+same fields any character's health depends on. `Character_declareDead_hook`'s block leaves a specific,
+otherwise near-impossible combination on a Deactivated robot - at least one body part at fatal flesh while
+`dead` stays false (in real vanilla play `dead` becomes true essentially the instant damage is fatal, so
+that combination doesn't normally persist; it only does here because this mod's own hook forces `dead`
+back to false). Checked from `Character_updateOnScreenCheck_hook` (already firing every frame per
+character) for any not-yet-tracked robot, gated behind a cheap `g_deactivated.count()` check first so the
+anatomy scan only runs until a character is found and recorded. No load-event hook, no serialised ID,
+nothing that can go stale.
 
 ## Reference index
 
@@ -466,10 +492,18 @@ itself being restored is the natural "a load just happened" signal.
 - `DatapanelGUI::getObject() const` — DatapanelGUI.h:100-101, virtual — resolves which character a panel
   belongs to (called normally at runtime, not hooked - see the virtual-function pitfall note)
 - `MainBarGUI::medicalPanel` (`MedicalDatapanel*`) / `getMedicalPanel()` — gui/MainBarGUI.h:91/131 —
-  ruled out as the source of the still-unfixed persistent health-status text (see §2) via live pointer
-  comparison; not hooked in the shipped version. `MedicalDatapanel` itself is forward-declared only, no
-  full definition anywhere in RE_Kenshi's headers
-- `hand::getCharacter() const` / `fromString(const std::string&)` / `toString() const` — util/hand.h:49/39/38
+  ruled out as the source of the persistent health-status text via live pointer comparison.
+  `MedicalDatapanel` itself is forward-declared only, no full definition anywhere in RE_Kenshi's headers -
+  the real widget was found by name-suffix tree walk instead, see the next entry
+- `findHealthTextWidget()` / `updateHealthTextOverride()` — this file, not RE_Kenshi/KenshiLib - locates
+  `MainBarGUI`'s `*_HealthText` `MyGUI::TextBox` by walking its widget tree once (`MyGUI::Widget::
+  castType<T>(false)` is RTTI-checked, safe against a type mismatch) and matching the stable name suffix
+  (the full name has a per-session numeric prefix); cached thereafter since `MainBarGUI` is a persistent
+  singleton. See §2 and "A second pitfall" for why this needed `g_lastInspectedCharacter` rather than
+  `PlayerInterface::selectedCharacter`
+- `hand::getCharacter() const` / `getRootObjectBase() const` / `operator==(const hand&) const` /
+  `fromString(const std::string&)` / `toString() const` — util/hand.h - see "A second pitfall" for why
+  none of these reliably identify an `ANIMAL_CHARACTER`
 - `MessageBoxManager::createMessageBox(title, message, buttons, modal, callback)` —
   gui/MessageBoxManager.h:30 — real mangled name too long for MASM, exported as
   `MessageBoxManager_createMessageBox_PLACEHOLDER` instead (see MessageBoxManager.inc); redeclared
@@ -504,12 +538,15 @@ itself being restored is the natural "a load just happened" signal.
   protected, this factory is the real public entry point
 - `ScreenLabel::setTracking(const hand&, const Ogre::Vector3&)` — gui/ScreenLabel.h, RVA `0x6E1BB0`,
   virtual — anchors a floating text label to the patient so it follows them
-- `HandleManager::_NV_restore(std::ifstream&)` — HandleManager.h:201, RVA `0x36ADF0`, non-virtual
-  wrapper (the virtual `restore()` at the same RVA can't be hooked directly - see the pitfall note)
 - `HandleManager::destroy(const hand&, const char* reason)` — HandleManager.h:208, RVA `0x2AC790`,
   non-virtual — the native "corpse unloaded" cleanup mechanism (see §5); not hooked in the shipped
   version - `dead` never becomes true, so this never fires for a Deactivated robot regardless
-- `SaveManager::getSingleton()` / `getSavePath() const` / `getCurrentGame()` — SaveManager.h:26/47/44
+- `hasDeactivatedSignature()` — this file, not RE_Kenshi/KenshiLib - re-derives `g_deactivated`
+  membership from native `MedicalSystem::dead`/`HealthPartStatus::isDead()` instead of any persisted ID
+  (see §6 and "A second pitfall")
+- `PlayerInterface::selectedCharacter` (`hand`) — PlayerInterface.h:191 - does not reliably resolve for
+  `ANIMAL_CHARACTER`; superseded by `g_lastInspectedCharacter` (this file) for identity checks - see "A
+  second pitfall"
 - `RootObjectBase::getHandle()` — RootObjectBase.h:63/78
 - `RootObjectBase::getGameData() const` — RootObjectBase.h:36, virtual, `Character` inherits this via
   `RootObject` - `isAnimalCharacterType()` reads `->type == ANIMAL_CHARACTER` off the result
