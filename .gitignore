@@ -2,3 +2,18 @@
 *.exp
 *.lib
 *.dll
+*.pdb
+*.iobj
+*.ilk
+
+# MSBuild output/intermediate dirs
+x64/
+x86/
+[Dd]ebug/
+[Rr]elease/
+*.tlog/
+[Bb]in/
+[Oo]bj/
+
+# MSBuild GUID-prefixed intermediate dirs (e.g. Skeleton.<projectguid>/)
+SkeletonRebirth/Skeleton.*/
