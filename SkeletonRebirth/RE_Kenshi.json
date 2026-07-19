@@ -21,12 +21,26 @@
 			"buttons": [
 				{
 					"caption": "Diagnostics",
+					"excludeRace": "Skeleton No-Head MkII",
 					"requiresSkill": "science",
 					"minSkill": 1,
 					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43392-changes_otto.mod" },
 						{ "type": "show_text", "text": "{item} consumed - running diagnostics...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
+						{ "type": "delay", "seconds": 3 },
+						{ "type": "open_menu", "menu": "diagnostic_menu" }
+					]
+				},
+				{
+					"caption": "Diagnostics",
+					"requiresRace": "Skeleton No-Head MkII",
+					"requiresSkill": "science",
+					"minSkill": 1,
+					"requiresItem": "43398-changes_otto.mod",
+					"steps": [
+						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "show_text", "text": "{item} consumed - running diagnostics...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
@@ -69,7 +83,6 @@
 				{
 					"caption": "Revive",
 					"requiresDeactivated": true,
-					"requiresPlayerFaction": true,
 					"steps": [
 						{ "type": "delay", "seconds": 5 },
 						{ "type": "notify", "text": "{name} has been successfully revived!" },
@@ -80,6 +93,7 @@
 				{
 					"caption": "Reset",
 					"excludePlayerFaction": true,
+					"excludeDeactivated": true,
 					"steps": [
 						{ "type": "delay", "seconds": 5 },
 						{ "type": "show_text", "text": "{name} has been reset!", "color": "#3399FF" },

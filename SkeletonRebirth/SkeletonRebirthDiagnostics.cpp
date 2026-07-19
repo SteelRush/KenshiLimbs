@@ -179,8 +179,12 @@ static std::string describeAnatomy(MedicalSystem* med)
 			continue;
 
 		std::string label = (part->data && !part->data->stringID.empty()) ? part->data->stringID : "?";
-		ss << " " << label << "(type=" << (int)part->whatAmI << " side=" << (int)part->side
-		   << " flesh=" << part->flesh << " fatal=" << part->fatal << " isDead=" << part->isDead() << ")";
+		std::string name = part->data ? part->data->name : "?";
+		ss << " " << label << "(name=\"" << name << "\" type=" << (int)part->whatAmI << " side=" << (int)part->side
+		   << " flesh=" << part->flesh << " fleshStun=" << part->fleshStun << " wearDamage=" << part->wearDamage
+		   << " bandaging=" << part->bandaging << " juryRigging=" << part->juryRigging
+		   << " maxHealth=" << part->maxHealth() << " derivedFleshHealthPercent=" << part->derivedFleshHealthPercent
+		   << " fatal=" << part->fatal << " isDead=" << part->isDead() << ")";
 	}
 	ss << " ]";
 	return ss.str();
@@ -221,6 +225,48 @@ static std::string describe(Character* c)
 	   << " isVisibleAndNear=" << c->isVisibleAndNear
 	   << " goalString=\"" << getCurrentGoalStringSafe(c) << "\"";
 	return ss.str();
+}
+
+// Item-triggered instant death doesn't deplete flesh like combat does - see DESIGN.md §1.
+bool (*Inventory_deathCheck_orig)(Inventory*, Item*);
+bool Inventory_deathCheck_hook(Inventory* self, Item* item)
+{
+	bool result = Inventory_deathCheck_orig(self, item);
+
+	Character* owner = self->getCallbackCharacter();
+	if (result && owner && isRobotRace(owner))
+	{
+		MedicalSystem* med = owner->getMedical();
+		if (med)
+		{
+			// Head/Chest/Stomach only, whichever is already weakest - not every character has a head,
+			// and PART_TORSO covers both chest and stomach as separate parts (see DESIGN.md §1).
+			MedicalSystem::HealthPartStatus* weakest = nullptr;
+			for (auto it = med->anatomy.begin(); it != med->anatomy.end(); ++it)
+			{
+				MedicalSystem::HealthPartStatus* part = *it;
+				if (!part)
+					continue;
+
+				bool isVital = part->whatAmI == MedicalSystem::HealthPartStatus::PART_HEAD
+					|| part->whatAmI == MedicalSystem::HealthPartStatus::PART_TORSO;
+				if (isVital && (!weakest || (part->flesh - part->fleshStun) < (weakest->flesh - weakest->fleshStun)))
+					weakest = part;
+			}
+
+			if (weakest)
+			{
+				// derivedFleshHealthPercent = (flesh - fleshStun) / maxHealth (confirmed live) - flesh
+				// alone isn't the effective health, so solve for flesh given the part's existing fleshStun
+				// rather than ignoring it (see DESIGN.md §1).
+				weakest->flesh = -weakest->maxHealth() * 0.965f + weakest->fleshStun;
+				weakest->updateDerivedHealths();
+			}
+		}
+		verboseLog("SkeletonRebirth: forced fatal flesh for item-death signature -> " + describe(owner));
+	}
+
+	return result;
 }
 
 // --- Hook 1: declareDead() -----------------------------------------------------------------
@@ -272,26 +318,31 @@ void Character_declareDead_hook(Character* self)
 	Character_declareDead_orig(self);
 }
 
-// Reactivating with flesh still fatal would let medicalUpdate() immediately re-trigger declareDead()
-// the moment it un-freezes. A 1% nudge toward zero clears isDead() without granting a full heal - the
-// character wakes up critically hurt on purpose. Only applies below 0 (an already-healthy part pushed
-// further positive overshoots its max instead), and clamped to maxHealth() as a backstop.
+static bool isCriticalPart(MedicalSystem::HealthPartStatus* part)
+{
+	return part && (part->whatAmI == MedicalSystem::HealthPartStatus::PART_TORSO
+		|| part->whatAmI == MedicalSystem::HealthPartStatus::PART_HEAD);
+}
+
+// Floors flesh at -95% of maxHealth rather than a relative nudge - see DESIGN.md §3.
 static void nudgeFleshTowardSurvivable(MedicalSystem::HealthPartStatus* part)
 {
 	if (!part)
 		return;
 
-	if (part->flesh < 0.0f)
-		part->flesh += std::fabs(part->flesh) * 0.01f;
+	// Floor accounts for fleshStun the same way Inventory_deathCheck_hook does - see DESIGN.md §1.
+	float floor = -part->maxHealth() * 0.95f + part->fleshStun;
+	if (part->flesh < floor)
+		part->flesh = floor;
 
 	float cap = part->maxHealth();
 	if (part->flesh > cap)
 		part->flesh = cap;
+
+	part->updateDerivedHealths();
 }
 
-// Nudges every part in anatomy, not just PART_HEAD/PART_TORSO via getPart() - "chest" and "stomach"
-// are separate torso-region parts in Kenshi's damage model but share one PartType bucket, so getPart()
-// only ever reaches one of them, leaving the other fatal and re-triggering declareDead() on unfreeze.
+// Only critical parts (torso/head) are nudged, via anatomy iteration not getPart() - see DESIGN.md §3.
 bool TryReactivate(Character* self)
 {
 	auto deactivatedIt = g_deactivated.find(self);
@@ -302,7 +353,8 @@ bool TryReactivate(Character* self)
 	if (med)
 	{
 		for (auto it = med->anatomy.begin(); it != med->anatomy.end(); ++it)
-			nudgeFleshTowardSurvivable(*it);
+			if (isCriticalPart(*it))
+				nudgeFleshTowardSurvivable(*it);
 	}
 
 	g_deactivated.erase(self);
@@ -372,10 +424,13 @@ struct DialogueBoxButtonDef
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 	bool requiresPlayerFaction; // hidden unless the patient belongs to the player's faction - the counterpart to excludePlayerFaction
 	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
+	bool excludeDeactivated; // hidden while the patient is in g_deactivated - the counterpart to requiresDeactivated
 	bool requiresAnimal; // hidden unless isAnimalCharacterType() - lets an animal-only button require a different item than the humanoid one
 	bool excludeAnimal; // hidden if isAnimalCharacterType() - the humanoid-only counterpart to requiresAnimal
+	std::string requiresRace; // RaceData's display name (Character::getRace()->data->name) - hidden unless it matches exactly
+	std::string excludeRace; // same match, inverted - the counterpart to requiresRace
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), excludeDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
 
 struct DialogueBoxDef
@@ -533,6 +588,16 @@ static std::string toLowerCopy(const std::string& s)
 	return result;
 }
 
+// See DESIGN.md §4 for why requiresRace/excludeRace need this.
+static std::string trimCopy(const std::string& s)
+{
+	size_t start = s.find_first_not_of(" \t\r\n");
+	if (start == std::string::npos)
+		return "";
+	size_t end = s.find_last_not_of(" \t\r\n");
+	return s.substr(start, end - start + 1);
+}
+
 // Hand-rolled "#RRGGBB" parsing - MyGUI::Colour's own string constructor format isn't documented in
 // RE_Kenshi's headers.
 static bool tryParseHexColor(const std::string& value, MyGUI::Colour& outColor)
@@ -596,6 +661,23 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 	{
 		auto deactivatedIt = g_deactivated.find(patient);
 		if (deactivatedIt == g_deactivated.end() || !deactivatedIt->second)
+			return false;
+	}
+
+	if (btn.excludeDeactivated && g_deactivated.count(patient))
+		return false;
+
+	if (!btn.requiresRace.empty())
+	{
+		RaceData* race = patient->getRace();
+		if (!race || !race->data || trimCopy(race->data->name) != trimCopy(btn.requiresRace))
+			return false;
+	}
+
+	if (!btn.excludeRace.empty())
+	{
+		RaceData* race = patient->getRace();
+		if (race && race->data && trimCopy(race->data->name) == trimCopy(btn.excludeRace))
 			return false;
 	}
 
@@ -727,6 +809,9 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 	{
 		const DialogueBoxStepDef& step = steps[i];
 
+		verboseLog("SkeletonRebirth: DIAG dispatchDialogueSteps step " + std::to_string(i) + " type=\"" + step.type
+			+ "\" action=\"" + step.action + "\" patient=\"" + patient->getName() + "\"");
+
 		if (step.type == "delay")
 		{
 			if (step.seconds > 0.0f)
@@ -774,17 +859,22 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 			else
 				ErrorLog("SkeletonRebirth: dialogue step action \"" + step.action + "\" has no registered handler");
 
-			// join_squad specifically (the "with edit" recruit path, as opposed to join_squad_fast)
-			// opens the character editor - implicit, not a JSON-authored step, so a JSON author can't
-			// forget it and have a later step (e.g. system_reset) run while the editor's still open and
-			// possibly about to change the very things that step just set.
-			if (step.action == "join_squad" && gui && gui->isCharacterEditorMode())
+			// join_squad always defers the rest of the sequence, unconditionally - see DESIGN.md §4.
+			if (step.action == "join_squad")
 			{
 				PendingDialogueSequence pending;
 				pending.steps = steps;
 				pending.nextIndex = i + 1;
 				pending.initiator = initiator;
-				pending.waitForEditorClose = true;
+				if (gui && gui->isCharacterEditorMode())
+				{
+					pending.waitForEditorClose = true;
+				}
+				else
+				{
+					pending.waitForEditorClose = false;
+					pending.fireAtTick = GetTickCount64() + 5000;
+				}
 				g_pendingDialogueSequences[patient] = pending;
 				return;
 			}
@@ -859,7 +949,20 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 			   << " excludePlayerFaction=" << btn.excludePlayerFaction
 			   << " requiresPlayerFaction=" << btn.requiresPlayerFaction
 			   << " patientFactionPtr=" << (void*)patientFaction
-			   << " patientFactionIsPlayer=" << (patientFaction ? patientFaction->isThePlayer() : false);
+			   << " patientFactionIsPlayer=" << (patientFaction ? patientFaction->isThePlayer() : false)
+			   << " requiresDeactivated=" << btn.requiresDeactivated
+			   << " excludeDeactivated=" << btn.excludeDeactivated
+			   << " patientDeactivated=" << g_deactivated.count(patient);
+
+			if (!btn.requiresRace.empty() || !btn.excludeRace.empty())
+			{
+				RaceData* patientRace = patient->getRace();
+				ss << " requiresRace=\"" << btn.requiresRace << "\" excludeRace=\"" << btn.excludeRace << "\""
+				   << " patientRaceNull=" << (patientRace == nullptr)
+				   << " patientRaceDataNull=" << (patientRace && !patientRace->data)
+				   << " patientRaceName=\"" << (patientRace && patientRace->data ? patientRace->data->name : "") << "\""
+				   << " patientRaceStringID=\"" << (patientRace && patientRace->data ? patientRace->data->stringID : "") << "\"";
+			}
 
 			if (!btn.requiresSkill.empty())
 			{
@@ -892,7 +995,20 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	std::string message = resolvePlaceholders(def.message, patient, def.item, "dialogue box \"" + dialogueId + "\"");
+	// Prefer an eligible button's own requiresItem over the box-level default, so a race/animal-specific
+	// button variant with a different required item (e.g. Power Core vs AI Core) gets the right {item}
+	// substitution instead of always the box's generic one - see DESIGN.md §4.
+	std::string effectiveItem = def.item;
+	for (size_t i = 0; i < eligibleButtons.size(); ++i)
+	{
+		if (!eligibleButtons[i].requiresItem.empty())
+		{
+			effectiveItem = eligibleButtons[i].requiresItem;
+			break;
+		}
+	}
+
+	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, "dialogue box \"" + dialogueId + "\"");
 
 	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
 	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.
@@ -934,7 +1050,11 @@ static void DialogueAction_Reactivate(Character* patient)
 static void DialogueAction_JoinSquad(Character* patient)
 {
 	if (ou && ou->player)
+	{
+		verboseLog("SkeletonRebirth: DIAG before recruit(editor=true) -> " + describe(patient));
 		ou->player->recruit(patient, true);
+		verboseLog("SkeletonRebirth: DIAG after recruit(editor=true) -> " + describe(patient));
+	}
 }
 
 // recruit()'s "fast" mode (editor=false) - matches the native DA_JOIN_SQUAD_FAST dialogue action -
@@ -1084,10 +1204,16 @@ static void loadDialogueBoxesFromJson()
 					btn.requiresPlayerFaction = (*bit)["requiresPlayerFaction"].GetBool();
 				if (bit->HasMember("requiresDeactivated") && (*bit)["requiresDeactivated"].IsBool())
 					btn.requiresDeactivated = (*bit)["requiresDeactivated"].GetBool();
+				if (bit->HasMember("excludeDeactivated") && (*bit)["excludeDeactivated"].IsBool())
+					btn.excludeDeactivated = (*bit)["excludeDeactivated"].GetBool();
 				if (bit->HasMember("requiresAnimal") && (*bit)["requiresAnimal"].IsBool())
 					btn.requiresAnimal = (*bit)["requiresAnimal"].GetBool();
 				if (bit->HasMember("excludeAnimal") && (*bit)["excludeAnimal"].IsBool())
 					btn.excludeAnimal = (*bit)["excludeAnimal"].GetBool();
+				if (bit->HasMember("requiresRace") && (*bit)["requiresRace"].IsString())
+					btn.requiresRace = (*bit)["requiresRace"].GetString();
+				if (bit->HasMember("excludeRace") && (*bit)["excludeRace"].IsString())
+					btn.excludeRace = (*bit)["excludeRace"].GetString();
 
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{
@@ -1481,6 +1607,9 @@ __declspec(dllexport) void startPlugin()
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Character::updateOnScreenCheck), Character_updateOnScreenCheck_hook, &Character_updateOnScreenCheck_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add Character::updateOnScreenCheck hook!");
+
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Inventory::deathCheck), Inventory_deathCheck_hook, &Inventory_deathCheck_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add Inventory::deathCheck hook!");
 
 	typedef DataPanelLine* (DatapanelGUI::*SetLineKeyLastVisibleFn)(const std::string&, const std::string&, const std::string&, int, bool, bool);
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((SetLineKeyLastVisibleFn)&DatapanelGUI::setLine), DatapanelGUI_setLine_KeyLastVisible_hook, &DatapanelGUI_setLine_KeyLastVisible_orig))

@@ -141,6 +141,28 @@ a Deactivated character is being carried, and causes a rigid, non-ragdolling cor
 `g_deactivated` stays `Character*`-keyed and session-only for hot per-tick lookups deliberately - see
 §6 for how it survives save/reload without needing every lookup site to switch to a string key.
 
+**A part's real effective health is `flesh - fleshStun`, not `flesh` alone** - confirmed live via
+`HealthPartStatus::derivedFleshHealthPercent`, which matches `(flesh - fleshStun) / maxHealth()` exactly
+against logged values (and `flesh - fleshStun` alone matches the in-game UI's displayed number). A part
+can carry real `fleshStun` from ordinary combat independent of `flesh`, so any code that sets `flesh` to
+hit a target effective-health value must solve for `flesh` given the part's *current* `fleshStun`
+(`targetFlesh = targetPercent * maxHealth() + fleshStun`), not treat `flesh` as the whole picture - writing
+`flesh` alone once left a part at a far more negative effective health than intended, and separately meant
+a reactivation floor that looked correct in `flesh` terms was still fatal in practice.
+
+**Item-triggered instant death** (`Item::deathItem`, checked by `Inventory::deathCheck(Item*)` when a
+death-tagged item is looted off a character) already goes through `declareDead()` like any other kill, so
+blocking is unaffected - but unlike combat, it doesn't deplete `flesh`, so a Deactivated robot killed this
+way had no fatal part for §6's persistence signature to detect after reload. `Inventory_deathCheck_hook`
+finds whichever vital part (`PART_HEAD`, or either `PART_TORSO` part - chest and stomach are separate
+parts that both bucket to `PART_TORSO`, `part->data->name` distinguishes them, not `stringID`, which is a
+generic asset name shared across parts) has the lowest effective health (`flesh - fleshStun`), and writes
+`-96.5%` of that part's own `maxHealth()` to `flesh`, offset by its `fleshStun` per the note above, then
+calls `HealthPartStatus::updateDerivedHealths()` - setting `flesh` directly doesn't refresh `isDead()`'s
+own cached result, confirmed live (two parts written to the identical `flesh` value disagreed on
+`isDead()` until this was added). This makes the item-death path produce the same
+native signature a combat death does, on whichever vital part narratively make sense as already weakest.
+
 ### 2. GUI status tag override
 
 The character info panel's "State:" row (category 3) is overridden **unconditionally** for any tracked
@@ -249,20 +271,19 @@ to the box itself (as opposed to what drives its content, which came later) were
   `0.0-1.0` screen fractions, matching `position_real` in the `.layout` XML - not pixels. An early
   attempt used pixel-ish values and the panel rendered far off-screen, invisible despite succeeding.)
 
-**`TryReactivate()`** nudges every part in `MedicalSystem::anatomy` (the real, complete part list -
-`lektor<HealthPartStatus*>`) that's still in fatal (negative) `flesh` territory 1% toward zero, clamped
-to that part's own `maxHealth()`. This replaced an earlier version that only nudged two hardcoded parts
-via `getPart(PART_HEAD/PART_TORSO, SIDE_NEITHER)`: `HealthPartStatus::PartType` only has four generic
-buckets (`TORSO`/`LEG`/`ARM`/`HEAD`), but Kenshi's real damage model has separate "chest" and "stomach"
-parts that both fall in the `TORSO` bucket - `getPart()` only ever reached one of them. A kill that
-happened to land on the unreachable one caused an instant re-death after every reactivation (confirmed
-live: a `describeAnatomy()` diagnostic showed two separate `type=0` (TORSO) entries, one healthy, one
-still at its original fatal `flesh` value no matter how many times "Yes" was clicked). Iterating
-`anatomy` instead can't miss a part regardless of how many distinct locations a race actually has. The
-clamp to `maxHealth()` is necessary because `anatomy` includes already-healthy parts too (most of a
-robot's body, on any kill) - nudging every part unconditionally (rather than only ones still negative)
-pushed already-healthy parts past their normal maximum, also confirmed live before being narrowed to
-fatal-only.
+**`TryReactivate()`** iterates every part in `MedicalSystem::anatomy` (the real, complete part list -
+`lektor<HealthPartStatus*>`, not `getPart(PART_HEAD/PART_TORSO, SIDE_NEITHER)`, which only reaches one of
+Kenshi's two separate TORSO-bucket parts - "chest" and "stomach" - and can leave the other fatal) and
+floors any critical part (`isCriticalPart()` - `PART_TORSO`/`PART_HEAD` only, limbs left untouched) still
+below `-95%` of its own `maxHealth()` up to exactly that floor, clamped to `maxHealth()` as a backstop.
+Floors rather than a relative nudge because a fixed percentage of the *current* value doesn't reliably
+clear `isDead()` from deep overkill `flesh` - `-95%` reliably does, in one call, confirmed against the
+same `-96.5%` value `Inventory_deathCheck_hook` (§1) writes for the item-death path. The floor is offset by
+the part's own `fleshStun` the same way (§1's note on effective health) - a part can carry real stun
+damage from combat independent of `flesh`, and ignoring it once left a reactivated character with an
+effective health still fatal enough to immediately re-trigger `declareDead()`, confirmed live. Also calls
+`updateDerivedHealths()` per part, same reason as §1 - writing `flesh` alone doesn't refresh `isDead()`'s
+own cached result.
 
 ### 4. JSON-driven dialogue boxes
 
@@ -350,6 +371,22 @@ JSON array that might define more, or fewer be eligible.
   gameplay-critical timing - the same relaxed precision the old `delay` override type used, just driven
   by wall clock instead of `Dialogue::update()`'s `frameTime`.
 
+`join_squad` (not `join_squad_fast`) always defers the rest of its sequence through the same
+`g_pendingDialogueSequences` mechanism, implicitly - not something a JSON author writes. If
+`recruit(editor=true)` actually opened the character editor (`gui->isCharacterEditorMode()`), it waits for
+that to close, same as before. Originally this was the *only* condition - but confirmed live that a later
+step (`system_reset`) running immediately after `recruit()`, in the same call, crashed
+(`STATUS_ACCESS_VIOLATION` reading `-1`) even in a case where the editor never visibly entered that mode -
+so `isCharacterEditorMode()` isn't a reliable signal that it's safe to continue. Now unconditional: if the
+editor didn't open, it still defers rather than continuing in the same call. A 1-tick defer
+(`GetTickCount64() + 1`) still crashed intermittently (same exception, confirmed live via two identical
+minidumps - same address, code, and thread ID, on two different characters) - comparing a crash trace
+against a successful one showed the successful case happened to take the `waitForEditorClose` path (a real
+multi-second gap while the player closed the editor), while the crash traces matched the 1-tick path.
+Raised to 5000ms - long enough to behave like the editor-close wait timing-wise even when the editor
+doesn't visibly open, on the theory that whatever `recruit()` does internally needs real wall-clock time to
+settle, not just a different call stack.
+
 **Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItem`, `excludePlayerFaction`)
 controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
 from anything its steps do:
@@ -369,6 +406,21 @@ from anything its steps do:
 - `excludePlayerFaction` (bool) - hides the button if the *patient* (not the initiator) belongs to the
   player's faction, checked via `RootObjectBase::getFaction()`/`Faction::isThePlayer()`. Used on "Reset"
   so it's only offered for a wild/unaffiliated robot, not a recruited squad member.
+- `requiresDeactivated`/`excludeDeactivated` (bool, counterparts) - gate on `g_deactivated` membership.
+  "Reset" requires `excludeDeactivated` - `join_squad`'s `recruit(editor=true)` crashed
+  (`STATUS_ACCESS_VIOLATION` reading `-1`, confirmed live via minidump) when run on a still-fatally-wounded
+  character; "Revive" no longer also requires `requiresPlayerFaction` (removed - it otherwise never showed
+  for a wild robot at all, the exact case that needs reactivating before Reset can safely run).
+- `requiresRace`/`excludeRace` (string, counterparts) - matches `Character::getRace()->data->name`,
+  both sides trimmed (`trimCopy()`) before comparing - confirmed live that this race's real `name` carries
+  a trailing space invisible in-game, which silently broke an untrimmed exact match. Used to give
+  "Skeleton No-Head MkII" its own "Diagnostics" button variant (requiring a Power Core, same item as the
+  animal path) alongside `system_menu`'s generic humanoid one (which excludes this race so the two don't
+  both show at once).
+- The box-level `message`'s `{item}` substitution prefers the first eligible button's own `requiresItem`
+  over `DialogueBoxDef::item` (the box-level default) - without this, a race/animal-specific button
+  variant with a different required item would still show the generic item's name in the message text,
+  even though gating and consumption already used the right one.
 - Eligible buttons are **compacted** into `ButtonA`/`ButtonB`/`ButtonC` in JSON order, not left as gaps -
   an ineligible button in the middle of a 3-button JSON array doesn't leave an empty slot where it would
   have been. If gating leaves zero buttons eligible for the current initiator, the box isn't shown at all
