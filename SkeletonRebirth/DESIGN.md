@@ -7,9 +7,18 @@ itself never runs, and `MedicalSystem::dead` is kept false throughout. Placing a
 a Skeleton Repair Bed prompts reactivation via a confirmation dialogue box, whose text and button
 behavior are data-driven from RE_Kenshi.json's `"DialogueBoxes"` object (see §4) rather than hardcoded C++. All of
 this survives save/reload. Cleanup of unattended Deactivated robots (random-spawn or otherwise) is
-**not implemented** - see §5 for why, and what was tried.
+**not implemented** - see §6 for why, and what was tried.
 
 File:line references are to `/home/bryan/Git/RE_Kenshi/KenshiLib/Include/kenshi/`.
+
+`DebugLog()` calls throughout this file are gated behind `verboseLog()`, on only when RE_Kenshi.json's
+top-level `"Debug"` is `true` (default `false`) - regular play still generates real log volume (dialogue
+boxes opening, reactivations, JSON reload summaries) even with `declareDead()` debounced, so this stays
+off by default to avoid growing `RE_Kenshi_log.txt` indefinitely for players who never need it.
+`ErrorLog()` is never gated - those indicate real problems and should always be visible.
+`loadDebugSettingFromJson()` must run before the other JSON loaders so their own summary log lines
+respect it, and is silent on a missing file/parse error (the other loaders open the same file and
+already report those) or a missing `"Debug"` key (logging just stays off, the safe default).
 
 ## A pitfall worth flagging up front: hooking virtual functions
 
@@ -48,7 +57,7 @@ this is FCS's Human/Animal Character category, not the `CharacterAnimal` C++ cla
 reference-index note) while working fine for humanoid robots, and both trace back to the same root cause:
 `hand`-based identity resolution isn't reliable for this class of object.
 
-**Persistence** (see §6 for the full history): the original JSON side-file persistence serialised
+**Persistence** (see §7 for the full history): the original JSON side-file persistence serialised
 `RootObjectBase::getHandle().toString()` and resolved it back via `hand::fromString()` +
 `hand::getCharacter()` on load. Confirmed live this fails completely for these characters - a real
 save/reload logged `resolved=0 failed=8`. Separately confirmed `hand` values for this class of character
@@ -139,7 +148,13 @@ character was genuinely dead, making the freeze redundant for different reasons.
 a Deactivated character is being carried, and causes a rigid, non-ragdolling corpse.
 
 `g_deactivated` stays `Character*`-keyed and session-only for hot per-tick lookups deliberately - see
-§6 for how it survives save/reload without needing every lookup site to switch to a string key.
+§7 for how it survives save/reload without needing every lookup site to switch to a string key.
+
+Player-squad robots getting Deactivated is otherwise silent - no native "X is dead" message fires, since
+`dead` never actually becomes true. `Character_declareDead_hook` calls Kenshi's own player-notification
+queue (`showPlayerAMessage_withLog`) directly for this fixed message, rather than through
+`showGameNotification()` (§4) - that helper exists for JSON-authored `{name}`/`{item}` dialogue text, and
+this message needs neither.
 
 **A part's real effective health is `flesh - fleshStun`, not `flesh` alone** - confirmed live via
 `HealthPartStatus::derivedFleshHealthPercent`, which matches `(flesh - fleshStun) / maxHealth()` exactly
@@ -153,7 +168,7 @@ a reactivation floor that looked correct in `flesh` terms was still fatal in pra
 **Item-triggered instant death** (`Item::deathItem`, checked by `Inventory::deathCheck(Item*)` when a
 death-tagged item is looted off a character) already goes through `declareDead()` like any other kill, so
 blocking is unaffected - but unlike combat, it doesn't deplete `flesh`, so a Deactivated robot killed this
-way had no fatal part for §6's persistence signature to detect after reload. `Inventory_deathCheck_hook`
+way had no fatal part for §7's persistence signature to detect after reload. `Inventory_deathCheck_hook`
 finds whichever vital part (`PART_HEAD`, or either `PART_TORSO` part - chest and stomach are separate
 parts that both bucket to `PART_TORSO`, `part->data->name` distinguishes them, not `stringID`, which is a
 generic asset name shared across parts) has the lowest effective health (`flesh - fleshStun`), and writes
@@ -173,7 +188,13 @@ version that only rewrote the row when it detected the literal word "dead": that
 a character frozen at fatal health while still alive needed to be overridden regardless of what it says.
 Confirmed live: vanilla's real text here is `"Rebooting"` for robots (organic races reportedly show
 `"Recovery coma"`), colour-tagged `#59231a` - the same dark red vanilla uses for its own "Dead" text
-elsewhere, reused here for the override's colour too, on a plain `"POWER FAILURE"` string.
+elsewhere, reused here for the override's colour too, on a plain `"POWER FAILURE"` / `"AI FAILURE"`
+string. Which one is picked mirrors which core the FCS system-menu buttons require (RE_Kenshi.json's
+`system_menu`/`system_menu_animal`, gated by `requiresRace`/`excludeRace`/animal trigger state - see
+"FCS item requirements" below): `isHumanoidState()` (i.e. not `isAnimalCharacterType()`) combined with
+`hasHeadPart()` (a direct `MedicalSystem::getPart(PART_HEAD, SIDE_NEITHER)` lookup, not a race-name
+match) shows `"AI FAILURE"`; anything else - headless (e.g. "Skeleton No-Head MkII"), or animal-type even
+though those still have a head part (e.g. Iron Spider) - shows `"POWER FAILURE"`.
 
 `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` is the hook point; `self->getObject().
 getCharacter()` identifies which character the panel belongs to. This required checking - and ruling
@@ -344,12 +365,21 @@ step's `text`). Up to 3 buttons per entry (`Kenshi_MessageBox.layout` has exactl
 `ButtonC`) - see the button-gating/visibility rules below for how "up to 3" is actually resolved from a
 JSON array that might define more, or fewer be eligible.
 
-**The four step types** (`DialogueBoxStepDef::type`), run in order by `dispatchDialogueSteps()`:
+**The step types** (`DialogueBoxStepDef::type`), run in order by `dispatchDialogueSteps()`:
 - `"action"` — dispatches `action` through `g_dialogueActions` (a `std::map<std::string,
-  DialogueActionFn>`, populated once in `startPlugin()`). `DialogueAction_Reactivate` (which calls
-  `TryReactivate()`) is the one action registered right now. A button with an empty `steps` array (e.g.
-  "No") does nothing but close - there's no dedicated close-only step type, since closing already happens
-  unconditionally on any click, before any step runs (see `OnDialogueButtonClicked()`).
+  DialogueActionFn>`, populated once in `startPlugin()`): `"reactivate"` (`TryReactivate()`, see §3),
+  `"join_squad"`/`"join_squad_fast"` (`PlayerInterface::recruit()`'s "with edit"/"fast" modes - the
+  native `DA_JOIN_SQUAD_WITH_EDIT`/`DA_JOIN_SQUAD_FAST` dialogue actions), and `"system_reset"`
+  (`DialogueAction_SystemReset()`, wipes every skill/attribute to 1 for a humanoid patient, or takes an
+  `ANIMAL_CHARACTER` patient's age to its minimum instead - real growth-stage governor for that type,
+  called through true virtual dispatch, not `_NV_setAge()`, so `CharacterAnimal`'s override actually
+  runs; see the virtual-function pitfall note at the top of this document). If a button uses both
+  `"join_squad"` and `"system_reset"`, `"join_squad"` must be listed first: `recruit(editor=true)`
+  reinitializes `CharStats` from the character's original template, which would silently clobber a reset
+  that ran before it. `"join_squad_fast"` skips that reinitialization, so it has no such ordering
+  constraint. A button with an empty `steps` array (e.g. "No") does nothing but close - there's no
+  dedicated close-only step type, since closing already happens unconditionally on any click, before any
+  step runs (see `OnMessageBoxButtonClicked()`).
 - `"take_item"` — consumes one of `item` (an FCS/GameData String ID) from the *initiator's* inventory
   (`Inventory::takeOneItemOnly()`), stopping the rest of the sequence if it fails (no silent partial
   effects - a robot shouldn't get "successfully revived" without the cost actually being paid). Distinct
@@ -362,6 +392,17 @@ JSON array that might define more, or fewer be eligible.
   hand-rolled parsing (`tryParseHexColor()`) rather than trusting `MyGUI::Colour`'s own undocumented
   string-constructor format - same reasoning as every other hand-rolled parser in this file. Defaults to
   white if omitted or unparseable.
+- `"notify"` — like `"show_text"`, but through Kenshi's own native player-notification queue
+  (`showPlayerAMessage_withLog()`, the corner-text log used for things like "X is dead") instead of a
+  floating `ScreenLabel` - `queued=true` so it takes its place behind any other pending notification
+  rather than replacing one still showing.
+- `"open_menu"` — opens a different `"DialogueBoxes"` entry by `menu` ID, the same way a reactivation
+  trigger (§5) opens the first one. This is how nested/multi-level menus and "back" buttons work: a
+  submenu is just another dialogue box, and "back" is just a button whose steps `open_menu` the parent's
+  ID - there's no menu-stack/breadcrumb tracking, so each box only ever knows the one ID it was opened
+  with and a "back" button has to name its target explicitly. Terminal, like `"delay"` and a failed
+  `"take_item"` - the box that triggered this step is already gone by the time it runs (`MessageBoxManager`
+  destroys it as part of the click), so `showDialogueBox()`'s one-at-a-time guard doesn't block this.
 - `"delay"` — pauses the *remaining* steps in the sequence for `seconds`, not the whole dialogue system.
   A `std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences`, keyed by patient, holds
   the not-yet-run steps (copied, not referenced, into the pending entry) plus a resume index; ticked from
@@ -439,11 +480,13 @@ earlier - see git history) - that was for driving real in-world FCS conversation
 it only configures the mod's own custom MyGUI panels, which were never gated by aliveness at all - the
 four step types and the gating fields just happen to cover the same *use cases* that system did.
 
-`OnDialogueButtonClicked()` is the single shared click handler for every button on every dialogue box -
-it resolves which of `ButtonA`/`ButtonB`/`ButtonC` fired by comparing the clicked widget's identity
-against `root->findWidget(...)` for each name (looked up *before* `closeDialogueBox()` unloads the
-layout, not after), maps that index into the button list captured when the box was shown, closes the box
-unconditionally, then hands the button's `steps` to `dispatchDialogueSteps()`.
+`OnMessageBoxButtonClicked(int buttonId)` is the single shared click handler for every button on every
+dialogue box, registered as the `MyGUI::delegates::IDelegate1<int>*` callback `createMessageBox()`
+invokes - `buttonId` is whichever int `showDialogueBox()` paired each button's caption with (its index
+into `g_currentDialogueButtons`), no widget lookup needed since `MessageBoxManager` already resolved the
+click itself and has destroyed the box's native `Window` by the time this fires. Maps that index into the
+button list captured when the box was shown, closes the box unconditionally, then hands the button's
+`steps` to `dispatchDialogueSteps()`.
 
 Only one dialogue box shows at a time (`g_pendingDialoguePatient` gates `showDialogueBox()`) - a second
 trigger while one is already open is silently dropped rather than stacking a second box.
@@ -453,7 +496,33 @@ trigger while one is already open is silently dropped rather than stacking a sec
 has no working directory of its own. Reused verbatim from the old (removed) `ConversationOverrides`
 system, which needed the same thing to find the same file.
 
-### 5. Cleanup - not implemented
+### 5. JSON-driven dialogue triggers
+
+"When does a dialogue box open" is data-driven the same way button behavior is (§4): `RE_Kenshi.json`'s
+`"DialogueTriggers"` array, each entry an AND of `requiredStates` (named `bool(Character*)` checks
+registered in `g_triggerStateChecks` - `"deactivated"`/`"animal"`/`"humanoid"`, all must pass) and
+`buildings` (the used building's own FCS String ID must be in this list), opening `menu` once both hold.
+This lets more than one trigger definition exist - e.g. `system_menu` for humanoid robots vs
+`system_menu_animal` for animal-type ones sharing the same Skeleton Repair Bed - rather than the single
+hardcoded trigger `Character::updateOnScreenCheck()` originally polled (§3). Deliberately flat named
+checks AND'd together, not a general boolean expression language, since every combination needed so far
+("deactivated AND animal") fits that shape without the parsing/fragility risk a real expression syntax
+would add.
+
+`Character_updateOnScreenCheck_hook` evaluates every trigger for every on-screen character every frame,
+so `requiredStates` are checked before `buildings` and short-circuit on the first failing check - the
+same cheap-gate-first discipline used throughout this file - since resolving/querying the standing
+building costs more than any individual state check.
+
+Each trigger's "already shown, waiting on the player" flag (`g_triggerShown`) is keyed by `(Character*,
+trigger index)`, not just `Character*`, so more than one trigger can be pending independently for the
+same character. It's deliberately level-triggered: dismissing a box (e.g. clicking "No") does not clear
+the flag, since the trigger's conditions still hold - clearing it would reopen the box the very next
+frame, making "No" appear to do nothing. Only a real state change (leaving the building, or an action
+like reactivation clearing `g_deactivated`) clears it, via the same requiredStates/buildings check
+re-run every frame regardless of the flag.
+
+### 6. Cleanup - not implemented
 
 An unattended Deactivated robot - random-spawn or otherwise - currently sits inert in the world forever.
 No automatic disposal exists. This is deliberate, not an oversight: getting the core Deactivated
@@ -491,7 +560,7 @@ timestamp + `updateOnScreenCheck`-based sweep, similar to the first abandoned at
 *real* `declareDead()` afterward rather than fighting native corpse-disposal machinery for a character
 that was never marked dead to begin with).
 
-### 6. Save/load persistence
+### 7. Save/load persistence
 
 `g_deactivated` (and `g_reactivateDialogueShown`) stay `Character*`-keyed and session-only for the hot
 per-tick lookups - `updateOnScreenCheck` fires roughly every frame per character, and switching every
@@ -512,6 +581,29 @@ back to false). Checked from `Character_updateOnScreenCheck_hook` (already firin
 character) for any not-yet-tracked robot, gated behind a cheap `g_deactivated.count()` check first so the
 anatomy scan only runs until a character is found and recorded. No load-event hook, no serialised ID,
 nothing that can go stale.
+
+## Robot limb race-lock
+
+Unrelated to the Deactivated/reactivation system above - merged in from the former standalone "The
+Limbless (Type 2)" mod, kept as its own self-contained section (own map, own two hooks) since the two
+features share no state. Fixes vanilla robot limbs being equippable onto any race regardless of their
+FCS "Race Limiter" (racesInclude/racesExclude).
+
+Vanilla stores each item's Race Limiter in `RaceLimiter`'s singleton, populated lazily via `addLimit()`
+the first time something looks the item up. Nothing on the robot-limb equip path ever calls that, so the
+cache stays empty and `canEquip()` always sees "unrestricted" for limbs - `RaceLimiter_canEquip2_hook`
+primes the cache for the item on every call before deferring to vanilla's own check.
+
+Separately, `canEquip()`'s `who` parameter is `RobotLimbs::inventory` - a cached "interface" `RootObject*`
+representing a character's limb-slot section in the GUI - whose `getName()` is a generic `"ROBOTICS"`
+label, not tied to the owning character, so vanilla's race check can't resolve the real recipient from
+it. `RobotLimbs_getInventoryInterface_hook` records interface-pointer -> owning-character
+(`g_limbInterfaceOwners`) every time one is (re)built; `RaceLimiter_canEquip2_hook` substitutes the
+item's true owning `Character*` for `who` before calling through, so vanilla's own validation then
+enforces the race restriction correctly, including in multi-character trades.
+
+`canEquip` is virtual, so it's hooked via its `_NV_` non-virtual export (`RaceLimiter::_NV_canEquip`) -
+see the virtual-function hooking pitfall at the top of this document.
 
 ## Reference index
 
@@ -595,11 +687,11 @@ nothing that can go stale.
 - `ScreenLabel::setTracking(const hand&, const Ogre::Vector3&)` — gui/ScreenLabel.h, RVA `0x6E1BB0`,
   virtual — anchors a floating text label to the patient so it follows them
 - `HandleManager::destroy(const hand&, const char* reason)` — HandleManager.h:208, RVA `0x2AC790`,
-  non-virtual — the native "corpse unloaded" cleanup mechanism (see §5); not hooked in the shipped
+  non-virtual — the native "corpse unloaded" cleanup mechanism (see §6); not hooked in the shipped
   version - `dead` never becomes true, so this never fires for a Deactivated robot regardless
 - `hasDeactivatedSignature()` — this file, not RE_Kenshi/KenshiLib - re-derives `g_deactivated`
   membership from native `MedicalSystem::dead`/`HealthPartStatus::isDead()` instead of any persisted ID
-  (see §6 and "A second pitfall")
+  (see §7 and "A second pitfall")
 - `PlayerInterface::selectedCharacter` (`hand`) — PlayerInterface.h:191 - safe for identifying a humanoid
   *initiator* (§4). Not reliable when the object being checked could be an `ANIMAL_CHARACTER` - superseded
   by `g_lastInspectedCharacter` (this file) for that case - see "A second pitfall"

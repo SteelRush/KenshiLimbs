@@ -57,16 +57,7 @@ public:
 	AITaskSytem* getTaskSystem() const;
 };
 
-// MessageBoxManager::createMessageBox() as declared in MessageBoxManager.h fails to link
-// ("unresolved external symbol") - confirmed via the build error, then confirmed why via
-// MessageBoxManager.inc: its real mangled name (five template-heavy parameters) is too long for
-// MASM's identifier limit, so KenshiLib's .inc generator falls back to exporting it under an
-// arbitrary placeholder name instead of its true mangled one - a documented, recurring pattern for
-// ~24 functions across KenshiLib (e.g. AnimalInventoryLayout::setupSections and others hit the same
-// limit), not something specific to this function. The placeholder is a plain `jmp` to the real
-// function's address, so it's calling-convention-transparent - redeclaring it here with matching
-// parameter types under its literal exported name (extern "C" to skip C++ name mangling on our side)
-// calls the exact same native function the header's declaration was meant to reach.
+// MessageBoxManager.h's declaration compiles but fails to link - see DESIGN.md §3/reference index.
 extern "C" MyGUI::Window* MessageBoxManager_createMessageBox_PLACEHOLDER(
 	const std::string& title,
 	const std::string& message,
@@ -74,24 +65,9 @@ extern "C" MyGUI::Window* MessageBoxManager_createMessageBox_PLACEHOLDER(
 	bool modal,
 	MyGUI::delegates::IDelegate1<int>* callback);
 
-// SkeletonRebirth plugin - see DESIGN.md for full history and rejected approaches. Robots never
-// actually die (declareDead blocked, MedicalSystem::dead kept false); a Deactivated robot sits inert
-// via vanilla's own knockout state, with health frozen (medicalUpdate skipped). Placing one in a
-// Skeleton Repair Bed (polled via Character::updateOnScreenCheck) opens a confirmation dialogue box
-// built from Kenshi's own Kenshi_MessageBox.layout, data-driven from RE_Kenshi.json's "DialogueBoxes"
-// object (see showDialogueBox()/dispatchDialogueSteps()). Deactivated state survives save/reload via a
-// JSON side-file keyed by handle string.
-//
-// DebugLog() output (see Debug.h) is prefixed "SkeletonRebirth:" - gated behind verboseLog() below,
-// off by default.
+// SkeletonRebirth plugin - see DESIGN.md for full architecture, history, and rejected approaches.
 
-// Gates every DebugLog() call in this file behind RE_Kenshi.json's "Debug" (bool, default false, see
-// loadDebugSettingFromJson()). Regular play still generates real ongoing log volume even with
-// declareDead() debounced (dialogue boxes opening, reactivations succeeding, JSON reload summaries,
-// ...) - keeping that off by default avoids growing RE_Kenshi_log.txt indefinitely for players who
-// never need it, while leaving it available for troubleshooting without a rebuild. ErrorLog() is
-// deliberately NOT gated anywhere in this file - those indicate real problems/misconfigurations and
-// should always be visible regardless of this setting.
+// Gates DebugLog() (not ErrorLog()) behind RE_Kenshi.json's "Debug" setting - see DESIGN.md.
 static bool g_debugLoggingEnabled = false;
 static void verboseLog(const std::string& message)
 {
@@ -105,31 +81,28 @@ static bool isRobotRace(Character* c)
 	return race != nullptr && race->robot;
 }
 
-// Whether this character's own FCS "Character" template is categorized as ANIMAL_CHARACTER (vs
-// HUMAN_CHARACTER) - itemType is the same category enum already used elsewhere in this file (ITEM,
-// DIALOGUE_LINE, ...), just read off this character's own defining GameData. Not Character::isAnimal():
-// that reflects the CharacterAnimal AI/movement component, not this FCS category, and returns false for
-// e.g. an Iron Spider even though its FCS entry is authored as ANIMAL_CHARACTER.
+// FCS's Human/Animal Character category - not Character::isAnimal(), see DESIGN.md reference index.
 static bool isAnimalCharacterType(Character* c)
 {
 	GameData* data = c->getGameData();
 	return data && data->type == ANIMAL_CHARACTER;
 }
 
+// Not enough alone to decide AI Core vs Power Core - callers combine with isAnimalCharacterType()/
+// isHumanoidState() too, see DESIGN.md §2.
+static bool hasHeadPart(Character* c)
+{
+	MedicalSystem* med = c->getMedical();
+	return med && med->getPart(MedicalSystem::HealthPartStatus::PART_HEAD, SIDE_NEITHER) != nullptr;
+}
+
 // Character*-keyed and session-only - no persistence file needed, see DESIGN.md §6.
 static std::map<Character*, bool> g_deactivated;
 
-// Gates Character_updateOnScreenCheck_hook's trigger loop so a matched trigger doesn't reopen its box
-// every tick while conditions still hold. Dismissing a box (e.g. "No") deliberately does NOT clear
-// this - the trigger is level-triggered, so clearing on dismiss would reopen the box the very next
-// tick, making "No" appear to do nothing. Only a real state change (leaving the building, or an action
-// like reactivation clearing g_deactivated) clears it. Keyed by (character, trigger index) rather than
-// just character, since DialogueTriggers (see below) supports more than one trigger.
+// Level-triggered, keyed by (character, trigger index) - see DESIGN.md §5.
 static std::map<std::pair<Character*, size_t>, bool> g_triggerShown;
 
-// Drops every pending trigger-shown entry for one character, regardless of which trigger set it -
-// called after an action (like reactivation) that could invalidate more than one trigger's
-// requiredStates at once. A handful of linear scans over what's normally a tiny map costs nothing.
+// Called after an action that could invalidate more than one trigger at once - see DESIGN.md §5.
 static void clearTriggerShownFor(Character* c)
 {
 	for (auto it = g_triggerShown.begin(); it != g_triggerShown.end(); )
@@ -158,13 +131,9 @@ static bool hasDeactivatedSignature(Character* self)
 	return false;
 }
 
-// Do not set MedicalSystem::dead=true to get native corpse/roster cleanup "for free" - see
-// Character_declareDead_hook's comment and DESIGN.md for why that's been tried twice and reverted
-// twice (most recently 2026-07-16, a real recruited squad member permanently lost to the party-roster
-// prune). Nothing here needs a HandleManager::destroy() hook because dead never becomes true.
+// Do not set MedicalSystem::dead=true - see DESIGN.md §1.
 
-// MedicalSystem::anatomy is the complete part list; getPart(PART_HEAD/PART_TORSO) alone misses a
-// second torso-region part ("chest", distinct from "stomach") - see TryReactivate's nudge loop.
+// MedicalSystem::anatomy is the complete part list - see DESIGN.md §3.
 static std::string describeAnatomy(MedicalSystem* med)
 {
 	if (!med)
@@ -239,8 +208,7 @@ bool Inventory_deathCheck_hook(Inventory* self, Item* item)
 		MedicalSystem* med = owner->getMedical();
 		if (med)
 		{
-			// Head/Chest/Stomach only, whichever is already weakest - not every character has a head,
-			// and PART_TORSO covers both chest and stomach as separate parts (see DESIGN.md §1).
+			// Head/Chest/Stomach only, whichever is already weakest - see DESIGN.md §1.
 			MedicalSystem::HealthPartStatus* weakest = nullptr;
 			for (auto it = med->anatomy.begin(); it != med->anatomy.end(); ++it)
 			{
@@ -256,9 +224,7 @@ bool Inventory_deathCheck_hook(Inventory* self, Item* item)
 
 			if (weakest)
 			{
-				// derivedFleshHealthPercent = (flesh - fleshStun) / maxHealth (confirmed live) - flesh
-				// alone isn't the effective health, so solve for flesh given the part's existing fleshStun
-				// rather than ignoring it (see DESIGN.md §1).
+				// Solves for flesh given the part's existing fleshStun - see DESIGN.md §1.
 				weakest->flesh = -weakest->maxHealth() * 0.965f + weakest->fleshStun;
 				weakest->updateDerivedHealths();
 			}
@@ -270,43 +236,24 @@ bool Inventory_deathCheck_hook(Inventory* self, Item* item)
 }
 
 // --- Hook 1: declareDead() -----------------------------------------------------------------
-// Blocks the real death transition for robots. MedicalSystem::dead is kept false - do not set it true
-// to get AI/looting/party-membership/GUI to treat the character as a corpse "for free": that's been
-// tried twice (most recently 2026-07-16) and reverted twice after it caused real, permanent loss of a
-// character via native systems that independently read dead (HandleManager::destroy's zone-unload
-// cleanup, PlayerInterface::update's party-roster prune) - see DESIGN.md. "Operationally dead" is
-// instead handled directly: AI is paused below, health frozen (MedicalSystem_medicalUpdate_hook), and
-// the GUI status tag overridden (DatapanelGUI_setLine hook).
+// Blocks the real death transition for robots - see DESIGN.md §1.
 void (*Character_declareDead_orig)(Character*);
 void Character_declareDead_hook(Character* self)
 {
 	if (isRobotRace(self))
 	{
-		// dead is already true on entry (some upstream combat/damage code sets it directly -
-		// declareDead() only finalizes) - must be reset every time, not just left alone.
+		// Must be reset every call, not just left alone - see DESIGN.md §1.
 		MedicalSystem* med = self->getMedical();
 		if (med)
 			med->dead = false;
 
-		// This fires repeatedly - confirmed live via a 250k+ line log spike (~550 calls/second
-		// sustained) from a handful of robots taking continuous damage in combat - since some upstream
-		// system keeps re-setting dead=true and re-invoking this for as long as a Deactivated robot
-		// keeps getting hit, not just once at the moment of "death". Only the first call for a given
-		// character needs to build the describe() log string; every repeat call skips straight past it
-		// once the character's already recorded, which is what actually keeps this genuinely hot path
-		// cheap. The med->dead reset above still has to run unconditionally every time regardless.
+		// Fires repeatedly per character - gated here to stay a cheap hot path, see DESIGN.md §1.
 		if (g_deactivated.count(self))
 			return;
 
-		// No explicit AI pause needed - vanilla's own knockout state has no recovery timer at the
-		// catastrophic damage level that triggers this hook, so the character is already inert.
 		g_deactivated[self] = true;
 
-		// Player-squad robots getting Deactivated is otherwise silent - no native "X is dead" message
-		// fires, since dead never actually becomes true. Uses Kenshi's own player-notification queue
-		// (see showGameNotification()'s comment further down) directly rather than through that
-		// helper, since this is a fixed, hook-triggered message, not JSON-authored dialogue text - no
-		// {name}/{item} substitution machinery needed for a string built right here.
+		// Deactivation is otherwise silent (dead never becomes true) - see DESIGN.md §1.
 		Faction* faction = self->getFaction();
 		if (faction && faction->isThePlayer() && ou)
 			ou->showPlayerAMessage_withLog(self->getName() + " has died.", true);
@@ -363,35 +310,11 @@ bool TryReactivate(Character* self)
 	return true;
 }
 
-// Custom dialogue box rather than Dialogue::startPlayerConversation() (dialogue was suppressed while
-// this mod was still using MedicalSystem::dead=true - see DESIGN.md) or hand-built widgets
-// (ForgottenGUI::createPanel/createButton render nothing usable without a ResourceLayout template).
-//
-// Built via MessageBoxManager::createMessageBox() - the same native function the game itself uses for
-// its own confirmation popups - rather than manually MyGUI::LayoutManager::loadLayout()-ing
-// Kenshi_MessageBox.layout directly (an earlier version did this). The hand-loaded version rendered
-// with only a plain dark background instead of the game's real window chrome, even though it
-// referenced the identical skin ("Kenshi_WindowC", the same Kenshi_GenericWindowSkin/
-// Kenshi_GenericWindowHeaderSkin body every other window in the game uses) - going through the native
-// entry point instead guarantees the box looks and positions itself exactly like every other message
-// box in the game, since it's the same code path rather than a lookalike. This also means
-// MessageBoxManager owns the box's entire lifecycle - creation, positioning, and teardown on click -
-// so there's no layout to manually unload the way there was before; this file only needs to track
-// which patient/initiator/buttons a pending box belongs to for when its callback fires.
-// See DESIGN.md for the full rejected-approaches history.
+// Confirmation UI built via MessageBoxManager::createMessageBox() - see DESIGN.md §3.
 //
 // --- JSON-driven dialogue boxes -----------------------------------------------------------------
-// Box text and button behavior are data-driven from RE_Kenshi.json's "DialogueBoxes" object rather
-// than hardcoded per-dialogue C++. A button's behavior is an ordered list of "steps" - see
-// DialogueBoxStepDef for the step types. A new dialogue box needs only a JSON entry; a new "action"
-// step type needs registering in g_dialogueActions.
-//
-// Nested/multi-level menus are just another dialogue box: an "open_menu" step opens a different
-// "DialogueBoxes" entry by ID, the same way the reactivation trigger opens the first one (see
-// showDialogueBox()). A "back" button is nothing special either - just a button in the submenu whose
-// steps open the parent menu's ID. There's no dedicated menu-stack/breadcrumb tracking; each box only
-// ever knows the one ID it was opened with, so "back" has to name its target explicitly rather than
-// popping an implicit history.
+// Box text and button behavior are data-driven from RE_Kenshi.json's "DialogueBoxes" object - see
+// DESIGN.md §4 for the step types, nested-menu semantics, and button-gating fields below.
 struct DialogueBoxStepDef
 {
 	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu"
@@ -408,12 +331,7 @@ struct DialogueBoxStepDef
 
 struct DialogueBoxButtonDef
 {
-	// Kenshi_MessageBox.layout's buttons (Kenshi_Button2 skin) have a fixed width sized for short
-	// captions like the layout's own placeholder "A"/"B"/"C" - text doesn't wrap or shrink to fit, it
-	// just clips on both sides once centered text overflows the button. Confirmed live: "Do nothing"
-	// (10 characters) rendered fully; "Run Diagnostics" (15 characters) rendered as "un Diagnostic" -
-	// both ends clipped. Keep captions at "Do nothing"'s length or shorter (~10 characters) to be safe.
-	std::string caption;
+	std::string caption; // ~10 character limit before clipping - see DESIGN.md §3
 	std::vector<DialogueBoxStepDef> steps; // run in order when clicked - see dispatchDialogueSteps()
 	std::string requiresItem;  // FCS/GameData item String ID - hidden unless initiator has one
 	std::string requiresSkill; // lowercase CharStats field name (see g_skillFields) - hidden unless initiator's skill is in range
@@ -423,7 +341,7 @@ struct DialogueBoxButtonDef
 	float maxSkill;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 	bool requiresPlayerFaction; // hidden unless the patient belongs to the player's faction - the counterpart to excludePlayerFaction
-	bool requiresDeactivated; // hidden unless the patient is in g_deactivated (i.e. "POWER FAILURE") - see DatapanelGUI_setLine_KeyLastVisible_hook
+	bool requiresDeactivated; // hidden unless the patient is in g_deactivated - see DESIGN.md §2
 	bool excludeDeactivated; // hidden while the patient is in g_deactivated - the counterpart to requiresDeactivated
 	bool requiresAnimal; // hidden unless isAnimalCharacterType() - lets an animal-only button require a different item than the humanoid one
 	bool excludeAnimal; // hidden if isAnimalCharacterType() - the humanoid-only counterpart to requiresAnimal
@@ -444,21 +362,7 @@ struct DialogueBoxDef
 static std::map<std::string, DialogueBoxDef> g_dialogueBoxes;
 
 // --- JSON-driven dialogue triggers ---------------------------------------------------------------
-// "When does a dialogue box open" is data-driven the same way "what does a button do" already is -
-// RE_Kenshi.json's "DialogueTriggers" array, each entry an AND of "requiredStates" (named, registered
-// bool(Character*) checks - see g_triggerStateChecks, all must pass) and "buildings" (the used
-// building's own FCS String ID must be in this list), opening "menu" once both hold. Deliberately flat
-// named checks AND'd together, not a general boolean expression language - covers "deactivated AND
-// animal"-style combinations without the parsing/fragility risk a real expression syntax would add.
-//
-// Character_updateOnScreenCheck_hook evaluates every trigger for every on-screen character every
-// frame, so requiredStates are checked before buildings, and short-circuit on the first failing check
-// - the same "cheap gate first" discipline used everywhere else in this file (e.g.
-// handleDialogueReplyClicked's g_conversationOverrides.count() in the old ConversationOverrides
-// system). Individual state checks vary in cost (isDeactivatedState is a map lookup;
-// isAnimalCharacterType calls the virtual getGameData() on the character itself) but all of them are
-// still far cheaper than resolving and querying the RootObject/Building the character is standing in -
-// requiredStates failing early means that never happens at all for an irrelevant character.
+// "When does a dialogue box open" is data-driven the same way button behavior is - see DESIGN.md §5.
 struct DialogueTriggerDef
 {
 	std::vector<std::string> requiredStates; // all looked up in g_triggerStateChecks, all must pass
@@ -525,44 +429,6 @@ static std::map<std::string, float CharStats::*> buildSkillFieldTable()
 	return table;
 }
 static const std::map<std::string, float CharStats::*> g_skillFields = buildSkillFieldTable();
-
-// Subset of g_skillFields with a confident StatsEnumerated match, used by isDialogueButtonEligible()
-// to read via CharStats::getStat(what, /*unmodified*/ true) instead of the raw member - the game's
-// own explicit "base, ignore temporary modifiers" accessor, not an assumption that the raw field never
-// gets modified in place. Deliberately not exhaustive: a few g_skillFields names (arrowdefence, bluff,
-// tracking, climbing, doctor, assassin, unarmed, bows) have no StatsEnumerated entry that's an obvious,
-// confident match, so those fall back to the raw member read unchanged - wrong is worse than skipped.
-static std::map<std::string, StatsEnumerated> buildSkillStatEnumTable()
-{
-	std::map<std::string, StatsEnumerated> table;
-	table["medic"] = STAT_MEDIC;
-	table["masscombat"] = STAT_MASSCOMBAT;
-	table["stealth"] = STAT_STEALTH;
-	table["swimming"] = STAT_SWIMMING;
-	table["thieving"] = STAT_THIEVING;
-	table["lockpicking"] = STAT_LOCKPICKING;
-	table["survival"] = STAT_SURVIVAL;
-	table["engineer"] = STAT_ENGINEERING;
-	table["weaponsmith"] = STAT_SMITHING_WEAPON;
-	table["armoursmith"] = STAT_SMITHING_ARMOUR;
-	table["bowsmith"] = STAT_SMITHING_BOW;
-	table["robotics"] = STAT_ROBOTICS;
-	table["science"] = STAT_SCIENCE;
-	table["labouring"] = STAT_LABOURING;
-	table["farming"] = STAT_FARMING;
-	table["cooking"] = STAT_COOKING;
-	table["dodging"] = STAT_DODGE;
-	table["friendlyfire"] = STAT_FRIENDLY_FIRE;
-	table["katanas"] = STAT_KATANAS;
-	table["sabres"] = STAT_SABRES;
-	table["hackers"] = STAT_HACKERS;
-	table["blunt"] = STAT_BLUNT;
-	table["heavyweapons"] = STAT_HEAVYWEAPONS;
-	table["turrets"] = STAT_TURRETS;
-	table["polearms"] = STAT_POLEARMS;
-	return table;
-}
-static const std::map<std::string, StatsEnumerated> g_skillStatEnums = buildSkillStatEnumTable();
 
 // Used by DialogueAction_SystemReset.
 static std::map<std::string, float CharStats::*> buildAttributeFieldTable()
@@ -723,14 +589,9 @@ static void closeDialogueBox()
 	g_currentDialogueButtons.clear();
 }
 
-// itemId is optional - only resolved (via the same SEH-guarded lookup take_item uses) if the text
-// actually references "{item}", so a plain "{name}"-only show_text step pays nothing extra.
-// Shared by the dialogue box message, "show_text", and "notify" - all three support "{name}" (the
-// patient's name) and, given a resolvable item String ID, "{item}" (that item's display name,
-// GameData::name - not its FCS stringID). itemId is optional; {item} is only resolved (via the same
-// SEH-guarded lookup take_item uses) if the text actually references it, so plain "{name}"-only text
-// pays nothing extra. callerLabel is only used in the {item}-unresolvable error message, to say which
-// of the three callers hit it.
+// Shared by the dialogue box message, "show_text", and "notify" - see DESIGN.md §4. itemId is optional;
+// {item} is only resolved if the text actually references it. callerLabel names the caller in the
+// {item}-unresolvable error message only.
 static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, const std::string& callerLabel)
 {
 	std::string resolvedText = text;
@@ -768,12 +629,7 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 		label->setTracking(patient->getHandle(), Ogre::Vector3(0, 1, 0));
 }
 
-// Kenshi's own native player-notification system - the corner text queue used for things like "<name>
-// is dead" - distinct from show_text's ScreenLabel (floating over the character) and from the
-// dialogue box itself. showPlayerAMessage_withLog() (vs. the plain non-"_withLog" variant) also
-// records it into whatever history/log that notification queue keeps, matching how a native message
-// like that would normally behave. queued=true so it takes its place behind any other pending
-// notification instead of replacing one that's still showing.
+// The "notify" step type - see DESIGN.md §4.
 static void showGameNotification(Character* patient, const std::string& text, const std::string& itemId)
 {
 	if (!ou || text.empty())
@@ -884,11 +740,7 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 
 		if (step.type == "open_menu")
 		{
-			// Terminal, like "delay" and a failed "take_item" - by the time a submenu is up and waiting
-			// on the player's next click, any further steps from this sequence have no clear meaning.
-			// The box that triggered this step is already gone (MessageBoxManager destroys it as part
-			// of the click that led here, before OnMessageBoxButtonClicked ever dispatches), so
-			// showDialogueBox()'s one-at-a-time guard doesn't block this.
+			// Terminal - see DESIGN.md §4.
 			showDialogueBox(step.menu, patient, initiator);
 			return;
 		}
@@ -897,10 +749,7 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 	}
 }
 
-// IDelegate1<int> callback for MessageBoxManager::createMessageBox() - buttonId is whichever int we
-// paired each button's caption with in showDialogueBox() below (its index into g_currentDialogueButtons).
-// MessageBoxManager has already destroyed the box's native Window by the time this fires, so there's
-// no widget teardown to do here - just our own bookkeeping and dispatching the clicked button's steps.
+// IDelegate1<int> callback for MessageBoxManager::createMessageBox() - see DESIGN.md §4.
 static void OnMessageBoxButtonClicked(int buttonId)
 {
 	Character* patient = g_pendingDialoguePatient;
@@ -934,9 +783,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 	}
 	const DialogueBoxDef& def = defIt->second;
 
-	// Capped at 3 - Kenshi_MessageBox.layout (which createMessageBox() almost certainly still builds
-	// on internally, going by its fixed-size ButtonA/B/C widgets) only ever had 3 button slots, and
-	// createMessageBox()'s generic vector<pair<string,int>> signature doesn't confirm it supports more.
+	// Capped at 3 - see DESIGN.md §4.
 	std::vector<DialogueBoxButtonDef> eligibleButtons;
 	for (size_t i = 0; i < def.buttons.size() && eligibleButtons.size() < 3; ++i)
 	{
@@ -1039,14 +886,7 @@ static void DialogueAction_Reactivate(Character* patient)
 	clearTriggerShownFor(patient);
 }
 
-// Split out from DialogueAction_SystemReset so a dialogue button can join the patient to the player's
-// squad independently of resetting its stats (e.g. joining without a reset, or a reset that doesn't
-// join). This is recruit()'s "with edit" mode (editor=true) - matches the native DA_JOIN_SQUAD_WITH_EDIT
-// dialogue action - and it's this exact mode that reinitializes the character's CharStats from its
-// original template, which is why it must run BEFORE system_reset whenever a button uses both (see that
-// function's comment). Use DialogueAction_JoinSquadFast below instead if a button just wants the
-// character in the squad without touching its stats. JSON authors are responsible for step order;
-// "join_squad" needs to be listed ahead of "system_reset" in the steps array for the reset to stick.
+// recruit()'s "with edit" mode - must run BEFORE system_reset if a button uses both, see DESIGN.md §4.
 static void DialogueAction_JoinSquad(Character* patient)
 {
 	if (ou && ou->player)
@@ -1057,28 +897,14 @@ static void DialogueAction_JoinSquad(Character* patient)
 	}
 }
 
-// recruit()'s "fast" mode (editor=false) - matches the native DA_JOIN_SQUAD_FAST dialogue action -
-// skips the character-editing reinitialization DialogueAction_JoinSquad's editor=true triggers, so
-// unlike that one, this has no known ordering interaction with system_reset.
+// recruit()'s "fast" mode - see DESIGN.md §4.
 static void DialogueAction_JoinSquadFast(Character* patient)
 {
 	if (ou && ou->player)
 		ou->player->recruit(patient, false);
 }
 
-// Must run AFTER DialogueAction_JoinSquad if a button uses both (see that function's comment) -
-// recruit(editor=true) reinitializes CharStats from the character's original template, which would
-// silently clobber this reset back to the character's pre-reset (modified) values if it ran second.
-// CharStats* is fetched fresh here rather than passed in from JoinSquad, in case recruit() replaces
-// the object rather than mutating it in place.
-//
-// ANIMAL_CHARACTER-type robots (isAnimalCharacterType() - e.g. Iron Spiders) don't get their skills
-// and attributes wiped to 1 like humanoid robots do - age is what governs an animal's growth stage, so
-// "reset" means taking that to its minimum instead. setAge()/getAge() must be called through true
-// virtual dispatch (patient->setAge(...), not patient->_NV_setAge(...)) - CharacterAnimal overrides
-// both with its own backing fields at separate RVAs, and the _NV_ variants silently no-op by running
-// Character's base implementation regardless of the object's real type - see DESIGN.md's virtual-
-// function pitfall note.
+// Must run AFTER DialogueAction_JoinSquad if a button uses both - see DESIGN.md §4.
 static void DialogueAction_SystemReset(Character* patient)
 {
 	if (isAnimalCharacterType(patient))
@@ -1114,11 +940,7 @@ static std::string getOwnModDirectory()
 	return lastSlash != std::string::npos ? path.substr(0, lastSlash + 1) : "";
 }
 
-// Sets g_debugLoggingEnabled from RE_Kenshi.json's top-level "Debug" (bool, default false/absent).
-// Must run before the other loaders below, so their own verboseLog() summary lines respect it. Silent
-// on a missing file or parse error - the other loaders open the same file and already report those;
-// no need to say it three times. A missing/absent "Debug" key just means logging stays off, the safe
-// default, not an error worth reporting.
+// Must run before the other loaders below - see DESIGN.md.
 static void loadDebugSettingFromJson()
 {
 	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
@@ -1338,15 +1160,11 @@ static void loadDialogueTriggersFromJson()
 	verboseLog(summary.str());
 }
 
-// Character::update() is deliberately NOT hooked - skipping it breaks position syncing while carried
-// and causes a rigid, non-ragdolling corpse. MedicalSystem::medicalUpdate() stays frozen regardless,
-// since it's hooked independently of caller.
+// Character::update() is deliberately NOT hooked - see DESIGN.md §1.
 
 // --- Hook 2: MedicalSystem::medicalUpdate() ---------------------------------------------------
-// Freezes a Deactivated character's medical simulation - no health change either direction, and stops
-// declareDead() from re-triggering. MedicalSystem has no owning-Character* field, so reach it via
-// getPart(...)->me. Reactivation is polled from Character_updateOnScreenCheck_hook instead of here -
-// this hook doesn't fire for a genuinely dead character, which is what an earlier dead=true design hit.
+// Freezes a Deactivated character's medical simulation - see DESIGN.md §1. No owning-Character* field
+// on MedicalSystem, so reach it via getPart(...)->me.
 void (*MedicalSystem_medicalUpdate_orig)(MedicalSystem*, float);
 void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 {
@@ -1363,11 +1181,7 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 	MedicalSystem_medicalUpdate_orig(self, frameTime);
 }
 
-// requiredStates are checked (in order, short-circuiting on the first failure) before touching
-// inSomething/RootObject/Building at all - see the comment on DialogueTriggerDef for why that
-// ordering is load-bearing, not stylistic. Clears this trigger's shown flag on any early-out, so a
-// later re-match (re-entering the state(s), or re-entering the building) can prompt again - mirrors
-// the old single-trigger "leaving the bed clears it" behavior, just per-trigger.
+// Level-triggered, per DESIGN.md §5.
 static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const DialogueTriggerDef& trigger)
 {
 	std::pair<Character*, size_t> shownKey(self, triggerIndex);
@@ -1411,24 +1225,7 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	g_triggerShown[shownKey] = true;
 }
 
-// --- Persistent HUD health-status text (MedicalPanel/MedicalPanel_Front/StatusPanel/*_HealthText) ----
-// A second, separate status label from the "State:" row below - part of MainBarGUI's always-visible
-// medical panel (shows vanilla text like "Recovery coma"/"Dying"/"Critical" for the selected character),
-// found live via a one-shot widget-tree dump gated on Debug (see git history for that diagnostic) rather
-// than guessed: MyGUI::Widget::castType<T>(false) is RTTI-checked (typeid comparison) and returns nullptr
-// on a type mismatch instead of crashing, so walking the unnamed MainBarGUI tree was safe to do. The
-// widget's own name carries a per-session instance-specific numeric prefix (MainBarGUI's BaseLayout
-// prefix), so it's located once by matching the stable "_HealthText" suffix and the resulting pointer is
-// cached - MainBarGUI is a persistent singleton for the life of the game session, so this is safe to
-// resolve once rather than re-walking the tree every frame.
-//
-// This widget belongs to MedicalDatapanel, not DatapanelGUI (confirmed in DESIGN.md §2's original
-// investigation - MedicalDatapanel never calls DatapanelGUI::setLine), and refreshes on its own cadence
-// independent of the DatapanelGUI hook below, which is why forcing it from that hook didn't stick (it
-// kept getting overwritten back to vanilla text). It needs its own per-frame force instead, anchored on
-// Character::updateOnScreenCheck() - confirmed firing every frame per character already - and gated to
-// only the character currently selected (PlayerInterface::selectedCharacter), since this is a single
-// shared HUD widget, not one per character.
+// --- Persistent HUD health-status text - see DESIGN.md §2's "Second override" ---------------------
 static const char* DEACTIVATED_COLOR = "#59231a"; // vanilla's own dark red, same as its "Dead" text
 static MyGUI::TextBox* g_healthTextWidget = nullptr;
 static bool g_healthTextWidgetSearched = false;
@@ -1520,10 +1317,7 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 }
 
 // --- Hook: DatapanelGUI::setLine(key,s1,s2,category,last,keyVisible) - status tag override -------
-// The "State:" row is overridden unconditionally for any tracked Deactivated character - since dead
-// stays false, the corpse-only native "Dead" text never fires, so whatever text a fatally-frozen-but-
-// alive character would show (likely "Dying"/"Critical") is replaced regardless of its actual content.
-// (DEACTIVATED_COLOR is declared above, next to the HealthText override this shares its color with.)
+// The "State:" row is overridden unconditionally for any tracked Deactivated character - see DESIGN.md §2.
 DataPanelLine* (*DatapanelGUI_setLine_KeyLastVisible_orig)(DatapanelGUI*, const std::string&, const std::string&, const std::string&, int, bool, bool);
 DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, const std::string& keyValue, const std::string& s1, const std::string& s2, int category, bool last, bool keyVisible)
 {
@@ -1538,7 +1332,8 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 
 	if (keyValue == "State:")
 	{
-		std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + "POWER FAILURE";
+		bool needsAiCore = isHumanoidState(target) && hasHeadPart(target);
+		std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + (needsAiCore ? "AI FAILURE" : "POWER FAILURE");
 		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, overriddenS2, category, last, keyVisible);
 	}
 
@@ -1546,19 +1341,7 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 }
 
 // --- Robot limb race-lock (merged in from the former "The Limbless (Type 2)" mod) --------------
-// Unrelated to the Deactivated/reactivation system above - this is a standalone fix for vanilla
-// robot limbs being equippable onto any race. Kept as its own self-contained section (own map, own
-// two hooks) rather than woven into the reactivation code, since the two features share no state.
-//
-// Vanilla stores each item's FCS "Race Limiter" (racesInclude/racesExclude) in RaceLimiter's
-// singleton, populated lazily via addLimit() the first time something looks the item up - nothing on
-// the robot-limb equip path ever calls that, so the cache stays empty and canEquip() always sees
-// "unrestricted" for limbs. RobotLimbs::inventory is a cached "interface" RootObject* representing a
-// character's limb-slot section in the GUI - this is exactly the object vanilla passes as "who"
-// during the drag/equip race-check, but its getName() is a generic "ROBOTICS" label, not tied to the
-// owning character. getInventoryInterface() is hooked to record interface-pointer -> owning-character
-// every time one is (re)built, so canEquip()'s hook can look up the true recipient from "who" later -
-// correct in all cases, including multi-character trades, no guessing needed.
+// Unrelated to the Deactivated/reactivation system above - see DESIGN.md's "Robot limb race-lock".
 static std::map<RootObject*, Character*> g_limbInterfaceOwners;
 
 RootObject* (*RobotLimbs_getInventoryInterface_orig)(RobotLimbs*, bool);
@@ -1570,9 +1353,7 @@ RootObject* RobotLimbs_getInventoryInterface_hook(RobotLimbs* self, bool create)
 	return result;
 }
 
-// Primes the RaceLimiter cache for this item (see comment above), then substitutes "who" for the
-// item's true owning Character* before deferring to vanilla's own equip validation, which then
-// enforces the race restriction correctly on its own.
+// Primes the RaceLimiter cache, then substitutes "who" - see DESIGN.md's "Robot limb race-lock".
 bool (*RaceLimiter_canEquip2_orig)(RaceLimiter*, GameData*, RootObject*);
 bool RaceLimiter_canEquip2_hook(RaceLimiter* self, GameData* item, RootObject* who)
 {

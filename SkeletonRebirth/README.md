@@ -24,7 +24,7 @@ Hooks in `SkeletonRebirthDiagnostics.cpp`:
 | `Character::declareDead()` | Blocked entirely for robots — forces `MedicalSystem::dead` back to false (native code sets it true just before calling this, so it has to be reasserted, not just left alone) instead of letting the real transition proceed, and marks the character Deactivated. |
 | `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely. |
 | `Character::updateOnScreenCheck()` | Reactivation trigger only: prompts when a Deactivated robot is in the Skeleton Repair Bed. |
-| `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` | Overrides the "State:" GUI tag (vanilla shows "Rebooting" for a robot in this state) to "POWER FAILURE" in vanilla's own dead-red, unconditionally, for tracked robots. |
+| `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` | Overrides the "State:" GUI tag (vanilla shows "Rebooting" for a robot in this state) to "AI FAILURE" (humanoid with a head - needs an AI Core) or "POWER FAILURE" (headless, or animal-type - needs a Power Core) in vanilla's own dead-red, unconditionally, for tracked robots. |
 | `HandleManager::_NV_restore(std::ifstream&)` | Post-load trigger: re-resolves the persisted Deactivated-robot list after a save loads. |
 
 The confirmation box is a real instance of Kenshi's own `Kenshi_MessageBox.layout`, loaded via
