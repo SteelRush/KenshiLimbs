@@ -1,0 +1,4 @@
+{
+	"Plugins" : [ "AutoNavMesh.dll" ],
+	"Debug" : false
+}
