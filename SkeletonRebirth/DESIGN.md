@@ -229,15 +229,38 @@ were abandoned in favour of dynamic (live) diagnostic hooking throughout the res
 
 ### 3. Reactivation trigger and confirmation UI
 
-**Trigger**: simply placing a Deactivated robot in the Skeleton Repair Bed (`isInSkeletonBed()` -
-`Character::inSomething == IN_BED` and `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, value
-`25`) is enough - no item requirement, checked continuously via `Character::updateOnScreenCheck()`
-(fires roughly every frame per character). Three earlier approaches were tried and rejected:
+**Trigger, humanoid robots only**: simply placing a Deactivated humanoid robot in the Skeleton Repair Bed
+(`Character::inSomething == IN_BED`, checked via the `"inBed"` named state in §5's `requiredStates`, on a
+building whose `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, value `25`, FCS String ID is in
+the trigger's `buildings` list) is enough - no item requirement, checked continuously via
+`Character::updateOnScreenCheck()` (fires roughly every frame per character).
+
+**Trigger, animal-type robots (e.g. Iron Spider)**: item-based only (below) - furniture-based reactivation
+never worked reliably for animal skeletons, and the item-based trigger sidesteps the furniture-pose
+question entirely.
+
+**A second, independent trigger** (used by humanoids alongside the furniture one above, and exclusively by
+animal-type robots) fires the same menu on using either of the game's two robot-repair items on a
+Deactivated robot, while the caregiver has Science skill ≥ 1. This is a revival of the mod's *original*
+design (see the rejected-approaches list just below) - `MedicalSystem::applyFirstAid()`
+(`MedicalSystem.h:250`, RVA `0x64D080`, non-virtual) is hooked purely to populate `g_activeFirstAid` (a
+`Character* patient -> Character* caregiver` map, cleared and re-set every frame - see §5), which backs
+two named states: `"beingRepaired"` (just checks the map has an entry - only two items in the game can
+make `applyFirstAid()` fire on a robot at all, so no separate item-identity check is needed) and
+`"repairerScience1"` (reads the caregiver's `CharStats::science` directly, not the `skill` parameter
+`applyFirstAid()` receives - live logging showed that value drifts frame-to-frame during a single repair
+session, roughly 24.54 → 25.45 over ~1,460 calls, so it's some per-tick computed effective value rather
+than a stable stat snapshot, and unsuitable for a one-time gate). Confirmed live (not just from the
+header) that `who` is the caregiver, not the patient - reached the same way as the `medicalUpdate()` hook
+reaches its owning `Character*`, via `getPart(PART_HEAD)->me`.
+
+Earlier approaches tried and rejected before landing on the furniture-polling design above:
 - `MedicalSystem::applyFirstAid()` (the original design, gated on using a `ITEM_ROBOTREPAIR` item) broke
   once `dead=true` took effect under an earlier design - a genuinely dead character isn't a valid target
   for the normal AI-driven "treat with item" action at all, confirmed by direct testing (repair kits
-  stopped working). Moot now that `dead` stays false, but not reverted back to, since the polling
-  approach below is simpler regardless.
+  stopped working). This is exactly why it was dropped at the time - not a flaw in the idea itself, only
+  in the surrounding `dead=true` design (§1). Once `dead` stayed false permanently, the idea was revisited
+  and now coexists with the furniture trigger as the second trigger described above.
 - `InventoryGUI::show()` (triggering off the loot/trade menu opening) crashed the game - see the virtual-
   function pitfall above.
 - `InventoryTraderGUI::_CONSTRUCTOR()` (the non-virtual-safe fix for the above) worked, but
@@ -500,14 +523,29 @@ system, which needed the same thing to find the same file.
 
 "When does a dialogue box open" is data-driven the same way button behavior is (§4): `RE_Kenshi.json`'s
 `"DialogueTriggers"` array, each entry an AND of `requiredStates` (named `bool(Character*)` checks
-registered in `g_triggerStateChecks` - `"deactivated"`/`"animal"`/`"humanoid"`, all must pass) and
-`buildings` (the used building's own FCS String ID must be in this list), opening `menu` once both hold.
-This lets more than one trigger definition exist - e.g. `system_menu` for humanoid robots vs
-`system_menu_animal` for animal-type ones sharing the same Skeleton Repair Bed - rather than the single
-hardcoded trigger `Character::updateOnScreenCheck()` originally polled (§3). Deliberately flat named
-checks AND'd together, not a general boolean expression language, since every combination needed so far
-("deactivated AND animal") fits that shape without the parsing/fragility risk a real expression syntax
-would add.
+registered in `g_triggerStateChecks` - `"deactivated"`/`"animal"`/`"humanoid"`/`"inBed"`/
+`"beingRepaired"`/`"repairerScience1"`, all must pass) and `buildings` (the used building's own FCS String
+ID must be in this list; **empty means no building requirement at all**, not "never fires" - see below),
+opening `menu` once both hold. This lets more than one trigger definition exist - e.g. `system_menu` for
+humanoid robots vs `system_menu_animal` for animal-type ones, and (now) a furniture-based trigger
+alongside a completely independent item-based one, both able to open the same menu - rather than the
+single hardcoded trigger `Character::updateOnScreenCheck()` originally polled (§3). Deliberately flat
+named checks AND'd together, not a general boolean expression language, since every combination needed so
+far (e.g. "deactivated AND animal AND inBed") fits that shape without the parsing/fragility risk a real
+expression syntax would add.
+
+`"inBed"` (`isInBedState`) was split out of `evaluateDialogueTrigger()` into a named `requiredStates`
+check rather than staying a hardcoded `self->inSomething != IN_BED` early-out, so which `UseStuffState`
+the Repair Bay furniture uses is a JSON edit, not a recompile.
+
+`"beingRepaired"`/`"repairerScience1"` (§3's item-based trigger) don't fit the furniture trigger's
+`self->inWhat` building lookup at all - a robot being repair-kitted isn't necessarily standing in any
+building - so `trigger.buildings` being empty had to become a real, intentional "no requirement" case
+(`buildingMatches = trigger.buildings.empty()`) rather than the JSON loader's original assumption that an
+empty list was an authoring mistake ("will never fire"). The initiator passed to `showDialogueBox()` is
+resolved the same way: prefer `g_activeFirstAid`'s caregiver for `self` if present, only falling back to
+the player's current selection (§4) when there isn't one - the furniture trigger has no other way to know
+"who's responsible", but the item trigger does, so it uses it.
 
 `Character_updateOnScreenCheck_hook` evaluates every trigger for every on-screen character every frame,
 so `requiredStates` are checked before `buildings` and short-circuit on the first failing check - the
@@ -633,6 +671,15 @@ see the virtual-function hooking pitfall at the top of this document.
 - `UseStuffState::IN_BED` — Character.h:129-134
 - `Building::_NV_getSpecialFunction() const` — Building/Building.h:220-221, RVA `0xF6AF0`, virtual
 - `BuildingFunction::BF_SKELETON_BED` — Enums.h:150, value `25`
+- `MedicalSystem::applyFirstAid(float skill, Item* equipment, float frameTIME, Character* who)` —
+  MedicalSystem.h:250, RVA `0x64D080`, non-virtual (the class has no vtable of its own, only a virtual
+  dtor) - `who` confirmed live to be the caregiver, not the patient; `skill` is some per-tick computed
+  value, not a stable stat (see §3) - reached the patient the same way `medicalUpdate()`'s hook does,
+  via `getPart(PART_HEAD)->me`
+- `CharStats::science` — CharStats.h:121, plain `float` member, offset `0xE0` - already reusable via
+  `g_skillFields["science"]` (used elsewhere for dialogue button `requiresSkill` checks), but the item
+  trigger's `"repairerScience1"` reads it directly off the caregiver instead, since `requiredStates`
+  checks only take the patient (`self`), not an arbitrary other character
 - `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` — DatapanelGUI.h:70, RVA `0x6FD4B0`,
   non-virtual — status-tag override hook, the only `setLine*` overload actually used; the other ~6
   (`setLineStatInfo`, `setLineFaction`, three more `setLine(...)` signature variants, `setLineText`) were

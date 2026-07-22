@@ -102,6 +102,9 @@ static std::map<Character*, bool> g_deactivated;
 // Level-triggered, keyed by (character, trigger index) - see DESIGN.md §5.
 static std::map<std::pair<Character*, size_t>, bool> g_triggerShown;
 
+// patient -> caregiver, refreshed each frame - see DESIGN.md §5.
+static std::map<Character*, Character*> g_activeFirstAid;
+
 // Called after an action that could invalidate more than one trigger at once - see DESIGN.md §5.
 static void clearTriggerShownFor(Character* c)
 {
@@ -366,7 +369,7 @@ static std::map<std::string, DialogueBoxDef> g_dialogueBoxes;
 struct DialogueTriggerDef
 {
 	std::vector<std::string> requiredStates; // all looked up in g_triggerStateChecks, all must pass
-	std::vector<std::string> buildings; // FCS building String IDs - any one match is enough
+	std::vector<std::string> buildings; // FCS building String IDs - any one match is enough; empty = no building requirement
 	std::string menu; // a "DialogueBoxes" key to open once requiredStates and buildings both match
 };
 static std::vector<DialogueTriggerDef> g_dialogueTriggers;
@@ -383,6 +386,27 @@ static bool isDeactivatedState(Character* c)
 static bool isHumanoidState(Character* c)
 {
 	return !isAnimalCharacterType(c);
+}
+
+// See DESIGN.md §5.
+static bool isInBedState(Character* c)
+{
+	return c->inSomething == IN_BED;
+}
+
+// See DESIGN.md §3.
+static bool isBeingRepairedState(Character* c)
+{
+	return g_activeFirstAid.count(c) > 0;
+}
+
+// Caregiver's skill, not the patient's - see DESIGN.md §3/§5.
+static bool hasRepairerScience1(Character* c)
+{
+	auto it = g_activeFirstAid.find(c);
+	Character* repairer = (it != g_activeFirstAid.end()) ? it->second : nullptr;
+	CharStats* stats = repairer ? repairer->getStats() : nullptr;
+	return stats && stats->science >= 1.0f;
 }
 
 typedef void (*DialogueActionFn)(Character* patient);
@@ -1149,8 +1173,7 @@ static void loadDialogueTriggersFromJson()
 					trigger.buildings.push_back(buildings[j].GetString());
 			}
 		}
-		if (trigger.buildings.empty())
-			ErrorLog("SkeletonRebirth: " + label.str() + " has no \"buildings\" - will never fire");
+		// Empty "buildings" is intentional - see DESIGN.md §5.
 
 		g_dialogueTriggers.push_back(trigger);
 	}
@@ -1181,6 +1204,20 @@ void MedicalSystem_medicalUpdate_hook(MedicalSystem* self, float frameTime)
 	MedicalSystem_medicalUpdate_orig(self, frameTime);
 }
 
+// --- Hook 3: MedicalSystem::applyFirstAid() -----------------------------------------------------
+// Feeds g_activeFirstAid for the item-based reactivation trigger - see DESIGN.md §3/§5.
+bool (*MedicalSystem_applyFirstAid_orig)(MedicalSystem*, float, Item*, float, Character*);
+bool MedicalSystem_applyFirstAid_hook(MedicalSystem* self, float skill, Item* equipment, float frameTIME, Character* who)
+{
+	MedicalSystem::HealthPartStatus* head = self->getPart(MedicalSystem::HealthPartStatus::PART_HEAD, SIDE_NEITHER);
+	Character* patient = head ? head->me : nullptr;
+
+	if (patient)
+		g_activeFirstAid[patient] = who;
+
+	return MedicalSystem_applyFirstAid_orig(self, skill, equipment, frameTIME, who);
+}
+
 // Level-triggered, per DESIGN.md §5.
 static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const DialogueTriggerDef& trigger)
 {
@@ -1196,19 +1233,17 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 		}
 	}
 
-	if (self->inSomething != IN_BED)
+	// Empty buildings = no requirement - see DESIGN.md §5.
+	bool buildingMatches = trigger.buildings.empty();
+	if (!buildingMatches)
 	{
-		g_triggerShown.erase(shownKey);
-		return;
+		RootObject* obj = self->inWhat.getRootObject();
+		Building* building = obj ? static_cast<Building*>(obj) : nullptr;
+		GameData* buildingData = building ? building->getGameData() : nullptr;
+
+		for (size_t i = 0; !buildingMatches && buildingData && i < trigger.buildings.size(); ++i)
+			buildingMatches = (trigger.buildings[i] == buildingData->stringID);
 	}
-
-	RootObject* obj = self->inWhat.getRootObject();
-	Building* building = obj ? static_cast<Building*>(obj) : nullptr;
-	GameData* buildingData = building ? building->getGameData() : nullptr;
-
-	bool buildingMatches = false;
-	for (size_t i = 0; !buildingMatches && buildingData && i < trigger.buildings.size(); ++i)
-		buildingMatches = (trigger.buildings[i] == buildingData->stringID);
 
 	if (!buildingMatches)
 	{
@@ -1219,8 +1254,11 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	if (g_triggerShown.count(shownKey))
 		return; // already shown, waiting on the player to act or leave
 
-	// initiator = player's current selection, not getAnyPlayerCharacter() - see DESIGN.md §4.
-	Character* initiator = (ou && ou->player) ? ou->player->selectedCharacter.getCharacter() : nullptr;
+	// Prefers g_activeFirstAid's caregiver, else player's current selection - see DESIGN.md §4/§5.
+	auto repairerIt = g_activeFirstAid.find(self);
+	Character* initiator = (repairerIt != g_activeFirstAid.end() && repairerIt->second)
+		? repairerIt->second
+		: ((ou && ou->player) ? ou->player->selectedCharacter.getCharacter() : nullptr);
 	showDialogueBox(trigger.menu, self, initiator);
 	g_triggerShown[shownKey] = true;
 }
@@ -1313,6 +1351,9 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	for (size_t i = 0; i < g_dialogueTriggers.size(); ++i)
 		evaluateDialogueTrigger(self, i, g_dialogueTriggers[i]);
 
+	// Cleared after evaluating so this frame's checks still see it - see DESIGN.md §5.
+	g_activeFirstAid.erase(self);
+
 	return result;
 }
 
@@ -1376,6 +1417,9 @@ __declspec(dllexport) void startPlugin()
 	g_triggerStateChecks["deactivated"] = &isDeactivatedState;
 	g_triggerStateChecks["animal"] = &isAnimalCharacterType;
 	g_triggerStateChecks["humanoid"] = &isHumanoidState;
+	g_triggerStateChecks["inBed"] = &isInBedState;
+	g_triggerStateChecks["beingRepaired"] = &isBeingRepairedState;
+	g_triggerStateChecks["repairerScience1"] = &hasRepairerScience1;
 	loadDebugSettingFromJson();
 	loadDialogueBoxesFromJson();
 	loadDialogueTriggersFromJson();
@@ -1385,6 +1429,9 @@ __declspec(dllexport) void startPlugin()
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&MedicalSystem::medicalUpdate), MedicalSystem_medicalUpdate_hook, &MedicalSystem_medicalUpdate_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add MedicalSystem::medicalUpdate hook!");
+
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&MedicalSystem::applyFirstAid), MedicalSystem_applyFirstAid_hook, &MedicalSystem_applyFirstAid_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add MedicalSystem::applyFirstAid hook!");
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&Character::updateOnScreenCheck), Character_updateOnScreenCheck_hook, &Character_updateOnScreenCheck_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add Character::updateOnScreenCheck hook!");

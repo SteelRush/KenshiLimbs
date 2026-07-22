@@ -3,13 +3,18 @@
 	"Debug" : true,
 	"DialogueTriggers" : [
 		{
-			"requiredStates" : [ "deactivated", "humanoid" ],
+			"requiredStates" : [ "deactivated", "humanoid", "inBed" ],
 			"buildings" : [ "64614-rebirth.mod" ],
 			"menu" : "system_menu"
 		},
 		{
-			"requiredStates" : [ "deactivated", "animal" ],
-			"buildings" : [ "33-Skeleton Rebirth.mod" ],
+			"requiredStates" : [ "deactivated", "humanoid", "beingRepaired", "repairerScience1" ],
+			"buildings" : [],
+			"menu" : "system_menu"
+		},
+		{
+			"requiredStates" : [ "deactivated", "animal", "beingRepaired", "repairerScience1" ],
+			"buildings" : [],
 			"menu" : "system_menu_animal"
 		}
 	],
