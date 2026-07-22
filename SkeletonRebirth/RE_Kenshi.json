@@ -20,9 +20,9 @@
 	],
 	"DialogueBoxes" : {
 		"system_menu": {
-			"title": "System Menu",
+			"title": "Bootloader Menu",
 			"item": "43392-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop. Running diagnostics will consume the {item} used - proceed?",
+			"message": "{name} is in a catastrophic shutdown loop. A {item} will be required to enable service mode for repairs. What do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
@@ -32,7 +32,7 @@
 					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43392-changes_otto.mod" },
-						{ "type": "show_text", "text": "{item} consumed - running diagnostics...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
+						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
@@ -45,7 +45,7 @@
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
-						{ "type": "show_text", "text": "{item} consumed - running diagnostics...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
+						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
@@ -58,9 +58,9 @@
 		},
 
 		"system_menu_animal": {
-			"title": "System Menu",
+			"title": "Bootloader Menu",
 			"item": "43398-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop. Running diagnostics will consume the {item} used - proceed?",
+			"message": "{name} is in a catastrophic shutdown loop. A {item} will be required to enable service mode for repairs. What do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
@@ -69,7 +69,7 @@
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
-						{ "type": "show_text", "text": "{item} consumed - running diagnostics...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
+						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
@@ -82,15 +82,15 @@
 		},
 
 		"diagnostic_menu": {
-			"title": "Diagnostics",
-			"message": "Diagnostics complete. {name}'s core systems are accessible. Select a course of action.",
+			"title": "Service Mode",
+			"message": "{name}'s core systems are accessible. Select an action.",
 			"buttons": [
 				{
-					"caption": "Revive",
+					"caption": "Reactivate",
 					"requiresDeactivated": true,
 					"steps": [
 						{ "type": "delay", "seconds": 5 },
-						{ "type": "notify", "text": "{name} has been successfully revived!" },
+						{ "type": "notify", "text": "{name} has been successfully reactivated!" },
 						{ "type": "action", "action": "reactivate" },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
@@ -101,7 +101,7 @@
 					"excludeDeactivated": true,
 					"steps": [
 						{ "type": "delay", "seconds": 5 },
-						{ "type": "show_text", "text": "{name} has been reset!", "color": "#3399FF" },
+						{ "type": "show_text", "text": "{name} has been reset to factory defaults!", "color": "#3399FF" },
 						{ "type": "action", "action": "join_squad" },
 						{ "type": "action", "action": "system_reset" },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
