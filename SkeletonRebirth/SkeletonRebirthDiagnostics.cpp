@@ -1365,8 +1365,7 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 	Character* target = self->getObject().getCharacter();
 
 	// Feeds g_lastInspectedCharacter (DESIGN.md §2) - kept fresh for any open panel, not just Deactivated.
-	if (target)
-		g_lastInspectedCharacter = target;
+	g_lastInspectedCharacter = target;
 
 	if (!target || !g_deactivated.count(target))
 		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);

@@ -213,7 +213,11 @@ reversed methods, so no RVA to hook directly there). Forcing its caption (`"Deac
 `PlayerInterface::selectedCharacter.getCharacter()`, which does not reliably resolve for animals (see "A
 second pitfall" above); fixed by reusing `g_lastInspectedCharacter`, tracked from the
 `DatapanelGUI::getObject().getCharacter()` resolution already proven correct for the row above, instead
-of depending on `selectedCharacter` at all.
+of depending on `selectedCharacter` at all. That tracking assignment must be unconditional, including when
+the currently-open panel resolves to no character at all (a building, an item): earlier code only wrote
+`g_lastInspectedCharacter` when a character was found, so inspecting a non-character object after a
+Deactivated robot left the stale robot reference in place, and the health-text override kept stomping
+"Deactivated" onto whatever was currently on screen and inspected next - e.g. a Research Bench.
 
 Finding the *original* status-tag logic (back when this was still a `dead=true` design) required static
 analysis of the shipped `kenshi_x64.exe`, not just the headers: `MedicalSystem::getMedicalGUIData`'s RVA
