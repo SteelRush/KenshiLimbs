@@ -297,6 +297,16 @@ Diagnostics" (15 characters) rendered as "un Diagnostic" - both ends clipped. `R
 button captions were shortened accordingly ("Diagnose"/"Repair"/"Reset"/"Cancel"/"Do nothing"). Keep
 future captions at roughly "Do nothing"'s length (~10 characters) or shorter.
 
+**Message text renders center-aligned and this can't be fixed from outside the layout.** Tried: walking
+`createMessageBox()`'s returned `MyGUI::Window*` to find the message `TextBox` (by exact caption match,
+since the layout isn't reversed - no child name to hook by) and calling `setTextAlign(Align::Left)` on
+it directly. Confirmed live via a full widget-tree dump that there's exactly one `_MessageText` widget
+(no duplicate/shadow copy to miss), and its `getTextAlign()` already reports `Left Top` both before and
+after the call - yet the text still renders centered. So `TextAlign` isn't what's actually driving this
+widget's wrapped-line layout; Kenshi's skin for this widget does its own line-centering independent of
+that property, and there's no other reversed hook into it. Left as vanilla center-aligned - not worth
+chasing further for a cosmetic issue.
+
 Its content is data-driven, not hardcoded per dialogue - see "JSON-driven dialogue boxes" below - with
 each eligible button's caption and an integer id passed straight to `createMessageBox()`, any button
 beyond however many the JSON entry defines simply not included in that list. Three earlier approaches
@@ -388,9 +398,18 @@ and fast-recruits the patient via `PlayerInterface::recruit()`):
 ```
 
 `{name}` is substituted with the patient's name wherever it appears (`message`, and any `show_text`
-step's `text`). Up to 3 buttons per entry (`Kenshi_MessageBox.layout` has exactly `ButtonA`/`ButtonB`/
-`ButtonC`) - see the button-gating/visibility rules below for how "up to 3" is actually resolved from a
-JSON array that might define more, or fewer be eligible.
+step's `text`). `{skillCharacter}`/`{skillCharacter2}` (box-level `message` only, not step text) name
+the squad member `findSquadMemberWithSkill()` found for the first patient-applicable button's (per
+`isDialogueButtonForPatient()`, not `eligibleButtons`) `requiresSkill`/`requiresSkill2` - see
+"Button-level gating" below - falling back to "No one" if nobody currently qualifies, since that's an
+expected outcome, not a data error. `{itemStatus}` (same scope as the two above) reads
+`initiator->getInventory()->hasItem()` against the same patient-applicable button's `requiresItem` and
+resolves to "You have one."/"You don't have one yet." - added so the message explains *why* a button
+like "Diagnostics" might be missing (missing item vs. nobody in the squad qualifying) instead of the
+player having to guess. Up to 3 buttons per entry
+(`Kenshi_MessageBox.layout` has exactly `ButtonA`/`ButtonB`/`ButtonC`) - see the button-gating/
+visibility rules below for how "up to 3" is actually resolved from a JSON array that might define more,
+or fewer be eligible.
 
 **The step types** (`DialogueBoxStepDef::type`), run in order by `dispatchDialogueSteps()`:
 - `"action"` — dispatches `action` through `g_dialogueActions` (a `std::map<std::string,
@@ -458,10 +477,16 @@ settle, not just a different call stack.
 **Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItem`, `excludePlayerFaction`)
 controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
 from anything its steps do:
-- `requiresSkill` (a lowercase `CharStats` field name - see `g_skillFields`, the same skill-name table
-  the old `DialogueSkillChecks` feature used) plus `minSkill`/`maxSkill` (at least one required if
-  `requiresSkill` is set, Kenshi's native 0-100 scale), checked against `initiator`'s
-  `Character::getStats()`. An unrecognized skill name is logged once at JSON-load time and then treated
+- `requiresSkill`/`requiresSkill2` (independent, lowercase `CharStats` field names - see `g_skillFields`,
+  the same skill-name table the old `DialogueSkillChecks` feature used) plus their own `minSkill`/
+  `maxSkill` and `minSkill2`/`maxSkill2` (at least one required per skill that's set, Kenshi's native
+  0-100 scale). Checked squad-wide (`squadHasSkill()`, over `initiator->getPlatoon()->things`, each
+  member resolved via `hand(RootObjectBase*).getCharacter()` - the same safe cast-by-handle pattern
+  `getObject().getCharacter()` uses elsewhere in this file), not against `initiator` alone: each skill
+  just needs *some* squad member in range, not the same member for both, so "Diagnostics" (Reactivate/
+  Reset's entry point, requiring both Science and Robotics - representing Old World dual-discipline
+  knowledge) can be satisfied by two specialists working together instead of demanding one character
+  who's trained in both. An unrecognized skill name is logged once at JSON-load time and then treated
   as "no skill requirement" every time the button would otherwise show, rather than hiding it - a typo
   shouldn't silently make a button impossible to see and impossible to know why.
 - `requiresItem` (an FCS/GameData item String ID, looked up via `GameDataManager::getData(id, ITEM)`) -
@@ -485,10 +510,15 @@ from anything its steps do:
   "Skeleton No-Head MkII" its own "Diagnostics" button variant (requiring a Power Core, same item as the
   animal path) alongside `system_menu`'s generic humanoid one (which excludes this race so the two don't
   both show at once).
-- The box-level `message`'s `{item}` substitution prefers the first eligible button's own `requiresItem`
-  over `DialogueBoxDef::item` (the box-level default) - without this, a race/animal-specific button
-  variant with a different required item would still show the generic item's name in the message text,
-  even though gating and consumption already used the right one.
+- The box-level `message`'s `{item}`/`{skillCharacter}`/`{skillCharacter2}` substitutions are resolved
+  from `def.buttons` filtered by `isDialogueButtonForPatient()` (the patient-only subset of gating -
+  race/animal/faction/deactivated), not from `eligibleButtons` (the full, initiator-inclusive gate).
+  Originally scoped to `eligibleButtons`: this under-resolved live - a patient with a qualifying squad
+  but no Power Core yet had its "Diagnostics" button hidden for the item alone, so the message fell
+  through to `{item}`'s box-level default and (once `{skillCharacter}`/`{skillCharacter2}` existed)
+  had no button left to resolve those from at all, showing "No one" despite a qualifying squad member.
+  Message text should describe what a button *would* need/who *would* qualify for this patient
+  regardless of what the initiator currently has in hand.
 - Eligible buttons are **compacted** into `ButtonA`/`ButtonB`/`ButtonC` in JSON order, not left as gaps -
   an ineligible button in the middle of a 3-button JSON array doesn't leave an empty slot where it would
   have been. If gating leaves zero buttons eligible for the current initiator, the box isn't shown at all

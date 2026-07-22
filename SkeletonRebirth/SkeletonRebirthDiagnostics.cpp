@@ -15,6 +15,7 @@
 #include <kenshi/Faction.h>
 #include <kenshi/Inventory.h>
 #include <kenshi/PlayerInterface.h>
+#include <kenshi/Platoon.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/Globals.h>
 #include <kenshi/gui/DatapanelGUI.h>
@@ -342,6 +343,11 @@ struct DialogueBoxButtonDef
 	float minSkill;
 	bool hasMaxSkill;
 	float maxSkill;
+	std::string requiresSkill2; // second, independently-gated skill - see DESIGN.md §4, "Button-level gating"
+	bool hasMinSkill2;
+	float minSkill2;
+	bool hasMaxSkill2;
+	float maxSkill2;
 	bool excludePlayerFaction; // hidden if the patient belongs to the player's faction
 	bool requiresPlayerFaction; // hidden unless the patient belongs to the player's faction - the counterpart to excludePlayerFaction
 	bool requiresDeactivated; // hidden unless the patient is in g_deactivated - see DESIGN.md §2
@@ -351,7 +357,7 @@ struct DialogueBoxButtonDef
 	std::string requiresRace; // RaceData's display name (Character::getRace()->data->name) - hidden unless it matches exactly
 	std::string excludeRace; // same match, inverted - the counterpart to requiresRace
 
-	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), excludeDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
+	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), hasMinSkill2(false), minSkill2(0.0f), hasMaxSkill2(false), maxSkill2(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), excludeDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
 
 struct DialogueBoxDef
@@ -523,9 +529,43 @@ static GameData* getGameDataGuarded(const std::string& id, itemType category)
 	}
 }
 
-// Gates whether a button is shown, not whether its steps can still run once clicked - the "take_item"
-// step re-checks defensively (the item could be lost between show and click).
-static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character* patient, Character* initiator)
+// Squad-wide requiresSkill/requiresSkill2 lookup - see DESIGN.md §4, "Button-level gating".
+static Character* findSquadMemberWithSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
+	if (fieldIt == g_skillFields.end())
+		return initiator; // unrecognized skill name - logged once at JSON-load time, treated as no requirement
+
+	ActivePlatoon* platoon = initiator ? initiator->getPlatoon() : nullptr;
+	if (!platoon)
+	{
+		CharStats* stats = initiator ? initiator->getStats() : nullptr;
+		if (!stats)
+			return nullptr;
+		float value = stats->*(fieldIt->second);
+		return ((!hasMin || value >= minValue) && (!hasMax || value <= maxValue)) ? initiator : nullptr;
+	}
+
+	for (auto it = platoon->things.begin(); it != platoon->things.end(); ++it)
+	{
+		Character* member = hand(*it).getCharacter();
+		CharStats* stats = member ? member->getStats() : nullptr;
+		if (!stats)
+			continue;
+		float value = stats->*(fieldIt->second);
+		if ((!hasMin || value >= minValue) && (!hasMax || value <= maxValue))
+			return member;
+	}
+	return nullptr;
+}
+
+static bool squadHasSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	return findSquadMemberWithSkill(initiator, skillField, hasMin, minValue, hasMax, maxValue) != nullptr;
+}
+
+// Patient-only subset of isDialogueButtonEligible's checks - see DESIGN.md §4, "Button-level gating".
+static bool isDialogueButtonForPatient(const DialogueBoxButtonDef& btn, Character* patient)
 {
 	if (btn.excludePlayerFaction)
 	{
@@ -571,23 +611,21 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 			return false;
 	}
 
-	if (!btn.requiresSkill.empty())
-	{
-		CharStats* stats = initiator ? initiator->getStats() : nullptr;
-		if (!stats)
-			return false;
+	return true;
+}
 
-		auto fieldIt = g_skillFields.find(toLowerCopy(btn.requiresSkill));
-		if (fieldIt != g_skillFields.end())
-		{
-			float value = stats->*(fieldIt->second);
-			if (btn.hasMinSkill && value < btn.minSkill)
-				return false;
-			if (btn.hasMaxSkill && value > btn.maxSkill)
-				return false;
-		}
-		// unrecognized skill names are logged once at JSON-load time, not here
-	}
+// Gates whether a button is shown, not whether its steps can still run once clicked - the "take_item"
+// step re-checks defensively (the item could be lost between show and click).
+static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character* patient, Character* initiator)
+{
+	if (!isDialogueButtonForPatient(btn, patient))
+		return false;
+
+	if (!btn.requiresSkill.empty() && !squadHasSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill))
+		return false;
+
+	if (!btn.requiresSkill2.empty() && !squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2))
+		return false;
 
 	if (!btn.requiresItem.empty())
 	{
@@ -613,10 +651,8 @@ static void closeDialogueBox()
 	g_currentDialogueButtons.clear();
 }
 
-// Shared by the dialogue box message, "show_text", and "notify" - see DESIGN.md §4. itemId is optional;
-// {item} is only resolved if the text actually references it. callerLabel names the caller in the
-// {item}-unresolvable error message only.
-static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, const std::string& callerLabel)
+// Shared by the dialogue box message, "show_text", and "notify" - see DESIGN.md §4.
+static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, bool hasItem, const std::string& skillCharacterName, const std::string& skillCharacterName2, const std::string& callerLabel)
 {
 	std::string resolvedText = text;
 
@@ -634,6 +670,19 @@ static std::string resolvePlaceholders(const std::string& text, Character* patie
 			ErrorLog("SkeletonRebirth: " + callerLabel + " has \"{item}\" in its text but no resolvable \"item\" (\"" + itemId + "\") - left as-is");
 	}
 
+	size_t itemStatusPos = resolvedText.find("{itemStatus}");
+	if (itemStatusPos != std::string::npos)
+		resolvedText.replace(itemStatusPos, 12, hasItem ? "You have one." : "You don't have one yet.");
+
+	// Falls back to "No one" rather than erroring - see DESIGN.md §4.
+	size_t skillPos = resolvedText.find("{skillCharacter}");
+	if (skillPos != std::string::npos)
+		resolvedText.replace(skillPos, 16, skillCharacterName.empty() ? "No one" : skillCharacterName);
+
+	size_t skillPos2 = resolvedText.find("{skillCharacter2}");
+	if (skillPos2 != std::string::npos)
+		resolvedText.replace(skillPos2, 17, skillCharacterName2.empty() ? "No one" : skillCharacterName2);
+
 	return resolvedText;
 }
 
@@ -642,7 +691,7 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 	if (!gui || text.empty())
 		return;
 
-	std::string resolvedText = resolvePlaceholders(text, patient, itemId, "dialogue step \"show_text\"");
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, false, "", "", "dialogue step \"show_text\"");
 
 	MyGUI::Colour color = MyGUI::Colour::White;
 	if (!colorHex.empty() && !tryParseHexColor(colorHex, color))
@@ -659,7 +708,7 @@ static void showGameNotification(Character* patient, const std::string& text, co
 	if (!ou || text.empty())
 		return;
 
-	std::string resolvedText = resolvePlaceholders(text, patient, itemId, "dialogue step \"notify\"");
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, false, "", "", "dialogue step \"notify\"");
 	ou->showPlayerAMessage_withLog(resolvedText, true);
 }
 
@@ -837,12 +886,16 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 
 			if (!btn.requiresSkill.empty())
 			{
-				CharStats* stats = initiator ? initiator->getStats() : nullptr;
-				auto fieldIt = g_skillFields.find(toLowerCopy(btn.requiresSkill));
-				float value = (stats && fieldIt != g_skillFields.end()) ? stats->*(fieldIt->second) : -1.0f;
-				ss << " requiresSkill=\"" << btn.requiresSkill << "\" initiatorStatsNull=" << (stats == nullptr)
-				   << " skillRecognized=" << (fieldIt != g_skillFields.end()) << " skillValue=" << value
-				   << " minSkill=" << (btn.hasMinSkill ? btn.minSkill : -1.0f);
+				ss << " requiresSkill=\"" << btn.requiresSkill << "\""
+				   << " minSkill=" << (btn.hasMinSkill ? btn.minSkill : -1.0f)
+				   << " squadSatisfies=" << squadHasSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
+			}
+
+			if (!btn.requiresSkill2.empty())
+			{
+				ss << " requiresSkill2=\"" << btn.requiresSkill2 << "\""
+				   << " minSkill2=" << (btn.hasMinSkill2 ? btn.minSkill2 : -1.0f)
+				   << " squadSatisfies2=" << squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
 			}
 
 			if (!btn.requiresItem.empty())
@@ -866,20 +919,47 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	// Prefer an eligible button's own requiresItem over the box-level default, so a race/animal-specific
-	// button variant with a different required item (e.g. Power Core vs AI Core) gets the right {item}
-	// substitution instead of always the box's generic one - see DESIGN.md §4.
+	// Resolved via isDialogueButtonForPatient(), not eligibleButtons - see DESIGN.md §4.
 	std::string effectiveItem = def.item;
-	for (size_t i = 0; i < eligibleButtons.size(); ++i)
+	bool foundItem = false;
+	std::string skillCharacterName;
+	bool foundSkill = false;
+	std::string skillCharacterName2;
+	bool foundSkill2 = false;
+	for (size_t i = 0; i < def.buttons.size() && (!foundItem || !foundSkill || !foundSkill2); ++i)
 	{
-		if (!eligibleButtons[i].requiresItem.empty())
+		const DialogueBoxButtonDef& btn = def.buttons[i];
+		if (!isDialogueButtonForPatient(btn, patient))
+			continue;
+
+		if (!foundItem && !btn.requiresItem.empty())
 		{
-			effectiveItem = eligibleButtons[i].requiresItem;
-			break;
+			effectiveItem = btn.requiresItem;
+			foundItem = true;
+		}
+
+		if (!foundSkill && !btn.requiresSkill.empty())
+		{
+			foundSkill = true;
+			Character* c = findSquadMemberWithSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
+			if (c)
+				skillCharacterName = c->getName();
+		}
+
+		if (!foundSkill2 && !btn.requiresSkill2.empty())
+		{
+			foundSkill2 = true;
+			Character* c = findSquadMemberWithSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
+			if (c)
+				skillCharacterName2 = c->getName();
 		}
 	}
 
-	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, "dialogue box \"" + dialogueId + "\"");
+	Inventory* initiatorInv = initiator ? initiator->getInventory() : nullptr;
+	GameData* effectiveItemData = effectiveItem.empty() ? nullptr : getGameDataGuarded(effectiveItem, ITEM);
+	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, 1);
+
+	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, hasItem, skillCharacterName, skillCharacterName2, "dialogue box \"" + dialogueId + "\"");
 
 	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
 	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.
@@ -1043,6 +1123,22 @@ static void loadDialogueBoxesFromJson()
 				{
 					btn.hasMaxSkill = true;
 					btn.maxSkill = (*bit)["maxSkill"].GetFloat();
+				}
+				if (bit->HasMember("requiresSkill2") && (*bit)["requiresSkill2"].IsString())
+				{
+					btn.requiresSkill2 = (*bit)["requiresSkill2"].GetString();
+					if (!g_skillFields.count(toLowerCopy(btn.requiresSkill2)))
+						ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has unrecognized requiresSkill2 \"" + btn.requiresSkill2 + "\" - this button will show unconditionally (skill part of the check is skipped)");
+				}
+				if (bit->HasMember("minSkill2") && (*bit)["minSkill2"].IsNumber())
+				{
+					btn.hasMinSkill2 = true;
+					btn.minSkill2 = (*bit)["minSkill2"].GetFloat();
+				}
+				if (bit->HasMember("maxSkill2") && (*bit)["maxSkill2"].IsNumber())
+				{
+					btn.hasMaxSkill2 = true;
+					btn.maxSkill2 = (*bit)["maxSkill2"].GetFloat();
 				}
 				if (bit->HasMember("excludePlayerFaction") && (*bit)["excludePlayerFaction"].IsBool())
 					btn.excludePlayerFaction = (*bit)["excludePlayerFaction"].GetBool();

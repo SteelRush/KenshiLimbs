@@ -22,13 +22,15 @@
 		"system_menu": {
 			"title": "Bootloader Menu",
 			"item": "43392-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop. A {item} will be required to enable service mode for repairs. What do you want to do?",
+			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics.\n\nWhat do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
 					"excludeRace": "Skeleton No-Head MkII",
 					"requiresSkill": "science",
-					"minSkill": 1,
+					"minSkill": 40,
+					"requiresSkill2": "robotics",
+					"minSkill2": 40,
 					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43392-changes_otto.mod" },
@@ -41,7 +43,9 @@
 					"caption": "Diagnostics",
 					"requiresRace": "Skeleton No-Head MkII",
 					"requiresSkill": "science",
-					"minSkill": 1,
+					"minSkill": 20,
+					"requiresSkill2": "robotics",
+					"minSkill2": 20,
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
@@ -51,7 +55,7 @@
 					]
 				},
 				{
-					"caption": "Do nothing",
+					"caption": "Exit",
 					"steps": []
 				}
 			]
@@ -60,12 +64,14 @@
 		"system_menu_animal": {
 			"title": "Bootloader Menu",
 			"item": "43398-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop. A {item} will be required to enable service mode for repairs. What do you want to do?",
+			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics.\n\nWhat do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
 					"requiresSkill": "science",
-					"minSkill": 1,
+					"minSkill": 30,
+					"requiresSkill2": "robotics",
+					"minSkill2": 30,
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
@@ -75,7 +81,7 @@
 					]
 				},
 				{
-					"caption": "Do nothing",
+					"caption": "Exit",
 					"steps": []
 				}
 			]
