@@ -58,7 +58,7 @@ an ordered list of `"steps"`, run in sequence when clicked:
                     "minSkill": 1,
                     "requiresItems": [ { "item": "43392-changes_otto.mod", "count": 1 } ],
                     "steps": [
-                        { "type": "take_item", "item": "43392-changes_otto.mod" },
+                        { "type": "take_item", "items": [ { "item": "43392-changes_otto.mod", "count": 1 } ] },
                         { "type": "show_text", "text": "Used AI Core" },
                         { "type": "delay", "seconds": 5 },
                         { "type": "show_text", "text": "{name} has been successfully revived!" },
@@ -83,8 +83,12 @@ Four step types:
   `"system_reset"` wipes every skill and core attribute to 1 and fast-recruits the patient into the
   player faction. A button with no steps at all (e.g. "Do nothing") just closes the box - there's no
   separate close-only step type, since closing already happens on any click before its steps run.
-- `"take_item"` — consumes one of `item` from whoever triggered the dialogue's inventory; stops the rest
-  of that button's steps if it fails.
+- `"take_item"` — consumes `"items"`, the same array of `{ "item", "count" }` (or plain-string, for
+  `count: 1`) entries as a button's `requiresItems`, from whoever triggered the dialogue's inventory.
+  Re-checks that the initiator still has enough of every entry right before consuming it (the item(s)
+  could have been dropped/traded away since the button was shown, especially if an earlier `"delay"`/
+  `"await_repair"` step held things up) - on a shortfall it tells the player "I don't have enough
+  {item}." and stops the rest of that button's steps without partially consuming anything.
 - `"show_text"` — a floating rising-text notification tracking the patient, **not** a GUI panel and not
   tied to the dialogue box (which is already closed by the time steps run). Optional `"color"`:
   `"#RRGGBB"` hex, defaults to white.

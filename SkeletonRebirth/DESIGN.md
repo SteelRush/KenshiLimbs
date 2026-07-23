@@ -428,7 +428,7 @@ and fast-recruits the patient via `PlayerInterface::recruit()`):
                     "minSkill": 1,
                     "requiresItems": [ { "item": "43392-changes_otto.mod", "count": 1 } ],
                     "steps": [
-                        { "type": "take_item", "item": "43392-changes_otto.mod" },
+                        { "type": "take_item", "items": [ { "item": "43392-changes_otto.mod", "count": 1 } ] },
                         { "type": "show_text", "text": "Used AI Core" },
                         { "type": "delay", "seconds": 5 },
                         { "type": "show_text", "text": "{name} has been successfully revived!" },
@@ -477,14 +477,14 @@ or fewer be eligible.
   constraint. A button with an empty `steps` array (e.g. "No") does nothing but close - there's no
   dedicated close-only step type, since closing already happens unconditionally on any click, before any
   step runs (see `OnMessageBoxButtonClicked()`).
-- `"take_item"` — consumes one of `item` (an FCS/GameData String ID) from the *initiator's* inventory
-  (`Inventory::takeOneItemOnly()`), stopping the rest of the sequence if it fails (no silent partial
-  effects - a robot shouldn't get "successfully revived" without the cost actually being paid). Distinct
-  from the button-level `requiresItems` gate (see below) - `requiresItems` only controls whether the
-  button is shown at all; a `take_item` step is what actually removes an item, and doesn't run until the
-  button is actually clicked. Note `take_item` still only ever consumes a single unit of one item, even
-  when `requiresItems` gates on a higher `count` - an author who wants to consume all of a required
-  stack needs one `take_item` step per unit.
+- `"take_item"` — consumes `items`, the same array-of-`{ "item", "count" }` (or plain-string, for
+  `count: 1`) shape as a button's `requiresItems` - each entry's `count` units are removed from the
+  *initiator's* inventory via repeated `Inventory::takeOneItemOnly()` calls. Distinct from the
+  button-level `requiresItems` gate (see below) - `requiresItems` only controls whether the button is
+  shown at all; a `take_item` step is what actually removes the item(s), and doesn't run until the
+  button is actually clicked, so it re-checks `Inventory::hasItem()` for every entry before consuming
+  any of them (see "Re-checking at click time" below) - no silent partial effects, a robot shouldn't get
+  "successfully revived" without the full cost actually being paid.
 - `"show_text"` — a floating rising-text notification via `ForgottenGUI::createScreenLabel()`, tracking
   the patient (`ScreenLabel::setTracking()`), **not** a GUI panel and **not** tied to the dialogue box in
   any way (the box is already closed by the time any step runs). Optional `color` is `"#RRGGBB"` hex,
@@ -559,6 +559,15 @@ from anything its steps do:
   removal, two systems that happened to compose), there's no separate native condition system here to
   lean on, so this file's own gate has to do both jobs, just via two different fields an author sets to
   the same item ID(s).
+- **Re-checking at click time**: `requiresItems` is only evaluated once, when the box is shown -
+  between then and the player actually clicking a button (an ordinary reaction-time gap, or a much
+  longer one if the button's `steps` include a `delay`/`await_repair` that suspends the sequence), the
+  initiator could drop, trade away, or otherwise lose the item(s) that made the button eligible in the
+  first place. A `take_item` step therefore re-verifies `Inventory::hasItem()` for every one of its
+  `items` entries before consuming any of them (see "take_item" above) - on a shortfall it shows the
+  player a game notification, `"I don't have enough {item}."` (the same `{item}`-name substitution as
+  everywhere else), naming whichever entry came up short, and stops the rest of that button's `steps`
+  without partially consuming the others.
 - `excludePlayerFaction` (bool) - hides the button if the *patient* (not the initiator) belongs to the
   player's faction, checked via `RootObjectBase::getFaction()`/`Faction::isThePlayer()`. Used on "Reset"
   so it's only offered for a wild/unaffiliated robot, not a recruited squad member.
@@ -845,7 +854,8 @@ see the virtual-function hooking pitfall at the top of this document.
 - `Character::_NV_getInventory() const` — Character.h:386, RVA `0x5E1760` (real vtable-offset-0 slot;
   non-virtual wrapper still used per this file's own convention even though offset 0 rarely shifts)
 - `Inventory::hasItem(GameData*, int) const` / `takeOneItemOnly(GameData*)` — Inventory.h:179/191 —
-  visibility-gate (per-entry `count`) and actually-consume-it, respectively, for `requiresItems` (§4)
+  visibility-gate/re-check (per-entry `count`) and actually-consume-it (called `count` times per entry,
+  since there's no batch-count overload), respectively, for `requiresItems`/`take_item`'s `items` (§4)
 - `GameDataManager::getData(const std::string&, itemType) const` (via `GameWorld::gamedata`) —
   GameDataManager.h:28 — resolves an FCS/GameData item String ID to a `GameData*`; SEH-guarded here
   (`getGameDataGuarded()`) since the ID is JSON-authored and unverified

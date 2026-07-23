@@ -55,7 +55,7 @@
 					"requiresItems": [ { "item": "43392-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43392-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43392-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
@@ -71,7 +71,7 @@
 					"requiresItems": [ { "item": "43398-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43398-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
@@ -98,7 +98,7 @@
 					"requiresItems": [ { "item": "43398-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43398-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }

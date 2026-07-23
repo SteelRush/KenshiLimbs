@@ -319,26 +319,26 @@ bool TryReactivate(Character* self)
 // --- JSON-driven dialogue boxes -----------------------------------------------------------------
 // Box text and button behavior are data-driven from RE_Kenshi.json's "DialogueBoxes" object - see
 // DESIGN.md §4 for the step types, nested-menu semantics, and button-gating fields below.
+struct DialogueBoxItemRequirementDef
+{
+	std::string item; // FCS/GameData item String ID
+	int count;         // how many of it are required - hidden (or, for "take_item", refused) unless initiator has at least this many
+
+	DialogueBoxItemRequirementDef() : count(1) {}
+};
+
 struct DialogueBoxStepDef
 {
 	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu" | "await_repair"
 	std::string action; // for "action" - looked up in g_dialogueActions
-	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator;
-	                    // also usable on "show_text"/"notify" purely to resolve "{item}" in text, no consuming
+	std::string item;   // for "show_text"/"notify" - resolves "{item}" in text, no consuming
+	std::vector<DialogueBoxItemRequirementDef> items; // for "take_item" - same {item, count} shape as a button's requiresItems; re-checked at click time and consumed on success
 	std::string text;   // for "show_text"/"notify" - "{name}"/"{item}" replaced with the patient's name / item's display name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
 	float seconds;       // for "delay", pauses this many seconds (wall clock); for "await_repair", timeout - see DESIGN.md §3
 	std::string menu;    // for "open_menu" - a "DialogueBoxes" key to open, e.g. a submenu or "back" target
 
 	DialogueBoxStepDef() : seconds(0.0f) {}
-};
-
-struct DialogueBoxItemRequirementDef
-{
-	std::string item; // FCS/GameData item String ID
-	int count;         // how many of it are required - hidden unless initiator has at least this many
-
-	DialogueBoxItemRequirementDef() : count(1) {}
 };
 
 struct DialogueBoxButtonDef
@@ -865,11 +865,34 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 		if (step.type == "take_item")
 		{
 			Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-			GameData* itemData = inv ? getGameDataGuarded(step.item, ITEM) : nullptr;
-			if (!inv || !itemData || !inv->takeOneItemOnly(itemData))
+
+			// Defensive re-check - "requiresItems" only gated the button when the box was first shown;
+			// the initiator could have dropped/traded/consumed an item in the gap since then, including
+			// during an earlier "delay"/"await_repair" suspension. Verify every requirement before
+			// consuming any of them, so a shortfall on a later item doesn't leave an earlier one already
+			// spent.
+			const DialogueBoxItemRequirementDef* missing = nullptr;
+			for (size_t itemIdx = 0; itemIdx < step.items.size() && !missing; ++itemIdx)
 			{
-				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + step.item + "\") failed for " + patient->getName() + " - stopping the rest of this sequence");
+				const DialogueBoxItemRequirementDef& req = step.items[itemIdx];
+				GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+				if (!inv || !itemData || !inv->hasItem(itemData, req.count))
+					missing = &req;
+			}
+
+			if (missing)
+			{
+				showGameNotification(patient, "I don't have enough {item}.", missing->item);
+				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string(missing->count) + ") failed for " + patient->getName() + " - stopping the rest of this sequence");
 				return;
+			}
+
+			for (size_t itemIdx = 0; itemIdx < step.items.size(); ++itemIdx)
+			{
+				const DialogueBoxItemRequirementDef& req = step.items[itemIdx];
+				GameData* itemData = getGameDataGuarded(req.item, ITEM);
+				for (int n = 0; n < req.count; ++n)
+					inv->takeOneItemOnly(itemData);
 			}
 			continue;
 		}
@@ -1193,6 +1216,30 @@ static void loadDebugSettingFromJson()
 		g_debugLoggingEnabled = doc["Debug"].GetBool();
 }
 
+// Shared by a button's "requiresItems" and a "take_item" step's "items" - both are arrays of either
+// plain item-id strings (shorthand for count 1) or { "item", "count" } objects.
+static void parseItemRequirements(const rapidjson::Value& arr, const std::string& dialogueBoxName, const std::string& buttonCaption, const char* fieldName, std::vector<DialogueBoxItemRequirementDef>& out)
+{
+	for (auto rit = arr.Begin(); rit != arr.End(); ++rit)
+	{
+		DialogueBoxItemRequirementDef req;
+		if (rit->IsString())
+			req.item = rit->GetString();
+		else if (rit->IsObject())
+		{
+			if (rit->HasMember("item") && (*rit)["item"].IsString())
+				req.item = (*rit)["item"].GetString();
+			if (rit->HasMember("count") && (*rit)["count"].IsNumber())
+				req.count = (*rit)["count"].GetInt();
+		}
+
+		if (!req.item.empty())
+			out.push_back(req);
+		else
+			ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueBoxName + "\" button \"" + buttonCaption + "\" has a \"" + fieldName + "\" entry with no \"item\" - skipped");
+	}
+}
+
 static void loadDialogueBoxesFromJson()
 {
 	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
@@ -1239,26 +1286,7 @@ static void loadDialogueBoxesFromJson()
 				DialogueBoxButtonDef btn;
 				btn.caption = (bit->HasMember("caption") && (*bit)["caption"].IsString()) ? (*bit)["caption"].GetString() : "";
 				if (bit->HasMember("requiresItems") && (*bit)["requiresItems"].IsArray())
-				{
-					for (auto rit = (*bit)["requiresItems"].Begin(); rit != (*bit)["requiresItems"].End(); ++rit)
-					{
-						DialogueBoxItemRequirementDef req;
-						if (rit->IsString()) // shorthand for { "item": "...", "count": 1 }
-							req.item = rit->GetString();
-						else if (rit->IsObject())
-						{
-							if (rit->HasMember("item") && (*rit)["item"].IsString())
-								req.item = (*rit)["item"].GetString();
-							if (rit->HasMember("count") && (*rit)["count"].IsNumber())
-								req.count = (*rit)["count"].GetInt();
-						}
-
-						if (!req.item.empty())
-							btn.requiresItems.push_back(req);
-						else
-							ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has a \"requiresItems\" entry with no \"item\" - skipped");
-					}
-				}
+					parseItemRequirements((*bit)["requiresItems"], it->name.GetString(), btn.caption, "requiresItems", btn.requiresItems);
 				if (bit->HasMember("requiresSkill") && (*bit)["requiresSkill"].IsString())
 				{
 					btn.requiresSkill = (*bit)["requiresSkill"].GetString();
@@ -1325,6 +1353,8 @@ static void loadDialogueBoxesFromJson()
 							step.action = (*sit)["action"].GetString();
 						if (sit->HasMember("item") && (*sit)["item"].IsString())
 							step.item = (*sit)["item"].GetString();
+						if (sit->HasMember("items") && (*sit)["items"].IsArray())
+							parseItemRequirements((*sit)["items"], it->name.GetString(), btn.caption, "items", step.items);
 						if (sit->HasMember("text") && (*sit)["text"].IsString())
 							step.text = (*sit)["text"].GetString();
 						if (sit->HasMember("color") && (*sit)["color"].IsString())
@@ -1333,6 +1363,8 @@ static void loadDialogueBoxesFromJson()
 							step.seconds = (*sit)["seconds"].GetFloat();
 						if (sit->HasMember("menu") && (*sit)["menu"].IsString())
 							step.menu = (*sit)["menu"].GetString();
+						if (step.type == "take_item" && step.items.empty())
+							ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has a \"take_item\" step with no \"items\" - it will do nothing");
 						btn.steps.push_back(step);
 					}
 				}
