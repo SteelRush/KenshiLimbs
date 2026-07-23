@@ -23,8 +23,8 @@ Deactivated state. It goes fully inert on its own — no babysitting required �
 is permanent until you decide it is.
 [*] [b]A real status, not just "Dead."[/b] Vanilla has no in-between — a dying robot just reads
 "Dead," same as any human, full stop. This mod gives Deactivated robots their own status
-instead: [b]AI FAILURE[/b] for a headless-capable humanoid unit that needs a new AI Core, or
-[b]POWER FAILURE[/b] for a headless or animal-type unit that needs a Power Core.
+instead: [b]AI FAILURE[/b] for a humanoid unit with a head, needing a new AI Core, or
+[b]POWER FAILURE[/b] for a headless unit or any animal-type robot, needing a Power Core instead.
 [*] [b]Field reactivation.[/b] Get a Deactivated robot into a Skeleton Repair Bed, or use a
 robot-repair item on it directly, and you'll be prompted with a Bootloader Menu. Bring the right
 core item and someone competent in Science and Robotics, and you can attempt Diagnostics.
