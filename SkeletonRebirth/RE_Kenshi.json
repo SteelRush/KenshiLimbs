@@ -52,10 +52,10 @@
 					"minSkill": 40,
 					"requiresSkill2": "robotics",
 					"minSkill2": 40,
-					"requiresItem": "43392-changes_otto.mod",
+					"requiresItems": [ { "item": "43392-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43392-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43392-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
@@ -68,10 +68,10 @@
 					"minSkill": 20,
 					"requiresSkill2": "robotics",
 					"minSkill2": 20,
-					"requiresItem": "43398-changes_otto.mod",
+					"requiresItems": [ { "item": "43398-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43398-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
@@ -95,10 +95,10 @@
 					"minSkill": 30,
 					"requiresSkill2": "robotics",
 					"minSkill2": 30,
-					"requiresItem": "43398-changes_otto.mod",
+					"requiresItems": [ { "item": "43398-changes_otto.mod" } ],
 					"steps": [
 						{ "type": "await_repair", "seconds": 45 },
-						{ "type": "take_item", "item": "43398-changes_otto.mod" },
+						{ "type": "take_item", "items": [ { "item": "43398-changes_otto.mod" } ] },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }

@@ -56,9 +56,9 @@ an ordered list of `"steps"`, run in sequence when clicked:
                     "caption": "Repair",
                     "requiresSkill": "science",
                     "minSkill": 1,
-                    "requiresItem": "43392-changes_otto.mod",
+                    "requiresItems": [ { "item": "43392-changes_otto.mod", "count": 1 } ],
                     "steps": [
-                        { "type": "take_item", "item": "43392-changes_otto.mod" },
+                        { "type": "take_item", "items": [ { "item": "43392-changes_otto.mod", "count": 1 } ] },
                         { "type": "show_text", "text": "Used AI Core" },
                         { "type": "delay", "seconds": 5 },
                         { "type": "show_text", "text": "{name} has been successfully revived!" },
@@ -83,19 +83,26 @@ Four step types:
   `"system_reset"` wipes every skill and core attribute to 1 and fast-recruits the patient into the
   player faction. A button with no steps at all (e.g. "Do nothing") just closes the box - there's no
   separate close-only step type, since closing already happens on any click before its steps run.
-- `"take_item"` — consumes one of `item` from whoever triggered the dialogue's inventory; stops the rest
-  of that button's steps if it fails.
+- `"take_item"` — consumes `"items"`, the same array of `{ "item", "count" }` (or plain-string, for
+  `count: 1`) entries as a button's `requiresItems`, from whoever triggered the dialogue's inventory.
+  Re-checks that the initiator still has enough of every entry right before consuming it (the item(s)
+  could have been dropped/traded away since the button was shown, especially if an earlier `"delay"`/
+  `"await_repair"` step held things up) - on a shortfall it tells the player "I don't have enough
+  {item}." and stops the rest of that button's steps without partially consuming anything.
 - `"show_text"` — a floating rising-text notification tracking the patient, **not** a GUI panel and not
   tied to the dialogue box (which is already closed by the time steps run). Optional `"color"`:
   `"#RRGGBB"` hex, defaults to white.
 - `"delay"` — pauses the *remaining* steps for `seconds`, then resumes them automatically. The box itself
   doesn't wait - it's already closed.
 
-Separately, `requiresItem` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `CharStats` skill name,
+Separately, `requiresItems` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `CharStats` skill name,
 0-100 scale) on a button gate whether it's even *shown* - checked once, against whoever triggered the
-dialogue, before the box appears. This is deliberately independent of a `take_item` step actually
-consuming the same item - one controls visibility, the other controls what happens on click - so a
-button that both requires and consumes an item lists that item ID in both places.
+dialogue, before the box appears. `requiresItems` is an array, so a button can require several distinct
+items at once, each with its own `"count"` (defaults to 1 if omitted, or when an entry is given as a
+plain string instead of an object) - the button only shows if the initiator has at least that many of
+every listed item. This is deliberately independent of a `take_item` step actually consuming an item -
+one controls visibility, the other controls what happens on click - so a button that both requires and
+consumes an item lists that item ID in both places.
 
 `excludePlayerFaction: true` hides a button if the *patient* (not the initiator) belongs to the
 player's faction - used on "Reset" so a recruited squad member can't have their skills wiped and be

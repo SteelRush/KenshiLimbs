@@ -319,12 +319,20 @@ bool TryReactivate(Character* self)
 // --- JSON-driven dialogue boxes -----------------------------------------------------------------
 // Box text and button behavior are data-driven from RE_Kenshi.json's "DialogueBoxes" object - see
 // DESIGN.md §4 for the step types, nested-menu semantics, and button-gating fields below.
+struct DialogueBoxItemRequirementDef
+{
+	std::string item; // FCS/GameData item String ID
+	int count;         // how many of it are required - hidden (or, for "take_item", refused) unless initiator has at least this many
+
+	DialogueBoxItemRequirementDef() : count(1) {}
+};
+
 struct DialogueBoxStepDef
 {
 	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu" | "await_repair"
 	std::string action; // for "action" - looked up in g_dialogueActions
-	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator;
-	                    // also usable on "show_text"/"notify" purely to resolve "{item}" in text, no consuming
+	std::string item;   // for "show_text"/"notify" - resolves "{item}" in text, no consuming
+	std::vector<DialogueBoxItemRequirementDef> items; // for "take_item" - same {item, count} shape as a button's requiresItems; re-checked at click time and consumed on success
 	std::string text;   // for "show_text"/"notify" - "{name}"/"{item}" replaced with the patient's name / item's display name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
 	float seconds;       // for "delay", pauses this many seconds (wall clock); for "await_repair", timeout - see DESIGN.md §3
@@ -337,7 +345,7 @@ struct DialogueBoxButtonDef
 {
 	std::string caption; // ~10 character limit before clipping - see DESIGN.md §3
 	std::vector<DialogueBoxStepDef> steps; // run in order when clicked - see dispatchDialogueSteps()
-	std::string requiresItem;  // FCS/GameData item String ID - hidden unless initiator has one
+	std::vector<DialogueBoxItemRequirementDef> requiresItems; // hidden unless initiator has every one, at its required count
 	std::string requiresSkill; // lowercase CharStats field name (see g_skillFields) - hidden unless initiator's skill is in range
 	bool hasMinSkill;
 	float minSkill;
@@ -689,11 +697,12 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 	if (!btn.requiresSkill2.empty() && !squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2))
 		return false;
 
-	if (!btn.requiresItem.empty())
+	for (size_t i = 0; i < btn.requiresItems.size(); ++i)
 	{
+		const DialogueBoxItemRequirementDef& req = btn.requiresItems[i];
 		Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-		GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
-		if (!inv || !itemData || !inv->hasItem(itemData, 1))
+		GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+		if (!inv || !itemData || !inv->hasItem(itemData, req.count))
 			return false;
 	}
 
@@ -856,11 +865,38 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 		if (step.type == "take_item")
 		{
 			Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-			GameData* itemData = inv ? getGameDataGuarded(step.item, ITEM) : nullptr;
-			if (!inv || !itemData || !inv->takeOneItemOnly(itemData))
+
+			// Defensive re-check - "requiresItems" only gated the button when the box was first shown;
+			// the initiator could have dropped/traded/consumed an item in the gap since then, including
+			// during an earlier "delay"/"await_repair" suspension. Verify every requirement before
+			// consuming any of them, so a shortfall on a later item doesn't leave an earlier one already
+			// spent.
+			const DialogueBoxItemRequirementDef* missing = nullptr;
+			for (size_t itemIdx = 0; itemIdx < step.items.size() && !missing; ++itemIdx)
 			{
-				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + step.item + "\") failed for " + patient->getName() + " - stopping the rest of this sequence");
+				const DialogueBoxItemRequirementDef& req = step.items[itemIdx];
+				GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+				if (!inv || !itemData || !inv->hasItem(itemData, req.count))
+					missing = &req;
+			}
+
+			if (missing)
+			{
+				// Not an error - the initiator simply doesn't have enough of this item anymore (could
+				// have dropped/traded it away since the button was shown). Player-facing notification
+				// above already communicates this; verboseLog() here is dev-facing and debug-gated,
+				// not ErrorLog(), since nothing about the config or the JSON is actually wrong.
+				showGameNotification(patient, "I don't have enough {item}.", missing->item);
+				verboseLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string(missing->count) + ") short for " + patient->getName() + " - stopping the rest of this sequence");
 				return;
+			}
+
+			for (size_t itemIdx = 0; itemIdx < step.items.size(); ++itemIdx)
+			{
+				const DialogueBoxItemRequirementDef& req = step.items[itemIdx];
+				GameData* itemData = getGameDataGuarded(req.item, ITEM);
+				for (int n = 0; n < req.count; ++n)
+					inv->takeOneItemOnly(itemData);
 			}
 			continue;
 		}
@@ -960,7 +996,7 @@ static void OnMessageBoxButtonClicked(int buttonId)
 	dispatchDialogueSteps(patient, initiator, specialist1, specialist2, btn.steps, 0);
 }
 
-// `initiator` is who "requiresItem"/"requiresSkill"/"take_item" are checked against - null is fine
+// `initiator` is who "requiresItems"/"requiresSkill"/"take_item" are checked against - null is fine
 // for a dialogue with no gated buttons or item steps.
 static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator)
 {
@@ -1017,14 +1053,16 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 				   << " squadSatisfies2=" << squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
 			}
 
-			if (!btn.requiresItem.empty())
+			for (size_t reqIdx = 0; reqIdx < btn.requiresItems.size(); ++reqIdx)
 			{
+				const DialogueBoxItemRequirementDef& req = btn.requiresItems[reqIdx];
 				Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-				GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
-				ss << " requiresItem=\"" << btn.requiresItem << "\" initiatorInvNull=" << (inv == nullptr)
+				GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+				ss << " requiresItems[" << reqIdx << "]=\"" << req.item << "\" count=" << req.count
+				   << " initiatorInvNull=" << (inv == nullptr)
 				   << " itemDataResolved=" << (itemData != nullptr)
 				   << " itemDataName=\"" << (itemData ? itemData->name : "") << "\""
-				   << " hasItem=" << (inv && itemData ? inv->hasItem(itemData, 1) : false);
+				   << " hasItem=" << (inv && itemData ? inv->hasItem(itemData, req.count) : false);
 			}
 
 			verboseLog(ss.str());
@@ -1040,6 +1078,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 
 	// Resolved via isDialogueButtonForPatient(), not eligibleButtons - see DESIGN.md §4.
 	std::string effectiveItem = def.item;
+	int effectiveItemCount = 1;
 	bool foundItem = false;
 	std::string skillCharacterName;
 	bool foundSkill = false;
@@ -1051,9 +1090,10 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		if (!isDialogueButtonForPatient(btn, patient))
 			continue;
 
-		if (!foundItem && !btn.requiresItem.empty())
+		if (!foundItem && !btn.requiresItems.empty())
 		{
-			effectiveItem = btn.requiresItem;
+			effectiveItem = btn.requiresItems[0].item;
+			effectiveItemCount = btn.requiresItems[0].count;
 			foundItem = true;
 		}
 
@@ -1076,7 +1116,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 
 	Inventory* initiatorInv = initiator ? initiator->getInventory() : nullptr;
 	GameData* effectiveItemData = effectiveItem.empty() ? nullptr : getGameDataGuarded(effectiveItem, ITEM);
-	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, 1);
+	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, effectiveItemCount);
 
 	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, hasItem, skillCharacterName, skillCharacterName2, "dialogue box \"" + dialogueId + "\"");
 
@@ -1180,6 +1220,30 @@ static void loadDebugSettingFromJson()
 		g_debugLoggingEnabled = doc["Debug"].GetBool();
 }
 
+// Shared by a button's "requiresItems" and a "take_item" step's "items" - both are arrays of either
+// plain item-id strings (shorthand for count 1) or { "item", "count" } objects.
+static void parseItemRequirements(const rapidjson::Value& arr, const std::string& dialogueBoxName, const std::string& buttonCaption, const char* fieldName, std::vector<DialogueBoxItemRequirementDef>& out)
+{
+	for (auto rit = arr.Begin(); rit != arr.End(); ++rit)
+	{
+		DialogueBoxItemRequirementDef req;
+		if (rit->IsString())
+			req.item = rit->GetString();
+		else if (rit->IsObject())
+		{
+			if (rit->HasMember("item") && (*rit)["item"].IsString())
+				req.item = (*rit)["item"].GetString();
+			if (rit->HasMember("count") && (*rit)["count"].IsNumber())
+				req.count = (*rit)["count"].GetInt();
+		}
+
+		if (!req.item.empty())
+			out.push_back(req);
+		else
+			ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueBoxName + "\" button \"" + buttonCaption + "\" has a \"" + fieldName + "\" entry with no \"item\" - skipped");
+	}
+}
+
 static void loadDialogueBoxesFromJson()
 {
 	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
@@ -1225,8 +1289,8 @@ static void loadDialogueBoxesFromJson()
 
 				DialogueBoxButtonDef btn;
 				btn.caption = (bit->HasMember("caption") && (*bit)["caption"].IsString()) ? (*bit)["caption"].GetString() : "";
-				if (bit->HasMember("requiresItem") && (*bit)["requiresItem"].IsString())
-					btn.requiresItem = (*bit)["requiresItem"].GetString();
+				if (bit->HasMember("requiresItems") && (*bit)["requiresItems"].IsArray())
+					parseItemRequirements((*bit)["requiresItems"], it->name.GetString(), btn.caption, "requiresItems", btn.requiresItems);
 				if (bit->HasMember("requiresSkill") && (*bit)["requiresSkill"].IsString())
 				{
 					btn.requiresSkill = (*bit)["requiresSkill"].GetString();
@@ -1293,6 +1357,8 @@ static void loadDialogueBoxesFromJson()
 							step.action = (*sit)["action"].GetString();
 						if (sit->HasMember("item") && (*sit)["item"].IsString())
 							step.item = (*sit)["item"].GetString();
+						if (sit->HasMember("items") && (*sit)["items"].IsArray())
+							parseItemRequirements((*sit)["items"], it->name.GetString(), btn.caption, "items", step.items);
 						if (sit->HasMember("text") && (*sit)["text"].IsString())
 							step.text = (*sit)["text"].GetString();
 						if (sit->HasMember("color") && (*sit)["color"].IsString())
@@ -1301,6 +1367,8 @@ static void loadDialogueBoxesFromJson()
 							step.seconds = (*sit)["seconds"].GetFloat();
 						if (sit->HasMember("menu") && (*sit)["menu"].IsString())
 							step.menu = (*sit)["menu"].GetString();
+						if (step.type == "take_item" && step.items.empty())
+							ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has a \"take_item\" step with no \"items\" - it will do nothing");
 						btn.steps.push_back(step);
 					}
 				}
