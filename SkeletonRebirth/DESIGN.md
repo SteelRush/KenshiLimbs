@@ -186,10 +186,12 @@ version that only rewrote the row when it detected the literal word "dead": that
 `dead=true` (see §1's history) so the native corpse-only text-setting call would actually fire; now that
 `dead` stays false, that specific corpse-only call never fires at all, and whatever text *would* show for
 a character frozen at fatal health while still alive needed to be overridden regardless of what it says.
-Confirmed live: vanilla's real text here is `"Rebooting"` for robots (organic races reportedly show
-`"Recovery coma"`), colour-tagged `#59231a` - the same dark red vanilla uses for its own "Dead" text
-elsewhere, reused here for the override's colour too, on a plain `"POWER FAILURE"` / `"AI FAILURE"`
-string. Which one is picked mirrors which core the FCS system-menu buttons require (RE_Kenshi.json's
+Vanilla has no equivalent state to fall back on here at all - a character reaching fatal health
+normally becomes `dead=true` within the same frame and this row just reads `"Dead"`, identical to
+any non-robot character, with no in-between and nothing ambiguous about it. The override reuses
+`#59231a` - the same dark red vanilla uses for its own "Dead" text elsewhere - on a plain
+`"POWER FAILURE"` / `"AI FAILURE"` string. Which one is picked mirrors which core the FCS
+system-menu buttons require (RE_Kenshi.json's
 `system_menu`/`system_menu_animal`, gated by `requiresRace`/`excludeRace`/animal trigger state - see
 "FCS item requirements" below): `isHumanoidState()` (i.e. not `isAnimalCharacterType()`) combined with
 `hasHeadPart()` (a direct `MedicalSystem::getPart(PART_HEAD, SIDE_NEITHER)` lookup, not a race-name
