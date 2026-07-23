@@ -1,0 +1,63 @@
+Steam Workshop description for **Skeleton Rebirth**, formatted in Steam's BBCode. Paste the block
+below into the Workshop item's description field as-is.
+
+---
+
+[h1]Skeleton Rebirth[/h1]
+
+[b]Your robots don't have to die for good.[/b]
+
+Vanilla Kenshi treats every knocked-out robot the same as a dead human — one bad fight and a
+Skeleton, Iron Spider, Soldierbot Guard, or Security Spider you spent hours training is just gone.
+This mod fixes that. Robots that hit zero health now [b]Deactivate[/b] instead of dying — a real,
+reversible shutdown — and can be brought back online if you get to them in time.
+
+[h2]What it does[/h2]
+
+[list]
+[*] [b]Robots go dark, not dead.[/b] A robot that would normally die instead collapses into a
+Deactivated state. It goes fully inert on its own — no babysitting required — but nothing about it
+is permanent until you decide it is.
+[*] [b]Accurate status readouts.[/b] Vanilla's data panel shows a Deactivated robot as "Rebooting,"
+which is a lie — it's not coming back on its own. This mod shows the truth: [b]AI FAILURE[/b] for
+a headless-capable humanoid unit that needs a new AI Core, or [b]POWER FAILURE[/b] for a headless
+or animal-type unit that needs a Power Core.
+[*] [b]Field reactivation.[/b] Get a Deactivated robot into a Skeleton Repair Bed, or use a
+robot-repair item on it directly, and you'll be prompted with a Bootloader Menu. Bring the right
+core item and someone competent in Science and Robotics, and you can attempt Diagnostics.
+[*] [b]Real stakes, real choices.[/b] Once you're in Service Mode you can [b]Reactivate[/b] the
+unit as-is, or wipe it to factory defaults with a full [b]Reset[/b] — every skill and core stat
+back to 1, folded straight into your squad. That includes robots you didn't build: a wild or
+hostile robot you managed to disable and drag home can be reset and recruited, not just looted.
+[*] [b]Robotic limb race restrictions actually work now.[/b] Skeleton Rebirth also fixes a
+long-standing vanilla bug where FCS's race restrictions on robotic limb items were silently
+ignored — a limb flagged as restricted to (or excluded from) certain races could be equipped by
+anyone, no matter what FCS said. This mod makes that restriction real, including in multi-character
+trade/medical screens.
+[*] [b]Survives save/reload.[/b] Which robots are Deactivated is tracked and restored automatically
+- nothing to configure.
+[/list]
+
+[h2]Why[/h2]
+
+Losing a fully-trained robot squadmate to one unlucky fight always felt wrong for a race that's
+explicitly built out of replaceable, repairable parts. Skeleton Rebirth turns "robot hits zero HP"
+from an instant, silent loss into an actual moment — scavenge the right core, find someone who
+knows old-world science and robotics, and decide whether that unit is worth saving or worth
+stripping for a fresh start.
+
+[h2]Requirements[/h2]
+
+Requires the [b]RE_Kenshi[/b] modding framework to load this mod's plugin DLL. Enable both in
+Kenshi's Mods tab.
+
+[h2]Compatibility notes[/h2]
+
+[list]
+[*] Doesn't touch human/non-robot death in any way — this only changes what happens to
+robot-race characters.
+[*] If a robotic limb has no race restriction set in FCS to begin with, the limb-lock fix has no
+visible effect on it.
+[*] Debug logging is off by default and only affects a local log file — it has no gameplay impact
+either way.
+[/list]
