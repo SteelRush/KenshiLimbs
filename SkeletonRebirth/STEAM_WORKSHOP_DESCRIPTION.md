@@ -18,10 +18,10 @@ reversible shutdown — and can be brought back online if you get to them in tim
 [*] [b]Robots go dark, not dead.[/b] A robot that would normally die instead collapses into a
 Deactivated state. It goes fully inert on its own — no babysitting required — but nothing about it
 is permanent until you decide it is.
-[*] [b]Accurate status readouts.[/b] Vanilla's data panel shows a Deactivated robot as "Rebooting,"
-which is a lie — it's not coming back on its own. This mod shows the truth: [b]AI FAILURE[/b] for
-a headless-capable humanoid unit that needs a new AI Core, or [b]POWER FAILURE[/b] for a headless
-or animal-type unit that needs a Power Core.
+[*] [b]A real status, not just "Dead."[/b] Vanilla has no in-between — a robot at zero health just
+reads "Dead," same as any human, full stop. This mod gives Deactivated robots their own status
+instead: [b]AI FAILURE[/b] for a headless-capable humanoid unit that needs a new AI Core, or
+[b]POWER FAILURE[/b] for a headless or animal-type unit that needs a Power Core.
 [*] [b]Field reactivation.[/b] Get a Deactivated robot into a Skeleton Repair Bed, or use a
 robot-repair item on it directly, and you'll be prompted with a Bootloader Menu. Bring the right
 core item and someone competent in Science and Robotics, and you can attempt Diagnostics.
