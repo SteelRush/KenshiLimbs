@@ -882,8 +882,12 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 
 			if (missing)
 			{
+				// Not an error - the initiator simply doesn't have enough of this item anymore (could
+				// have dropped/traded it away since the button was shown). Player-facing notification
+				// above already communicates this; verboseLog() here is dev-facing and debug-gated,
+				// not ErrorLog(), since nothing about the config or the JSON is actually wrong.
 				showGameNotification(patient, "I don't have enough {item}.", missing->item);
-				ErrorLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string(missing->count) + ") failed for " + patient->getName() + " - stopping the rest of this sequence");
+				verboseLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string(missing->count) + ") short for " + patient->getName() + " - stopping the rest of this sequence");
 				return;
 			}
 
