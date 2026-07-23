@@ -400,7 +400,7 @@ Requested explicitly: dialogue box *content and button behavior* shouldn't be ha
 old, removed `ConversationOverrides`/`DialogueSkillChecks` system nested its own config in that same
 file) defines each dialogue box's title, message, and per-button gating + behavior; a generic
 `showDialogueBox(dialogueId, patient, initiator)` loads the entry and wires it up, instead of a
-dedicated `Show*`/`On*Clicked` function pair per dialogue. `initiator` (who `requiresSkill`/`requiresItem`/
+dedicated `Show*`/`On*Clicked` function pair per dialogue. `initiator` (who `requiresSkill`/`requiresItems`/
 `take_item` check against) is `PlayerInterface::selectedCharacter` - not `getAnyPlayerCharacter()`, which
 returns an arbitrary squad member unrelated to who's actually carrying the required item. Safe to use here
 specifically because the initiator is always the player's own humanoid character, unlike the patient - see
@@ -426,7 +426,7 @@ and fast-recruits the patient via `PlayerInterface::recruit()`):
                     "caption": "Repair",
                     "requiresSkill": "science",
                     "minSkill": 1,
-                    "requiresItem": "43392-changes_otto.mod",
+                    "requiresItems": [ { "item": "43392-changes_otto.mod", "count": 1 } ],
                     "steps": [
                         { "type": "take_item", "item": "43392-changes_otto.mod" },
                         { "type": "show_text", "text": "Used AI Core" },
@@ -453,8 +453,9 @@ the squad member `findSquadMemberWithSkill()` found for the first patient-applic
 `isDialogueButtonForPatient()`, not `eligibleButtons`) `requiresSkill`/`requiresSkill2` - see
 "Button-level gating" below - falling back to "No one" if nobody currently qualifies, since that's an
 expected outcome, not a data error. `{itemStatus}` (same scope as the two above) reads
-`initiator->getInventory()->hasItem()` against the same patient-applicable button's `requiresItem` and
-resolves to "You have one."/"You don't have one yet." - added so the message explains *why* a button
+`initiator->getInventory()->hasItem()` against the same patient-applicable button's first
+`requiresItems` entry (and that entry's own `count`) and resolves to "You have one."/"You don't have
+one yet." - added so the message explains *why* a button
 like "Diagnostics" might be missing (missing item vs. nobody in the squad qualifying) instead of the
 player having to guess. Up to 3 buttons per entry
 (`Kenshi_MessageBox.layout` has exactly `ButtonA`/`ButtonB`/`ButtonC`) - see the button-gating/
@@ -479,9 +480,11 @@ or fewer be eligible.
 - `"take_item"` — consumes one of `item` (an FCS/GameData String ID) from the *initiator's* inventory
   (`Inventory::takeOneItemOnly()`), stopping the rest of the sequence if it fails (no silent partial
   effects - a robot shouldn't get "successfully revived" without the cost actually being paid). Distinct
-  from the button-level `requiresItem` gate (see below) - `requiresItem` only controls whether the button
-  is shown at all; a `take_item` step is what actually removes it, and doesn't run until the button is
-  actually clicked.
+  from the button-level `requiresItems` gate (see below) - `requiresItems` only controls whether the
+  button is shown at all; a `take_item` step is what actually removes an item, and doesn't run until the
+  button is actually clicked. Note `take_item` still only ever consumes a single unit of one item, even
+  when `requiresItems` gates on a higher `count` - an author who wants to consume all of a required
+  stack needs one `take_item` step per unit.
 - `"show_text"` — a floating rising-text notification via `ForgottenGUI::createScreenLabel()`, tracking
   the patient (`ScreenLabel::setTracking()`), **not** a GUI panel and **not** tied to the dialogue box in
   any way (the box is already closed by the time any step runs). Optional `color` is `"#RRGGBB"` hex,
@@ -527,7 +530,7 @@ Raised to 5000ms - long enough to behave like the editor-close wait timing-wise 
 doesn't visibly open, on the theory that whatever `recruit()` does internally needs real wall-clock time to
 settle, not just a different call stack.
 
-**Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItem`, `excludePlayerFaction`)
+**Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItems`, `excludePlayerFaction`)
 controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
 from anything its steps do:
 - `requiresSkill`/`requiresSkill2` (independent, lowercase `CharStats` field names - see `g_skillFields`,
@@ -547,13 +550,15 @@ from anything its steps do:
   already standing there could have done. An unrecognized skill name is logged once at JSON-load time
   and then treated as "no skill requirement" every time the button would otherwise show, rather than
   hiding it - a typo shouldn't silently make a button impossible to see and impossible to know why.
-- `requiresItem` (an FCS/GameData item String ID, looked up via `GameDataManager::getData(id, ITEM)`) -
-  the button only shows if `initiator`'s `Inventory::hasItem()` finds at least one. This is deliberately
-  separate from a `take_item` *step* consuming the same item ID - unlike the old system (where FCS's own
+- `requiresItems` (an array of `{ "item": <FCS/GameData item String ID>, "count": <int, defaults to 1> }`
+  objects, or plain strings as shorthand for `count: 1`, looked up via `GameDataManager::getData(id,
+  ITEM)`) - the button only shows if `initiator`'s `Inventory::hasItem()` finds at least `count` of
+  *every* entry (an empty or absent array means no item requirement at all). This is deliberately
+  separate from a `take_item` *step* consuming an item ID - unlike the old system (where FCS's own
   native `hasItem` dialogue condition handled visibility and the `take_item` override only ever handled
   removal, two systems that happened to compose), there's no separate native condition system here to
   lean on, so this file's own gate has to do both jobs, just via two different fields an author sets to
-  the same item ID.
+  the same item ID(s).
 - `excludePlayerFaction` (bool) - hides the button if the *patient* (not the initiator) belongs to the
   player's faction, checked via `RootObjectBase::getFaction()`/`Faction::isThePlayer()`. Used on "Reset"
   so it's only offered for a wild/unaffiliated robot, not a recruited squad member.
@@ -840,7 +845,7 @@ see the virtual-function hooking pitfall at the top of this document.
 - `Character::_NV_getInventory() const` — Character.h:386, RVA `0x5E1760` (real vtable-offset-0 slot;
   non-virtual wrapper still used per this file's own convention even though offset 0 rarely shifts)
 - `Inventory::hasItem(GameData*, int) const` / `takeOneItemOnly(GameData*)` — Inventory.h:179/191 —
-  visibility-gate and actually-consume-it, respectively, for `requiresItem` (§4)
+  visibility-gate (per-entry `count`) and actually-consume-it, respectively, for `requiresItems` (§4)
 - `GameDataManager::getData(const std::string&, itemType) const` (via `GameWorld::gamedata`) —
   GameDataManager.h:28 — resolves an FCS/GameData item String ID to a `GameData*`; SEH-guarded here
   (`getGameDataGuarded()`) since the ID is JSON-authored and unverified

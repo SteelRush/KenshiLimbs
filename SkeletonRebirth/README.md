@@ -56,7 +56,7 @@ an ordered list of `"steps"`, run in sequence when clicked:
                     "caption": "Repair",
                     "requiresSkill": "science",
                     "minSkill": 1,
-                    "requiresItem": "43392-changes_otto.mod",
+                    "requiresItems": [ { "item": "43392-changes_otto.mod", "count": 1 } ],
                     "steps": [
                         { "type": "take_item", "item": "43392-changes_otto.mod" },
                         { "type": "show_text", "text": "Used AI Core" },
@@ -91,11 +91,14 @@ Four step types:
 - `"delay"` — pauses the *remaining* steps for `seconds`, then resumes them automatically. The box itself
   doesn't wait - it's already closed.
 
-Separately, `requiresItem` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `CharStats` skill name,
+Separately, `requiresItems` and/or `requiresSkill` + `minSkill`/`maxSkill` (a `CharStats` skill name,
 0-100 scale) on a button gate whether it's even *shown* - checked once, against whoever triggered the
-dialogue, before the box appears. This is deliberately independent of a `take_item` step actually
-consuming the same item - one controls visibility, the other controls what happens on click - so a
-button that both requires and consumes an item lists that item ID in both places.
+dialogue, before the box appears. `requiresItems` is an array, so a button can require several distinct
+items at once, each with its own `"count"` (defaults to 1 if omitted, or when an entry is given as a
+plain string instead of an object) - the button only shows if the initiator has at least that many of
+every listed item. This is deliberately independent of a `take_item` step actually consuming an item -
+one controls visibility, the other controls what happens on click - so a button that both requires and
+consumes an item lists that item ID in both places.
 
 `excludePlayerFaction: true` hides a button if the *patient* (not the initiator) belongs to the
 player's faction - used on "Reset" so a recruited squad member can't have their skills wiped and be

@@ -333,11 +333,19 @@ struct DialogueBoxStepDef
 	DialogueBoxStepDef() : seconds(0.0f) {}
 };
 
+struct DialogueBoxItemRequirementDef
+{
+	std::string item; // FCS/GameData item String ID
+	int count;         // how many of it are required - hidden unless initiator has at least this many
+
+	DialogueBoxItemRequirementDef() : count(1) {}
+};
+
 struct DialogueBoxButtonDef
 {
 	std::string caption; // ~10 character limit before clipping - see DESIGN.md §3
 	std::vector<DialogueBoxStepDef> steps; // run in order when clicked - see dispatchDialogueSteps()
-	std::string requiresItem;  // FCS/GameData item String ID - hidden unless initiator has one
+	std::vector<DialogueBoxItemRequirementDef> requiresItems; // hidden unless initiator has every one, at its required count
 	std::string requiresSkill; // lowercase CharStats field name (see g_skillFields) - hidden unless initiator's skill is in range
 	bool hasMinSkill;
 	float minSkill;
@@ -689,11 +697,12 @@ static bool isDialogueButtonEligible(const DialogueBoxButtonDef& btn, Character*
 	if (!btn.requiresSkill2.empty() && !squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2))
 		return false;
 
-	if (!btn.requiresItem.empty())
+	for (size_t i = 0; i < btn.requiresItems.size(); ++i)
 	{
+		const DialogueBoxItemRequirementDef& req = btn.requiresItems[i];
 		Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-		GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
-		if (!inv || !itemData || !inv->hasItem(itemData, 1))
+		GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+		if (!inv || !itemData || !inv->hasItem(itemData, req.count))
 			return false;
 	}
 
@@ -960,7 +969,7 @@ static void OnMessageBoxButtonClicked(int buttonId)
 	dispatchDialogueSteps(patient, initiator, specialist1, specialist2, btn.steps, 0);
 }
 
-// `initiator` is who "requiresItem"/"requiresSkill"/"take_item" are checked against - null is fine
+// `initiator` is who "requiresItems"/"requiresSkill"/"take_item" are checked against - null is fine
 // for a dialogue with no gated buttons or item steps.
 static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator)
 {
@@ -1017,14 +1026,16 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 				   << " squadSatisfies2=" << squadHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
 			}
 
-			if (!btn.requiresItem.empty())
+			for (size_t reqIdx = 0; reqIdx < btn.requiresItems.size(); ++reqIdx)
 			{
+				const DialogueBoxItemRequirementDef& req = btn.requiresItems[reqIdx];
 				Inventory* inv = initiator ? initiator->getInventory() : nullptr;
-				GameData* itemData = inv ? getGameDataGuarded(btn.requiresItem, ITEM) : nullptr;
-				ss << " requiresItem=\"" << btn.requiresItem << "\" initiatorInvNull=" << (inv == nullptr)
+				GameData* itemData = inv ? getGameDataGuarded(req.item, ITEM) : nullptr;
+				ss << " requiresItems[" << reqIdx << "]=\"" << req.item << "\" count=" << req.count
+				   << " initiatorInvNull=" << (inv == nullptr)
 				   << " itemDataResolved=" << (itemData != nullptr)
 				   << " itemDataName=\"" << (itemData ? itemData->name : "") << "\""
-				   << " hasItem=" << (inv && itemData ? inv->hasItem(itemData, 1) : false);
+				   << " hasItem=" << (inv && itemData ? inv->hasItem(itemData, req.count) : false);
 			}
 
 			verboseLog(ss.str());
@@ -1040,6 +1051,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 
 	// Resolved via isDialogueButtonForPatient(), not eligibleButtons - see DESIGN.md §4.
 	std::string effectiveItem = def.item;
+	int effectiveItemCount = 1;
 	bool foundItem = false;
 	std::string skillCharacterName;
 	bool foundSkill = false;
@@ -1051,9 +1063,10 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		if (!isDialogueButtonForPatient(btn, patient))
 			continue;
 
-		if (!foundItem && !btn.requiresItem.empty())
+		if (!foundItem && !btn.requiresItems.empty())
 		{
-			effectiveItem = btn.requiresItem;
+			effectiveItem = btn.requiresItems[0].item;
+			effectiveItemCount = btn.requiresItems[0].count;
 			foundItem = true;
 		}
 
@@ -1076,7 +1089,7 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 
 	Inventory* initiatorInv = initiator ? initiator->getInventory() : nullptr;
 	GameData* effectiveItemData = effectiveItem.empty() ? nullptr : getGameDataGuarded(effectiveItem, ITEM);
-	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, 1);
+	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, effectiveItemCount);
 
 	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, hasItem, skillCharacterName, skillCharacterName2, "dialogue box \"" + dialogueId + "\"");
 
@@ -1225,8 +1238,27 @@ static void loadDialogueBoxesFromJson()
 
 				DialogueBoxButtonDef btn;
 				btn.caption = (bit->HasMember("caption") && (*bit)["caption"].IsString()) ? (*bit)["caption"].GetString() : "";
-				if (bit->HasMember("requiresItem") && (*bit)["requiresItem"].IsString())
-					btn.requiresItem = (*bit)["requiresItem"].GetString();
+				if (bit->HasMember("requiresItems") && (*bit)["requiresItems"].IsArray())
+				{
+					for (auto rit = (*bit)["requiresItems"].Begin(); rit != (*bit)["requiresItems"].End(); ++rit)
+					{
+						DialogueBoxItemRequirementDef req;
+						if (rit->IsString()) // shorthand for { "item": "...", "count": 1 }
+							req.item = rit->GetString();
+						else if (rit->IsObject())
+						{
+							if (rit->HasMember("item") && (*rit)["item"].IsString())
+								req.item = (*rit)["item"].GetString();
+							if (rit->HasMember("count") && (*rit)["count"].IsNumber())
+								req.count = (*rit)["count"].GetInt();
+						}
+
+						if (!req.item.empty())
+							btn.requiresItems.push_back(req);
+						else
+							ErrorLog("SkeletonRebirth: dialogue box \"" + std::string(it->name.GetString()) + "\" button \"" + btn.caption + "\" has a \"requiresItems\" entry with no \"item\" - skipped");
+					}
+				}
 				if (bit->HasMember("requiresSkill") && (*bit)["requiresSkill"].IsString())
 				{
 					btn.requiresSkill = (*bit)["requiresSkill"].GetString();
