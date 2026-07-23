@@ -11,7 +11,7 @@ Vanilla Kenshi treats a defeated robot exactly like a dead human: gone, permanen
 drops. For a Skeleton squadmate you've spent hours training, that's a real loss. For Iron Spiders,
 Soldierbot Guards, and Security Spiders, it's a non-issue for a different reason — none of them are
 playable or recruitable races in vanilla at all, no matter how you find one. This mod changes both.
-Robots that hit zero health now [b]Deactivate[/b] instead of dying — a real, reversible shutdown —
+Robots that would otherwise die now [b]Deactivate[/b] instead — a real, reversible shutdown —
 and with the right skills, items, and a full factory reset, even those normally-unrecruitable
 hostiles can end up fighting for you instead.
 
@@ -21,8 +21,8 @@ hostiles can end up fighting for you instead.
 [*] [b]Robots go dark, not dead.[/b] A robot that would normally die instead collapses into a
 Deactivated state. It goes fully inert on its own — no babysitting required — but nothing about it
 is permanent until you decide it is.
-[*] [b]A real status, not just "Dead."[/b] Vanilla has no in-between — a robot at zero health just
-reads "Dead," same as any human, full stop. This mod gives Deactivated robots their own status
+[*] [b]A real status, not just "Dead."[/b] Vanilla has no in-between — a dying robot just reads
+"Dead," same as any human, full stop. This mod gives Deactivated robots their own status
 instead: [b]AI FAILURE[/b] for a headless-capable humanoid unit that needs a new AI Core, or
 [b]POWER FAILURE[/b] for a headless or animal-type unit that needs a Power Core.
 [*] [b]Field reactivation.[/b] Get a Deactivated robot into a Skeleton Repair Bed, or use a
@@ -34,11 +34,14 @@ skill and core stat back to 1, folded straight into your squad. That includes Ir
 Soldierbot Guards, and Security Spiders — none of them playable or recruitable in vanilla under any
 circumstances. Disable one, drag it home, and Reset turns it into an actual squadmate instead of
 just loot.
-[*] [b]Robotic limb race restrictions actually work now.[/b] Skeleton Rebirth also fixes a
-long-standing vanilla bug where FCS's race restrictions on robotic limb items were silently
-ignored — a limb flagged as restricted to (or excluded from) certain races could be equipped by
-anyone, no matter what FCS said. This mod makes that restriction real, including in multi-character
-trade/medical screens.
+[*] [b]Balanced by design, not a loophole.[/b] Reset wipes a recruited unit's skills and core stats
+back to 1 - no free overpowered squadmate, no shortcut around the game's own progression the way
+some prisoner-recruitment mods hand out. That balance holds up on the gear side too: Skeleton
+Rebirth also fixes a long-standing vanilla bug where FCS's race restrictions on robotic limb items
+were silently ignored — a limb flagged as restricted to (or excluded from) certain races could be
+equipped by anyone, no matter what FCS said. With that fixed, recruiting an Iron Spider or
+Soldierbot Guard doesn't become a backdoor for putting their standard-issue limbs on every human in
+your squad; restrictions are enforced for real, including in multi-character trade/medical screens.
 [*] [b]Survives save/reload.[/b] Which robots are Deactivated is tracked and restored automatically
 - nothing to configure.
 [/list]
@@ -46,7 +49,7 @@ trade/medical screens.
 [h2]Why[/h2]
 
 Losing a fully-trained robot squadmate to one unlucky fight always felt wrong for a race that's
-explicitly built out of replaceable, repairable parts. Skeleton Rebirth turns "robot hits zero HP"
+explicitly built out of replaceable, repairable parts. Skeleton Rebirth turns a robot's death
 from an instant, silent loss into an actual moment — scavenge the right core, find someone who
 knows old-world science and robotics, and decide whether that unit is worth saving or worth
 stripping for a fresh start. And since the same Reset flow applies to any deactivated robot, not
