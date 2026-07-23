@@ -25,7 +25,10 @@
 #include <kenshi/gui/MessageBoxManager.h>
 #include <kenshi/gui/ScreenLabel.h>
 
+#include <mygui/MyGUI_Button.h>
 #include <mygui/MyGUI_Delegate.h>
+#include <mygui/MyGUI_EditBox.h>
+#include <mygui/MyGUI_Gui.h>
 #include <mygui/MyGUI_TextBox.h>
 #include <mygui/MyGUI_Window.h>
 
@@ -792,12 +795,12 @@ struct PendingDialogueSequence
 	Character* initiator;
 	Character* specialist1; // resolved once at button-click time, carried through every suspension - see DESIGN.md §3
 	Character* specialist2;
-	bool waitForEditorClose; // if true, fireAtTick is unused - resumes once gui->isCharacterEditorMode() clears instead
 	ULONGLONG fireAtTick;
 	bool awaitingRepair; // "await_repair" step - see DESIGN.md §3
 	ULONGLONG repairTimeoutAtTick;
+	bool showNamePrompt; // set by "join_squad" - see showNamePrompt() below
 
-	PendingDialogueSequence() : nextIndex(0), initiator(nullptr), specialist1(nullptr), specialist2(nullptr), waitForEditorClose(false), fireAtTick(0), awaitingRepair(false), repairTimeoutAtTick(0) {}
+	PendingDialogueSequence() : nextIndex(0), initiator(nullptr), specialist1(nullptr), specialist2(nullptr), fireAtTick(0), awaitingRepair(false), repairTimeoutAtTick(0), showNamePrompt(false) {}
 };
 static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
@@ -887,7 +890,7 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 				// above already communicates this; verboseLog() here is dev-facing and debug-gated,
 				// not ErrorLog(), since nothing about the config or the JSON is actually wrong.
 				showGameNotification(patient, "I don't have enough {item}.", missing->item);
-				verboseLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string(missing->count) + ") short for " + patient->getName() + " - stopping the rest of this sequence");
+				verboseLog("SkeletonRebirth: dialogue step \"take_item\" (\"" + missing->item + "\" x" + std::to_string((long long)missing->count) + ") short for " + patient->getName() + " - stopping the rest of this sequence");
 				return;
 			}
 
@@ -944,15 +947,8 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 				pending.initiator = initiator;
 				pending.specialist1 = specialist1;
 				pending.specialist2 = specialist2;
-				if (gui && gui->isCharacterEditorMode())
-				{
-					pending.waitForEditorClose = true;
-				}
-				else
-				{
-					pending.waitForEditorClose = false;
-					pending.fireAtTick = GetTickCount64() + 5000;
-				}
+				pending.fireAtTick = GetTickCount64() + 1000;
+				pending.showNamePrompt = true;
 				g_pendingDialogueSequences[patient] = pending;
 				return;
 			}
@@ -969,6 +965,79 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, Char
 
 		ErrorLog("SkeletonRebirth: unknown dialogue step type \"" + step.type + "\" for " + patient->getName());
 	}
+}
+
+// Name prompt shown after fast-mode recruit - see DESIGN.md §4, "Fast-mode recruit and the name prompt".
+struct PendingNamePrompt
+{
+	Character* patient;
+	Character* initiator;
+	Character* specialist1;
+	Character* specialist2;
+	std::vector<DialogueBoxStepDef> steps;
+	size_t nextIndex;
+	MyGUI::Window* window;
+	MyGUI::EditBox* nameBox;
+};
+static std::map<MyGUI::Widget*, PendingNamePrompt> g_pendingNamePrompts;
+
+static void OnNamePromptConfirmed(MyGUI::Widget* sender)
+{
+	auto it = g_pendingNamePrompts.find(sender);
+	if (it == g_pendingNamePrompts.end())
+		return;
+
+	PendingNamePrompt pending = it->second;
+	g_pendingNamePrompts.erase(it);
+
+	std::string newName = pending.nameBox ? pending.nameBox->getOnlyText() : "";
+	if (!newName.empty())
+		pending.patient->setName(newName);
+
+	MyGUI::Gui::getInstance().destroyWidget(pending.window);
+
+	dispatchDialogueSteps(pending.patient, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
+}
+
+static void showNamePrompt(Character* patient, Character* initiator, Character* specialist1, Character* specialist2, const std::vector<DialogueBoxStepDef>& steps, size_t nextIndex)
+{
+	MyGUI::Window* window = gui ? gui->createPanel("SkeletonRebirthNamePrompt", 0.38f, 0.41f, 0.18f, 0.15f, "Info", "Kenshi_WindowC") : nullptr;
+	if (!window)
+	{
+		ErrorLog("SkeletonRebirth: could not create the name prompt window - skipping rename for " + patient->getName());
+		dispatchDialogueSteps(patient, initiator, specialist1, specialist2, steps, nextIndex);
+		return;
+	}
+	window->setCaption("Name this character");
+	window->setMovable(false);
+
+	MyGUI::EditBox* nameBox = gui->createEditBox(window, 0.10f, 0.125f, 0.75f, 0.15f, "SkeletonRebirthNameBox", false);
+	if (nameBox)
+		nameBox->setCaption(patient->getName());
+
+	MyGUI::Button* confirmButton = gui->createButton(window, 0.45f, 0.3f, 0.4f, 0.18f, "SkeletonRebirthNameConfirm", "Confirm", "Kenshi_Button2");
+	if (!confirmButton)
+	{
+		ErrorLog("SkeletonRebirth: could not create the name prompt's Confirm button - skipping rename for " + patient->getName());
+		MyGUI::Gui::getInstance().destroyWidget(window);
+		dispatchDialogueSteps(patient, initiator, specialist1, specialist2, steps, nextIndex);
+		return;
+	}
+
+	PendingNamePrompt pending;
+	pending.patient = patient;
+	pending.initiator = initiator;
+	pending.specialist1 = specialist1;
+	pending.specialist2 = specialist2;
+	pending.steps = steps;
+	pending.nextIndex = nextIndex;
+	pending.window = window;
+	pending.nameBox = nameBox;
+	g_pendingNamePrompts[confirmButton] = pending;
+
+	confirmButton->eventMouseButtonClick += MyGUI::newDelegate(OnNamePromptConfirmed);
+
+	verboseLog("SkeletonRebirth: name prompt shown for " + patient->getName());
 }
 
 // IDelegate1<int> callback for MessageBoxManager::createMessageBox() - see DESIGN.md §4.
@@ -1149,14 +1218,14 @@ static void DialogueAction_Reactivate(Character* patient)
 	clearTriggerShownFor(patient);
 }
 
-// recruit()'s "with edit" mode - must run BEFORE system_reset if a button uses both, see DESIGN.md §4.
+// "Fast" mode, not "with edit" - see DESIGN.md §4, "Fast-mode recruit and the name prompt".
 static void DialogueAction_JoinSquad(Character* patient)
 {
 	if (ou && ou->player)
 	{
-		verboseLog("SkeletonRebirth: DIAG before recruit(editor=true) -> " + describe(patient));
-		ou->player->recruit(patient, true);
-		verboseLog("SkeletonRebirth: DIAG after recruit(editor=true) -> " + describe(patient));
+		verboseLog("SkeletonRebirth: DIAG before recruit(fast) -> " + describe(patient));
+		ou->player->recruit(patient, false);
+		verboseLog("SkeletonRebirth: DIAG after recruit(fast) -> " + describe(patient));
 	}
 }
 
@@ -1649,15 +1718,14 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 		}
 		else
 		{
-			bool ready = delayIt->second.waitForEditorClose
-				? !(gui && gui->isCharacterEditorMode())
-				: GetTickCount64() >= delayIt->second.fireAtTick;
-
-			if (ready)
+			if (GetTickCount64() >= delayIt->second.fireAtTick)
 			{
 				PendingDialogueSequence pending = delayIt->second;
 				g_pendingDialogueSequences.erase(delayIt);
-				dispatchDialogueSteps(self, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
+				if (pending.showNamePrompt)
+					showNamePrompt(self, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
+				else
+					dispatchDialogueSteps(self, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
 			}
 		}
 	}
@@ -1687,11 +1755,29 @@ DataPanelLine* DatapanelGUI_setLine_KeyLastVisible_hook(DatapanelGUI* self, cons
 	if (keyValue == "State:")
 	{
 		bool needsAiCore = isHumanoidState(target) && hasHeadPart(target);
-		std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + (needsAiCore ? "AI FAILURE" : "POWER FAILURE");
+		std::string overriddenS2 = std::string(DEACTIVATED_COLOR) + (needsAiCore ? "AI Failure" : "Power Failure");
 		return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, overriddenS2, category, last, keyVisible);
 	}
 
 	return DatapanelGUI_setLine_KeyLastVisible_orig(self, keyValue, s1, s2, category, last, keyVisible);
+}
+
+// --- Hook: DatapanelGUI::setLineStatInfo(s1,s2,category) - robot age-tier relabeling, see DESIGN.md.
+DataPanelLine* (*DatapanelGUI_setLineStatInfo_orig)(DatapanelGUI*, const std::string&, const std::string&, int);
+DataPanelLine* DatapanelGUI_setLineStatInfo_hook(DatapanelGUI* self, const std::string& s1, const std::string& s2, int category)
+{
+	Character* target = self->getObject().getCharacter();
+	if (target && s1 == "Age:" && isRobotRace(target))
+	{
+		float age0to1 = target->getAge0to1();
+		std::string tier = age0to1 <= 0.39f ? "Learning"
+			: age0to1 <= 0.59f ? "Operational"
+			: age0to1 <= 1.10f ? "Adaptive"
+			: "Elite";
+		return DatapanelGUI_setLineStatInfo_orig(self, "Calibration:", tier, category);
+	}
+
+	return DatapanelGUI_setLineStatInfo_orig(self, s1, s2, category);
 }
 
 // --- Robot limb race-lock (merged in from the former "The Limbless (Type 2)" mod) --------------
@@ -1755,6 +1841,9 @@ __declspec(dllexport) void startPlugin()
 	typedef DataPanelLine* (DatapanelGUI::*SetLineKeyLastVisibleFn)(const std::string&, const std::string&, const std::string&, int, bool, bool);
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress((SetLineKeyLastVisibleFn)&DatapanelGUI::setLine), DatapanelGUI_setLine_KeyLastVisible_hook, &DatapanelGUI_setLine_KeyLastVisible_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add DatapanelGUI::setLine(key,last,visible) hook!");
+
+	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&DatapanelGUI::setLineStatInfo), DatapanelGUI_setLineStatInfo_hook, &DatapanelGUI_setLineStatInfo_orig))
+		ErrorLog("SkeletonRebirthDiagnostics: Could not add DatapanelGUI::setLineStatInfo hook!");
 
 	if (KenshiLib::SUCCESS != KenshiLib::AddHook(KenshiLib::GetRealAddress(&RobotLimbs::getInventoryInterface), RobotLimbs_getInventoryInterface_hook, &RobotLimbs_getInventoryInterface_orig))
 		ErrorLog("SkeletonRebirthDiagnostics: Could not add RobotLimbs::getInventoryInterface hook!");

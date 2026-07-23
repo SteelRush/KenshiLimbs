@@ -144,8 +144,7 @@
 						{ "type": "delay", "seconds": 5 },
 						{ "type": "show_text", "text": "{name} has been reset to factory defaults!", "color": "#3399FF" },
 						{ "type": "action", "action": "join_squad" },
-						{ "type": "action", "action": "system_reset" },
-						{ "type": "open_menu", "menu": "diagnostic_menu" }
+						{ "type": "action", "action": "system_reset" }
 					]
 				},
 				{

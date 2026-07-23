@@ -465,18 +465,15 @@ or fewer be eligible.
 **The step types** (`DialogueBoxStepDef::type`), run in order by `dispatchDialogueSteps()`:
 - `"action"` — dispatches `action` through `g_dialogueActions` (a `std::map<std::string,
   DialogueActionFn>`, populated once in `startPlugin()`): `"reactivate"` (`TryReactivate()`, see §3),
-  `"join_squad"`/`"join_squad_fast"` (`PlayerInterface::recruit()`'s "with edit"/"fast" modes - the
-  native `DA_JOIN_SQUAD_WITH_EDIT`/`DA_JOIN_SQUAD_FAST` dialogue actions), and `"system_reset"`
-  (`DialogueAction_SystemReset()`, wipes every skill/attribute to 1 for a humanoid patient, or takes an
-  `ANIMAL_CHARACTER` patient's age to its minimum instead - real growth-stage governor for that type,
-  called through true virtual dispatch, not `_NV_setAge()`, so `CharacterAnimal`'s override actually
-  runs; see the virtual-function pitfall note at the top of this document). If a button uses both
-  `"join_squad"` and `"system_reset"`, `"join_squad"` must be listed first: `recruit(editor=true)`
-  reinitializes `CharStats` from the character's original template, which would silently clobber a reset
-  that ran before it. `"join_squad_fast"` skips that reinitialization, so it has no such ordering
-  constraint. A button with an empty `steps` array (e.g. "No") does nothing but close - there's no
-  dedicated close-only step type, since closing already happens unconditionally on any click, before any
-  step runs (see `OnMessageBoxButtonClicked()`).
+  `"join_squad"`/`"join_squad_fast"` (`PlayerInterface::recruit()`, both now "fast" mode - see "Fast-mode
+  recruit and the name prompt" below for why `"join_squad"` no longer uses "with edit"), and
+  `"system_reset"` (`DialogueAction_SystemReset()`, wipes every skill/attribute to 1 for a humanoid
+  patient, or takes an `ANIMAL_CHARACTER` patient's age to its minimum instead - real growth-stage
+  governor for that type, called through true virtual dispatch, not `_NV_setAge()`, so `CharacterAnimal`'s
+  override actually runs; see the virtual-function pitfall note at the top of this document). A button
+  with an empty `steps` array (e.g. "No") does nothing but close - there's no dedicated close-only step
+  type, since closing already happens unconditionally on any click, before any step runs (see
+  `OnMessageBoxButtonClicked()`).
 - `"take_item"` — consumes `items`, the same array-of-`{ "item", "count" }` (or plain-string, for
   `count: 1`) shape as a button's `requiresItems` - each entry's `count` units are removed from the
   *initiator's* inventory via repeated `Inventory::takeOneItemOnly()` calls. Distinct from the
@@ -515,20 +512,40 @@ or fewer be eligible.
   timeout rather than a wait length. See §3, "`"await_repair"` step", for the full mechanism.
 
 `join_squad` (not `join_squad_fast`) always defers the rest of its sequence through the same
-`g_pendingDialogueSequences` mechanism, implicitly - not something a JSON author writes. If
-`recruit(editor=true)` actually opened the character editor (`gui->isCharacterEditorMode()`), it waits for
-that to close, same as before. Originally this was the *only* condition - but confirmed live that a later
-step (`system_reset`) running immediately after `recruit()`, in the same call, crashed
-(`STATUS_ACCESS_VIOLATION` reading `-1`) even in a case where the editor never visibly entered that mode -
-so `isCharacterEditorMode()` isn't a reliable signal that it's safe to continue. Now unconditional: if the
-editor didn't open, it still defers rather than continuing in the same call. A 1-tick defer
+`g_pendingDialogueSequences` mechanism, implicitly - not something a JSON author writes. Originally this
+existed because `recruit(editor=true)`'s character-editor path needed real wall-clock time to settle -
+confirmed live that a later step (`system_reset`) running immediately after `recruit()`, in the same call,
+crashed (`STATUS_ACCESS_VIOLATION` reading `-1`) even when the editor never visibly opened. A 1-tick defer
 (`GetTickCount64() + 1`) still crashed intermittently (same exception, confirmed live via two identical
-minidumps - same address, code, and thread ID, on two different characters) - comparing a crash trace
-against a successful one showed the successful case happened to take the `waitForEditorClose` path (a real
-multi-second gap while the player closed the editor), while the crash traces matched the 1-tick path.
-Raised to 5000ms - long enough to behave like the editor-close wait timing-wise even when the editor
-doesn't visibly open, on the theory that whatever `recruit()` does internally needs real wall-clock time to
-settle, not just a different call stack.
+minidumps - same address, code, and thread ID, on two different characters); comparing traces showed the
+successful case happened to take a real multi-second gap (waiting for the editor to close), while the
+crashes matched the near-instant path. Raised to 5000ms on the theory that whatever `recruit()` does
+internally needs that much real time to settle, not just a different call stack.
+
+**`join_squad` no longer uses "with edit" mode at all** - see "Fast-mode recruit and the name prompt"
+below for why - so the defer's original `isCharacterEditorMode()` branch is gone; always the fixed
+5000ms wait now, kept at the value already confirmed crash-free above.
+
+### Fast-mode recruit and the name prompt
+
+The `STATUS_ACCESS_VIOLATION reading -1` crash above recurred live on the "Reset" button even with the
+5000ms defer in place - same signature, confirmed via manually parsing the resulting Wine minidump (same
+approach as before; standard tools don't parse Wine's minidumps correctly here either). Since
+`system_reset`'s `ANIMAL_CHARACTER` branch only calls `setAge()` (no `CharStats` dependency on `join_squad`
+having run "with edit" first), `DialogueAction_JoinSquad` was switched to `recruit(patient, false)` ("fast"
+mode) for both branches, removing the character-editor code path entirely rather than continuing to defer
+around it.
+
+Trade-off: fast mode has no in-game renaming path of its own (that's only available via a plastic
+surgeon, which animal-type robots can't interact with at all). `showNamePrompt()` covers this instead -
+shown once the post-recruit defer elapses, in place of resuming the rest of the sequence directly. Built
+from `ForgottenGUI::createPanel`/`createEditBox`/`createButton` using the same `Kenshi_WindowC`/
+`Kenshi_Button2` skins the native message box layout already uses (confirmed compatible by reading
+`Kenshi_MessageBox.layout` directly - its own "MessageText" widget is itself an `EditBox`), rather than
+guessing at an untested skin. Confirm-only, no Cancel - the field is pre-filled with the current name, so
+confirming without editing already is the "don't rename" path; there's nothing for a separate Cancel to do
+differently. Pending state (`PendingNamePrompt`) is keyed by the Confirm button widget, not by patient -
+nothing stops two robots from being mid-sequence at once.
 
 **Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItems`, `excludePlayerFaction`)
 controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
@@ -754,6 +771,18 @@ character) for any not-yet-tracked robot, gated behind a cheap `g_deactivated.co
 anatomy scan only runs until a character is found and recorded. No load-event hook, no serialised ID,
 nothing that can go stale.
 
+## Robot age-tier relabeling ("Calibration")
+
+Vanilla shows an "Age:" row (Pup/Teen/Adult/Elder) in the Attributes panel for animal-type characters, in
+place of "Defense:" (native behavior, not this mod's). Doesn't fit robots narratively.
+`DatapanelGUI_setLineStatInfo_hook` relabels it to "Calibration:" with Learning/Operational/Adaptive/Elite
+tiers for `isRobotRace` characters specifically, leaving real animals untouched.
+
+Boundaries confirmed live via a temporary sweep (`setAge()` across candidate values, reading back
+`getAge0to1()`/`getAgeString()`): Pup ends at `0.39` (Teen starts `0.40`), Teen ends at `0.59` (Adult
+starts `0.60`), Adult ends at `1.10` (Elder starts `1.11`) - the last gap isn't evenly spaced like the
+other two and wasn't guessable from the label text alone.
+
 ## Robot limb race-lock
 
 Unrelated to the Deactivated/reactivation system above - merged in from the former standalone "The
@@ -897,6 +926,33 @@ see the virtual-function hooking pitfall at the top of this document.
   all virtual - **call these normally, not via `_NV_`**, so `CharacterAnimal`'s override actually runs
   (see the pitfall note above). `getAge0to1()` is the reliable unit (confirmed via `getAgeString()`
   live: `0.3` → `"Pup"`, matching Kenshi's own Pup/Teen/Adult/Elder growth-stage milestones)
+
+## Unresolved: generic "unconscious" status tooltip
+
+Hovering a Deactivated robot's portrait (both the main character-info panel and squad-list thumbnails)
+shows a fixed native tooltip: `"This guy is unconscious and probably needs medical attention and rest."`
+Wanted: override this per-robot with something like `"This unit's {AI/power} core has failed and will
+need to be replaced."`, the same way §2's "State:" row already is. Not done - the real source function
+couldn't be identified with the tools available (no disassembler in this environment), only ruled out
+via live hooking:
+
+- Confirmed via a temporary hook that the text is delivered through
+  `ToolTip::setup(MyGUI::Widget* widget, const std::string& text)` (ToolTip.h, RVA `0x91F830`,
+  non-virtual) - `widget` here is the tooltip's own fixed display widget, not the hovered portrait, so it
+  carries no path back to which `Character` the tooltip belongs to.
+- That call's immediate caller has return-address RVA **`0x920c0f`** (relative to the exe's own base,
+  captured via `_ReturnAddress()`). This does **not** correspond to any function documented anywhere in
+  RE_Kenshi's current headers - it sits in a numeric gap with no exact match.
+- Initial theory: `0x920c0f` falls inside `ToolTip::setup(MyGUI::Widget*, const lektor<StringPair>&
+  lines)` (RVA `0x920AB0`, the next-closest preceding documented RVA). **Disproven by direct testing** -
+  hooking that overload showed it fires constantly for a completely different purpose (the Attributes
+  panel's per-stat breakdown tooltips - Strength/Dexterity/Athletics/etc.), always from one single caller
+  RVA `0x9216d7`, which matches `ToolTip::showGameData(const hand&)` (RVA `0x9216B0`, non-virtual) almost
+  exactly. Never once fired for "unconscious" text. So RVA-proximity-to-a-header-entry is not a reliable
+  way to identify an unknown caller here - confirmed, not just suspected.
+- Next step, if picked back up: needs an actual disassembler against `kenshi_x64.exe` pointed at RVA
+  `0x920c0f` to identify the real function and check whether it's virtual before attempting any hook -
+  not something to guess at again from header proximity alone.
 
 ## A note on the RE_Kenshi SDK itself
 
