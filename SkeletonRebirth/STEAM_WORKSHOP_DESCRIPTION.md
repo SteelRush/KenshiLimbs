@@ -34,9 +34,10 @@ skill and core stat back to 1, folded straight into your squad. That includes Ir
 Soldierbot Guards, and Security Spiders — none of them playable or recruitable in vanilla under any
 circumstances. Disable one, drag it home, and Reset turns it into an actual squadmate instead of
 just loot.
-[*] [b]Balanced by design, not a loophole.[/b] Reset wipes a recruited unit's skills and core stats
-back to 1 - no free overpowered squadmate, no shortcut around the game's own progression the way
-some prisoner-recruitment mods hand out. That balance holds up on the gear side too: Skeleton
+[*] [b]Balanced by design.[/b] Reset wipes a recruited unit's skills and core stats back to 1, so
+you don't end up with a free overpowered squadmate — older prisoner-recruitment mods handed out
+fully-statted recruits because the engine limitations of the time left them no other way to do it.
+That balance holds up on the gear side too: Skeleton
 Rebirth also fixes a long-standing vanilla bug where FCS's race restrictions on robotic limb items
 were silently ignored — a limb flagged as restricted to (or excluded from) certain races could be
 equipped by anyone, no matter what FCS said. With that fixed, recruiting an Iron Spider or
