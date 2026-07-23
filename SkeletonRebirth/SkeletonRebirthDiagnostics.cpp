@@ -106,9 +106,6 @@ static std::map<std::pair<Character*, size_t>, bool> g_triggerShown;
 // patient -> caregiver, refreshed each frame - see DESIGN.md §5.
 static std::map<Character*, Character*> g_activeFirstAid;
 
-// patient -> caregiver -> last tick seen - see DESIGN.md §3, "await_repair".
-static std::map<Character*, std::map<Character*, ULONGLONG>> g_firstAidCaregiverLastSeen;
-
 // Called after an action that could invalidate more than one trigger at once - see DESIGN.md §5.
 static void clearTriggerShownFor(Character* c)
 {
@@ -421,20 +418,17 @@ static bool hasRepairerScience1(Character* c)
 }
 
 // See DESIGN.md §3, "await_repair".
-static bool isActivelyRepairing(Character* patient, Character* caregiver)
+static const float AWAIT_REPAIR_ARRIVAL_DISTANCE = 250.0f;
+static bool hasArrivedForRepair(Character* patient, Character* caregiver)
 {
 	if (!caregiver)
 		return true;
 
-	auto patientIt = g_firstAidCaregiverLastSeen.find(patient);
-	if (patientIt == g_firstAidCaregiverLastSeen.end())
-		return false;
-
-	auto caregiverIt = patientIt->second.find(caregiver);
-	if (caregiverIt == patientIt->second.end())
-		return false;
-
-	return (GetTickCount64() - caregiverIt->second) < 500;
+	float distance = patient->getPosition().distance(caregiver->getPosition());
+	std::ostringstream ss;
+	ss << "SkeletonRebirth: DIAG await_repair distance -> caregiver=\"" << caregiver->getName() << "\" patient=\"" << patient->getName() << "\" distance=" << distance;
+	verboseLog(ss.str());
+	return distance <= AWAIT_REPAIR_ARRIVAL_DISTANCE;
 }
 
 typedef void (*DialogueActionFn)(Character* patient);
@@ -551,26 +545,41 @@ static GameData* getGameDataGuarded(const std::string& id, itemType category)
 	}
 }
 
-// Squad-wide requiresSkill/requiresSkill2 lookup - see DESIGN.md §4, "Button-level gating".
+// Checks one character, not the squad - see DESIGN.md §5, "requiresQualifiedFor".
+static bool characterHasSkill(Character* c, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
+	if (fieldIt == g_skillFields.end())
+		return true; // unrecognized skill name - treated as no requirement, same as squadHasSkill
+
+	CharStats* stats = c ? c->getStats() : nullptr;
+	if (!stats)
+		return false;
+
+	float value = stats->*(fieldIt->second);
+	return (!hasMin || value >= minValue) && (!hasMax || value <= maxValue);
+}
+
+// Prefers the initiator themselves over the rest of the squad - see DESIGN.md §4, "Button-level gating".
 static Character* findSquadMemberWithSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
 {
 	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
 	if (fieldIt == g_skillFields.end())
 		return initiator; // unrecognized skill name - logged once at JSON-load time, treated as no requirement
 
+	if (characterHasSkill(initiator, skillField, hasMin, minValue, hasMax, maxValue))
+		return initiator;
+
 	ActivePlatoon* platoon = initiator ? initiator->getPlatoon() : nullptr;
 	if (!platoon)
-	{
-		CharStats* stats = initiator ? initiator->getStats() : nullptr;
-		if (!stats)
-			return nullptr;
-		float value = stats->*(fieldIt->second);
-		return ((!hasMin || value >= minValue) && (!hasMax || value <= maxValue)) ? initiator : nullptr;
-	}
+		return nullptr;
 
 	for (auto it = platoon->things.begin(); it != platoon->things.end(); ++it)
 	{
 		Character* member = hand(*it).getCharacter();
+		if (member == initiator)
+			continue; // already checked above
+
 		CharStats* stats = member ? member->getStats() : nullptr;
 		if (!stats)
 			continue;
@@ -584,21 +593,6 @@ static Character* findSquadMemberWithSkill(Character* initiator, const std::stri
 static bool squadHasSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
 {
 	return findSquadMemberWithSkill(initiator, skillField, hasMin, minValue, hasMax, maxValue) != nullptr;
-}
-
-// Checks the initiator personally, not the squad - see DESIGN.md §5, "requiresQualifiedFor".
-static bool characterHasSkill(Character* c, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
-{
-	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
-	if (fieldIt == g_skillFields.end())
-		return true; // unrecognized skill name - treated as no requirement, same as squadHasSkill
-
-	CharStats* stats = c ? c->getStats() : nullptr;
-	if (!stats)
-		return false;
-
-	float value = stats->*(fieldIt->second);
-	return (!hasMin || value >= minValue) && (!hasMax || value <= maxValue);
 }
 
 static bool initiatorHasEitherSkill(Character* initiator, const DialogueBoxButtonDef& btn)
@@ -1435,11 +1429,7 @@ bool MedicalSystem_applyFirstAid_hook(MedicalSystem* self, float skill, Item* eq
 	Character* patient = head ? head->me : nullptr;
 
 	if (patient)
-	{
 		g_activeFirstAid[patient] = who;
-		if (who)
-			g_firstAidCaregiverLastSeen[patient][who] = GetTickCount64();
-	}
 
 	return MedicalSystem_applyFirstAid_orig(self, skill, equipment, frameTIME, who);
 }
@@ -1572,8 +1562,8 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	{
 		if (delayIt->second.awaitingRepair)
 		{
-			bool specialistsReady = isActivelyRepairing(self, delayIt->second.specialist1)
-				&& isActivelyRepairing(self, delayIt->second.specialist2);
+			bool specialistsReady = hasArrivedForRepair(self, delayIt->second.specialist1)
+				&& hasArrivedForRepair(self, delayIt->second.specialist2);
 
 			if (specialistsReady)
 			{

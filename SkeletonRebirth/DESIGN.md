@@ -233,18 +233,34 @@ were abandoned in favour of dynamic (live) diagnostic hooking throughout the res
 
 ### 3. Reactivation trigger and confirmation UI
 
-**Trigger, humanoid robots only**: simply placing a Deactivated humanoid robot in the Skeleton Repair Bed
-(`Character::inSomething == IN_BED`, checked via the `"inBed"` named state in §5's `requiredStates`, on a
-building whose `Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, value `25`, FCS String ID is in
-the trigger's `buildings` list) is enough - no item requirement, checked continuously via
-`Character::updateOnScreenCheck()` (fires roughly every frame per character).
+**Trigger, humanoid robots**: either placing a Deactivated humanoid robot in a Skeleton Repair Bed
+(`Character::inSomething == IN_BED`, checked via the `"inBed"` named state, on a building whose
+`Building::_NV_getSpecialFunction() == BF_SKELETON_BED`, FCS String ID in the trigger's `buildings`
+list - no item needed) or the item-based trigger below - both open `system_menu`.
 
-**Trigger, animal-type robots (e.g. Iron Spider)**: item-based only (below) - furniture-based reactivation
-never worked reliably for animal skeletons, and the item-based trigger sidesteps the furniture-pose
-question entirely.
+**Trigger, animal-type robots (e.g. Iron Spider)**: item-based only - furniture-based reactivation never
+worked reliably for animal skeletons, and the item-based trigger sidesteps the furniture-pose question
+entirely.
 
-**A second, independent trigger** (used by humanoids alongside the furniture one above, and exclusively by
-animal-type robots) fires the same menu on using either of the game's two robot-repair items on a
+`"await_repair"`'s completion check was originally `MedicalSystem::applyFirstAid()` activity (below), on
+the assumption a specialist visibly arriving and animating meant that hook had fired. Live testing proved
+that assumption wrong in two different ways: a specialist ordered to a bed-confined patient visibly
+arrives and plays a repair animation without `applyFirstAid()` ever firing, and separately a humanoid
+patient placed on open ground (`"Weak Thrall"`, race `95870-Newwworld.mod`) treated with a Skeleton
+Repair Kit *also* never fired it despite the caregiver visibly performing the treatment action - so this
+isn't specific to bed-confinement, `applyFirstAid()` just isn't a reliable signal for "is someone here
+working on this patient" across every race/item/placement combination. Replaced with plain proximity
+(`hasArrivedForRepair()`, `Ogre::Vector3::distance()` between patient and specialist positions) -
+sidesteps the question of which native code path handles "care" entirely, since it only asks where the
+specialist is standing, not what native function last touched the patient. A held-steady distance is
+itself a reasonable proxy for "the animation is playing", since the specialist stops moving only once
+they've actually engaged the patient. `AWAIT_REPAIR_ARRIVAL_DISTANCE` was first guessed at `3.0f` with no
+idea what scale Kenshi's coordinates use - wrong by two orders of magnitude, confirmed live via the
+`DIAG await_repair distance` log: a specialist visibly in position and animating held a constant
+`182.528` for the full timeout window, never satisfying `3.0f`. Raised to `250.0f`, comfortably above
+that confirmed real value.
+
+**The (now sole) trigger** fires the same menu on using either of the game's two robot-repair items on a
 Deactivated robot, while the caregiver has Science skill ≥ 1. This is a revival of the mod's *original*
 design (see the rejected-approaches list just below) - `MedicalSystem::applyFirstAid()`
 (`MedicalSystem.h:250`, RVA `0x64D080`, non-virtual) is hooked purely to populate `g_activeFirstAid` (a
@@ -268,11 +284,8 @@ where anyone actually is. Confirmed live via a one-off diagnostic that `OrdersRe
 with `FIRST_AID_ROBOT` genuinely walks a character to the target and plays the repair animation - not
 just a state flag. Issued once per specialist when the step first runs (`clearOld=true`, so it
 pre-empts whatever they were doing), not on every poll tick, which would otherwise restart their
-approach path repeatedly. Completion is detected via `g_firstAidCaregiverLastSeen` (patient → caregiver
-→ last tick `applyFirstAid()` fired for them, populated alongside `g_activeFirstAid` in that hook) and
-`isActivelyRepairing()`, checking "seen within the last 500ms" rather than exact same-frame
-synchronization - `g_activeFirstAid` alone can't do this since it only keeps the single most recent
-caregiver per patient, and two specialists can each be mid-animation at once. If both specialists (or
+approach path repeatedly. Completion is detected via `hasArrivedForRepair()` - see the note above on why
+this is proximity-based rather than tied to `applyFirstAid()`. If both specialists (or
 the one required, or neither if the button needs no skill) haven't started within the step's `seconds`
 (default 45 if omitted/zero) the sequence aborts with a notification instead of silently proceeding
 without them - same "no silent partial effects" principle as `take_item`'s failure path. This is also
@@ -294,13 +307,14 @@ specialists keep visibly working through `take_item`/the delays/`diagnostic_menu
 the moment the animation is first confirmed, only stopping at the one step that's actually unsafe to
 run while their order is still live.
 
-Earlier approaches tried and rejected before landing on the furniture-polling design above:
+Earlier approaches tried and rejected on the way to the item-based trigger above (which, per the note
+above, is now the only trigger, having also replaced the furniture-based one it originally coexisted
+with):
 - `MedicalSystem::applyFirstAid()` (the original design, gated on using a `ITEM_ROBOTREPAIR` item) broke
   once `dead=true` took effect under an earlier design - a genuinely dead character isn't a valid target
   for the normal AI-driven "treat with item" action at all, confirmed by direct testing (repair kits
   stopped working). This is exactly why it was dropped at the time - not a flaw in the idea itself, only
-  in the surrounding `dead=true` design (§1). Once `dead` stayed false permanently, the idea was revisited
-  and now coexists with the furniture trigger as the second trigger described above.
+  in the surrounding `dead=true` design (§1). Once `dead` stayed false permanently, the idea was revisited.
 - `InventoryGUI::show()` (triggering off the loot/trade menu opening) crashed the game - see the virtual-
   function pitfall above.
 - `InventoryTraderGUI::_CONSTRUCTOR()` (the non-virtual-safe fix for the above) worked, but
@@ -488,13 +502,13 @@ or fewer be eligible.
 - `"delay"` — pauses the *remaining* steps in the sequence for `seconds`, not the whole dialogue system.
   A `std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences`, keyed by patient, holds
   the not-yet-run steps (copied, not referenced, into the pending entry) plus a resume index; ticked from
-  `Character_updateOnScreenCheck_hook` (already firing every frame per character for the bed-placement
-  trigger, reused rather than adding a new hook) via `GetTickCount64()` wall-clock milliseconds, not a
+  `Character_updateOnScreenCheck_hook` (already firing every frame per character for dialogue-trigger
+  evaluation, reused rather than adding a new hook) via `GetTickCount64()` wall-clock milliseconds, not a
   per-frame delta, since `updateOnScreenCheck()` doesn't receive one and this is cosmetic UI pacing, not
   gameplay-critical timing - the same relaxed precision the old `delay` override type used, just driven
   by wall clock instead of `Dialogue::update()`'s `frameTime`.
 - `"await_repair"` — suspends the same way `"delay"` does, but resumes on a condition
-  (`isActivelyRepairing()` for both resolved specialists) instead of a fixed time, with `seconds` as a
+  (`hasArrivedForRepair()` for both resolved specialists) instead of a fixed time, with `seconds` as a
   timeout rather than a wait length. See §3, "`"await_repair"` step", for the full mechanism.
 
 `join_squad` (not `join_squad_fast`) always defers the rest of its sequence through the same
@@ -519,15 +533,20 @@ from anything its steps do:
 - `requiresSkill`/`requiresSkill2` (independent, lowercase `CharStats` field names - see `g_skillFields`,
   the same skill-name table the old `DialogueSkillChecks` feature used) plus their own `minSkill`/
   `maxSkill` and `minSkill2`/`maxSkill2` (at least one required per skill that's set, Kenshi's native
-  0-100 scale). Checked squad-wide (`squadHasSkill()`, over `initiator->getPlatoon()->things`, each
-  member resolved via `hand(RootObjectBase*).getCharacter()` - the same safe cast-by-handle pattern
-  `getObject().getCharacter()` uses elsewhere in this file), not against `initiator` alone: each skill
-  just needs *some* squad member in range, not the same member for both, so "Diagnostics" (Reactivate/
-  Reset's entry point, requiring both Science and Robotics - representing Old World dual-discipline
-  knowledge) can be satisfied by two specialists working together instead of demanding one character
-  who's trained in both. An unrecognized skill name is logged once at JSON-load time and then treated
-  as "no skill requirement" every time the button would otherwise show, rather than hiding it - a typo
-  shouldn't silently make a button impossible to see and impossible to know why.
+  0-100 scale). Checked squad-wide (`squadHasSkill()`/`findSquadMemberWithSkill()`, over
+  `initiator->getPlatoon()->things`, each member resolved via `hand(RootObjectBase*).getCharacter()` -
+  the same safe cast-by-handle pattern `getObject().getCharacter()` uses elsewhere in this file), not
+  against `initiator` alone: each skill just needs *some* squad member in range, not the same member for
+  both, so "Diagnostics" (Reactivate/Reset's entry point, requiring both Science and Robotics -
+  representing Old World dual-discipline knowledge) can be satisfied by two specialists working together
+  instead of demanding one character who's trained in both. `findSquadMemberWithSkill()` checks the
+  initiator first (`characterHasSkill()`), before scanning the rest of the squad - live testing showed
+  scanning `platoon->things` in storage order without this could pick a different, uninvolved squad
+  member for `{skillCharacter}`/`{skillCharacter2}` and `await_repair`'s orders even when the initiator
+  already personally covered that skill, sending someone else across the map to do a job the person
+  already standing there could have done. An unrecognized skill name is logged once at JSON-load time
+  and then treated as "no skill requirement" every time the button would otherwise show, rather than
+  hiding it - a typo shouldn't silently make a button impossible to see and impossible to know why.
 - `requiresItem` (an FCS/GameData item String ID, looked up via `GameDataManager::getData(id, ITEM)`) -
   the button only shows if `initiator`'s `Inventory::hasItem()` finds at least one. This is deliberately
   separate from a `take_item` *step* consuming the same item ID - unlike the old system (where FCS's own
@@ -600,25 +619,25 @@ registered in `g_triggerStateChecks` - `"deactivated"`/`"animal"`/`"humanoid"`/`
 `"beingRepaired"`/`"repairerScience1"`, all must pass) and `buildings` (the used building's own FCS String
 ID must be in this list; **empty means no building requirement at all**, not "never fires" - see below),
 opening `menu` once both hold. This lets more than one trigger definition exist - e.g. `system_menu` for
-humanoid robots vs `system_menu_animal` for animal-type ones, and (now) a furniture-based trigger
-alongside a completely independent item-based one, both able to open the same menu - rather than the
-single hardcoded trigger `Character::updateOnScreenCheck()` originally polled (§3). Deliberately flat
-named checks AND'd together, not a general boolean expression language, since every combination needed so
-far (e.g. "deactivated AND animal AND inBed") fits that shape without the parsing/fragility risk a real
-expression syntax would add.
+humanoid robots vs `system_menu_animal` for animal-type ones, and a pair of `requiresQualifiedFor`/
+`excludeQualifiedFor` triggers per case (§4) both able to open a menu for the same `requiredStates` -
+rather than the single hardcoded trigger `Character::updateOnScreenCheck()` originally polled (§3).
+Deliberately flat named checks AND'd together, not a general boolean expression language, since every
+combination needed so far (e.g. "deactivated AND animal AND repairerScience1") fits that shape without
+the parsing/fragility risk a real expression syntax would add.
 
 `"inBed"` (`isInBedState`) was split out of `evaluateDialogueTrigger()` into a named `requiredStates`
-check rather than staying a hardcoded `self->inSomething != IN_BED` early-out, so which `UseStuffState`
-the Repair Bay furniture uses is a JSON edit, not a recompile.
+check rather than staying a hardcoded `self->inSomething != IN_BED` early-out, back when a Skeleton
+Repair Bed furniture trigger existed alongside the item-based one - unused by any shipped trigger now
+(§3), but left registered in `g_triggerStateChecks` since it costs nothing to keep and a JSON author
+could still reach for it.
 
-`"beingRepaired"`/`"repairerScience1"` (§3's item-based trigger) don't fit the furniture trigger's
-`self->inWhat` building lookup at all - a robot being repair-kitted isn't necessarily standing in any
-building - so `trigger.buildings` being empty had to become a real, intentional "no requirement" case
-(`buildingMatches = trigger.buildings.empty()`) rather than the JSON loader's original assumption that an
-empty list was an authoring mistake ("will never fire"). The initiator passed to `showDialogueBox()` is
-resolved the same way: prefer `g_activeFirstAid`'s caregiver for `self` if present, only falling back to
-the player's current selection (§4) when there isn't one - the furniture trigger has no other way to know
-"who's responsible", but the item trigger does, so it uses it.
+`"beingRepaired"`/`"repairerScience1"` don't fit a `self->inWhat` building lookup at all - a robot being
+repair-kitted isn't necessarily standing in any building - so `trigger.buildings` being empty had to
+become a real, intentional "no requirement" case (`buildingMatches = trigger.buildings.empty()`) rather
+than the JSON loader's original assumption that an empty list was an authoring mistake ("will never
+fire"). The initiator passed to `showDialogueBox()` is resolved from `g_activeFirstAid`'s caregiver for
+`self`, falling back to the player's current selection (§4) only if there isn't one.
 
 `Character_updateOnScreenCheck_hook` evaluates every trigger for every on-screen character every frame,
 so `requiredStates` are checked before `buildings` and short-circuit on the first failing check - the

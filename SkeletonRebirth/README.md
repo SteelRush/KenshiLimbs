@@ -6,8 +6,9 @@ Security Spiders, etc.) never enter vanilla Dead state directly. Instead they co
 `MedicalSystem::dead` is kept false throughout (deliberately - see DESIGN.md §1 for why an earlier
 version that left `dead=true` for "free" AI/looting/GUI integration was abandoned after it caused a real
 crash). A Deactivated robot goes inert on its own, via vanilla's own permanent-at-catastrophic-damage
-knockout state - no explicit AI pause is needed. Placing a Deactivated robot in a Skeleton Repair Bed
-prompts reactivation via a confirmation dialogue box, whose text and button behavior are data-driven
+knockout state - no explicit AI pause is needed. Placing a Deactivated humanoid robot in a Skeleton
+Repair Bed, or using a robot-repair item on any Deactivated robot, prompts reactivation via a
+confirmation dialogue box, whose text and button behavior are data-driven
 from a `"DialogueBoxes"` object nested in [`RE_Kenshi.json`](RE_Kenshi.json) rather than hardcoded C++.
 Survives save/reload. Cleanup of unattended Deactivated robots is **not implemented** - see DESIGN.md
 §5. See [`DESIGN.md`](DESIGN.md) for the full architecture, including three separate rejected
@@ -23,7 +24,7 @@ Hooks in `SkeletonRebirthDiagnostics.cpp`:
 |---|---|
 | `Character::declareDead()` | Blocked entirely for robots — forces `MedicalSystem::dead` back to false (native code sets it true just before calling this, so it has to be reasserted, not just left alone) instead of letting the real transition proceed, and marks the character Deactivated. |
 | `MedicalSystem::medicalUpdate(float)` | Skipped entirely while Deactivated — freezes health completely. |
-| `Character::updateOnScreenCheck()` | Reactivation trigger only: prompts when a Deactivated robot is in the Skeleton Repair Bed. |
+| `Character::updateOnScreenCheck()` | Reactivation trigger only: prompts when a Deactivated humanoid robot is in a Skeleton Repair Bed, or any Deactivated robot is being treated with a robot-repair item. |
 | `DatapanelGUI::setLine(key, s1, s2, category, last, keyVisible)` | Overrides the "State:" GUI tag (vanilla shows "Rebooting" for a robot in this state) to "AI FAILURE" (humanoid with a head - needs an AI Core) or "POWER FAILURE" (headless, or animal-type - needs a Power Core) in vanilla's own dead-red, unconditionally, for tracked robots. |
 | `HandleManager::_NV_restore(std::ifstream&)` | Post-load trigger: re-resolves the persisted Deactivated-robot list after a save loads. |
 
