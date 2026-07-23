@@ -106,6 +106,9 @@ static std::map<std::pair<Character*, size_t>, bool> g_triggerShown;
 // patient -> caregiver, refreshed each frame - see DESIGN.md §5.
 static std::map<Character*, Character*> g_activeFirstAid;
 
+// patient -> caregiver -> last tick seen - see DESIGN.md §3, "await_repair".
+static std::map<Character*, std::map<Character*, ULONGLONG>> g_firstAidCaregiverLastSeen;
+
 // Called after an action that could invalidate more than one trigger at once - see DESIGN.md §5.
 static void clearTriggerShownFor(Character* c)
 {
@@ -321,13 +324,13 @@ bool TryReactivate(Character* self)
 // DESIGN.md §4 for the step types, nested-menu semantics, and button-gating fields below.
 struct DialogueBoxStepDef
 {
-	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu"
+	std::string type; // "action" | "take_item" | "show_text" | "notify" | "delay" | "open_menu" | "await_repair"
 	std::string action; // for "action" - looked up in g_dialogueActions
 	std::string item;   // for "take_item" - FCS/GameData item String ID, consumed from the initiator;
 	                    // also usable on "show_text"/"notify" purely to resolve "{item}" in text, no consuming
 	std::string text;   // for "show_text"/"notify" - "{name}"/"{item}" replaced with the patient's name / item's display name
 	std::string color;  // for "show_text", optional - "#RRGGBB" hex, defaults to white
-	float seconds;       // for "delay" - pauses the remaining steps this many seconds (wall clock)
+	float seconds;       // for "delay", pauses this many seconds (wall clock); for "await_repair", timeout - see DESIGN.md §3
 	std::string menu;    // for "open_menu" - a "DialogueBoxes" key to open, e.g. a submenu or "back" target
 
 	DialogueBoxStepDef() : seconds(0.0f) {}
@@ -377,6 +380,8 @@ struct DialogueTriggerDef
 	std::vector<std::string> requiredStates; // all looked up in g_triggerStateChecks, all must pass
 	std::vector<std::string> buildings; // FCS building String IDs - any one match is enough; empty = no building requirement
 	std::string menu; // a "DialogueBoxes" key to open once requiredStates and buildings both match
+	std::string requiresQualifiedFor; // menu name - hidden unless initiatorQualifiesForMenu() passes for it - see DESIGN.md §5
+	std::string excludeQualifiedFor; // counterpart - hidden if it passes
 };
 static std::vector<DialogueTriggerDef> g_dialogueTriggers;
 
@@ -413,6 +418,23 @@ static bool hasRepairerScience1(Character* c)
 	Character* repairer = (it != g_activeFirstAid.end()) ? it->second : nullptr;
 	CharStats* stats = repairer ? repairer->getStats() : nullptr;
 	return stats && stats->science >= 1.0f;
+}
+
+// See DESIGN.md §3, "await_repair".
+static bool isActivelyRepairing(Character* patient, Character* caregiver)
+{
+	if (!caregiver)
+		return true;
+
+	auto patientIt = g_firstAidCaregiverLastSeen.find(patient);
+	if (patientIt == g_firstAidCaregiverLastSeen.end())
+		return false;
+
+	auto caregiverIt = patientIt->second.find(caregiver);
+	if (caregiverIt == patientIt->second.end())
+		return false;
+
+	return (GetTickCount64() - caregiverIt->second) < 500;
 }
 
 typedef void (*DialogueActionFn)(Character* patient);
@@ -564,6 +586,28 @@ static bool squadHasSkill(Character* initiator, const std::string& skillField, b
 	return findSquadMemberWithSkill(initiator, skillField, hasMin, minValue, hasMax, maxValue) != nullptr;
 }
 
+// Checks the initiator personally, not the squad - see DESIGN.md §5, "requiresQualifiedFor".
+static bool characterHasSkill(Character* c, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
+	if (fieldIt == g_skillFields.end())
+		return true; // unrecognized skill name - treated as no requirement, same as squadHasSkill
+
+	CharStats* stats = c ? c->getStats() : nullptr;
+	if (!stats)
+		return false;
+
+	float value = stats->*(fieldIt->second);
+	return (!hasMin || value >= minValue) && (!hasMax || value <= maxValue);
+}
+
+static bool initiatorHasEitherSkill(Character* initiator, const DialogueBoxButtonDef& btn)
+{
+	bool hasFirst = !btn.requiresSkill.empty() && characterHasSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
+	bool hasSecond = !btn.requiresSkill2.empty() && characterHasSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
+	return hasFirst || hasSecond;
+}
+
 // Patient-only subset of isDialogueButtonEligible's checks - see DESIGN.md §4, "Button-level gating".
 static bool isDialogueButtonForPatient(const DialogueBoxButtonDef& btn, Character* patient)
 {
@@ -612,6 +656,30 @@ static bool isDialogueButtonForPatient(const DialogueBoxButtonDef& btn, Characte
 	}
 
 	return true;
+}
+
+// See DESIGN.md §5, "requiresQualifiedFor".
+static bool initiatorQualifiesForMenu(const std::string& menuId, Character* patient, Character* initiator)
+{
+	auto defIt = g_dialogueBoxes.find(menuId);
+	if (defIt == g_dialogueBoxes.end())
+		return true; // unknown menu - a JSON config error, not the initiator's fault; don't block on it
+
+	bool anySkillGatedButton = false;
+	for (size_t i = 0; i < defIt->second.buttons.size(); ++i)
+	{
+		const DialogueBoxButtonDef& btn = defIt->second.buttons[i];
+		if (btn.requiresSkill.empty() && btn.requiresSkill2.empty())
+			continue;
+		if (!isDialogueButtonForPatient(btn, patient))
+			continue;
+
+		anySkillGatedButton = true;
+		if (initiatorHasEitherSkill(initiator, btn))
+			return true;
+	}
+
+	return !anySkillGatedButton;
 }
 
 // Gates whether a button is shown, not whether its steps can still run once clicked - the "take_item"
@@ -719,10 +787,14 @@ struct PendingDialogueSequence
 	std::vector<DialogueBoxStepDef> steps; // copied, not referenced - see dispatchDialogueSteps()
 	size_t nextIndex;
 	Character* initiator;
+	Character* specialist1; // resolved once at button-click time, carried through every suspension - see DESIGN.md §3
+	Character* specialist2;
 	bool waitForEditorClose; // if true, fireAtTick is unused - resumes once gui->isCharacterEditorMode() clears instead
 	ULONGLONG fireAtTick;
+	bool awaitingRepair; // "await_repair" step - see DESIGN.md §3
+	ULONGLONG repairTimeoutAtTick;
 
-	PendingDialogueSequence() : nextIndex(0), initiator(nullptr), waitForEditorClose(false), fireAtTick(0) {}
+	PendingDialogueSequence() : nextIndex(0), initiator(nullptr), specialist1(nullptr), specialist2(nullptr), waitForEditorClose(false), fireAtTick(0), awaitingRepair(false), repairTimeoutAtTick(0) {}
 };
 static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
@@ -730,9 +802,9 @@ static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 // and the layout-loading machinery below), but "open_menu" steps here need to call back into it.
 static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator);
 
-// A "delay" step suspends the rest of `steps` in g_pendingDialogueSequences and returns rather than
-// blocking; resumed later from Character_updateOnScreenCheck_hook.
-static void dispatchDialogueSteps(Character* patient, Character* initiator, const std::vector<DialogueBoxStepDef>& steps, size_t startIndex)
+// A "delay"/"await_repair" step suspends the rest of `steps` in g_pendingDialogueSequences and returns
+// rather than blocking; resumed later from Character_updateOnScreenCheck_hook.
+static void dispatchDialogueSteps(Character* patient, Character* initiator, Character* specialist1, Character* specialist2, const std::vector<DialogueBoxStepDef>& steps, size_t startIndex)
 {
 	for (size_t i = startIndex; i < steps.size(); ++i)
 	{
@@ -749,11 +821,42 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 				pending.steps = steps;
 				pending.nextIndex = i + 1;
 				pending.initiator = initiator;
+				pending.specialist1 = specialist1;
+				pending.specialist2 = specialist2;
 				pending.fireAtTick = GetTickCount64() + (ULONGLONG)(step.seconds * 1000.0f);
 				g_pendingDialogueSequences[patient] = pending;
 				return; // remaining steps resume later
 			}
 			continue;
+		}
+
+		if (step.type == "await_repair")
+		{
+			// Orders issued once here, not on every poll tick - see DESIGN.md §3.
+			if (specialist1)
+			{
+				OrdersReceiver* orders = specialist1->getOrdersReciever();
+				if (orders)
+					orders->addOrder(FIRST_AID_ROBOT, hand(patient), patient->getPosition(), true, false);
+			}
+			if (specialist2 && specialist2 != specialist1)
+			{
+				OrdersReceiver* orders = specialist2->getOrdersReciever();
+				if (orders)
+					orders->addOrder(FIRST_AID_ROBOT, hand(patient), patient->getPosition(), true, false);
+			}
+
+			PendingDialogueSequence pending;
+			pending.steps = steps;
+			pending.nextIndex = i + 1;
+			pending.initiator = initiator;
+			pending.specialist1 = specialist1;
+			pending.specialist2 = specialist2;
+			pending.awaitingRepair = true;
+			float timeoutSeconds = step.seconds > 0.0f ? step.seconds : 45.0f;
+			pending.repairTimeoutAtTick = GetTickCount64() + (ULONGLONG)(timeoutSeconds * 1000.0f);
+			g_pendingDialogueSequences[patient] = pending;
+			return;
 		}
 
 		if (step.type == "take_item")
@@ -782,6 +885,20 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 
 		if (step.type == "action")
 		{
+			// Clears the specialists' order before recruit() runs - see DESIGN.md §3.
+			if (step.action == "join_squad")
+			{
+				OrdersReceiver* orders1 = specialist1 ? specialist1->getOrdersReciever() : nullptr;
+				if (orders1)
+					orders1->clearOrders();
+				if (specialist2 && specialist2 != specialist1)
+				{
+					OrdersReceiver* orders2 = specialist2->getOrdersReciever();
+					if (orders2)
+						orders2->clearOrders();
+				}
+			}
+
 			auto actionIt = g_dialogueActions.find(step.action);
 			if (actionIt != g_dialogueActions.end())
 				actionIt->second(patient);
@@ -795,6 +912,8 @@ static void dispatchDialogueSteps(Character* patient, Character* initiator, cons
 				pending.steps = steps;
 				pending.nextIndex = i + 1;
 				pending.initiator = initiator;
+				pending.specialist1 = specialist1;
+				pending.specialist2 = specialist2;
 				if (gui && gui->isCharacterEditorMode())
 				{
 					pending.waitForEditorClose = true;
@@ -838,7 +957,13 @@ static void OnMessageBoxButtonClicked(int buttonId)
 	if (!patient || !hasBtn)
 		return;
 
-	dispatchDialogueSteps(patient, initiator, btn.steps, 0);
+	// Re-resolved at click time rather than reusing the message's specialists - see DESIGN.md §3.
+	Character* specialist1 = btn.requiresSkill.empty() ? nullptr
+		: findSquadMemberWithSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
+	Character* specialist2 = btn.requiresSkill2.empty() ? nullptr
+		: findSquadMemberWithSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
+
+	dispatchDialogueSteps(patient, initiator, specialist1, specialist2, btn.steps, 0);
 }
 
 // `initiator` is who "requiresItem"/"requiresSkill"/"take_item" are checked against - null is fine
@@ -1156,7 +1281,6 @@ static void loadDialogueBoxesFromJson()
 					btn.requiresRace = (*bit)["requiresRace"].GetString();
 				if (bit->HasMember("excludeRace") && (*bit)["excludeRace"].IsString())
 					btn.excludeRace = (*bit)["excludeRace"].GetString();
-
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{
 					for (auto sit = (*bit)["steps"].Begin(); sit != (*bit)["steps"].End(); ++sit)
@@ -1238,6 +1362,8 @@ static void loadDialogueTriggersFromJson()
 
 		DialogueTriggerDef trigger;
 		trigger.menu = (t.HasMember("menu") && t["menu"].IsString()) ? t["menu"].GetString() : "";
+		trigger.requiresQualifiedFor = (t.HasMember("requiresQualifiedFor") && t["requiresQualifiedFor"].IsString()) ? t["requiresQualifiedFor"].GetString() : "";
+		trigger.excludeQualifiedFor = (t.HasMember("excludeQualifiedFor") && t["excludeQualifiedFor"].IsString()) ? t["excludeQualifiedFor"].GetString() : "";
 
 		if (t.HasMember("requiredStates") && t["requiredStates"].IsArray())
 		{
@@ -1309,7 +1435,11 @@ bool MedicalSystem_applyFirstAid_hook(MedicalSystem* self, float skill, Item* eq
 	Character* patient = head ? head->me : nullptr;
 
 	if (patient)
+	{
 		g_activeFirstAid[patient] = who;
+		if (who)
+			g_firstAidCaregiverLastSeen[patient][who] = GetTickCount64();
+	}
 
 	return MedicalSystem_applyFirstAid_orig(self, skill, equipment, frameTIME, who);
 }
@@ -1355,6 +1485,14 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	Character* initiator = (repairerIt != g_activeFirstAid.end() && repairerIt->second)
 		? repairerIt->second
 		: ((ou && ou->player) ? ou->player->selectedCharacter.getCharacter() : nullptr);
+
+	// Not marked shown on failure, so this re-checks next tick - see DESIGN.md §5.
+	if (!trigger.requiresQualifiedFor.empty() && !initiatorQualifiesForMenu(trigger.requiresQualifiedFor, self, initiator))
+		return;
+
+	if (!trigger.excludeQualifiedFor.empty() && initiatorQualifiesForMenu(trigger.excludeQualifiedFor, self, initiator))
+		return;
+
 	showDialogueBox(trigger.menu, self, initiator);
 	g_triggerShown[shownKey] = true;
 }
@@ -1432,15 +1570,37 @@ bool Character_updateOnScreenCheck_hook(Character* self)
 	auto delayIt = g_pendingDialogueSequences.find(self);
 	if (delayIt != g_pendingDialogueSequences.end())
 	{
-		bool ready = delayIt->second.waitForEditorClose
-			? !(gui && gui->isCharacterEditorMode())
-			: GetTickCount64() >= delayIt->second.fireAtTick;
-
-		if (ready)
+		if (delayIt->second.awaitingRepair)
 		{
-			PendingDialogueSequence pending = delayIt->second;
-			g_pendingDialogueSequences.erase(delayIt);
-			dispatchDialogueSteps(self, pending.initiator, pending.steps, pending.nextIndex);
+			bool specialistsReady = isActivelyRepairing(self, delayIt->second.specialist1)
+				&& isActivelyRepairing(self, delayIt->second.specialist2);
+
+			if (specialistsReady)
+			{
+				PendingDialogueSequence pending = delayIt->second;
+				g_pendingDialogueSequences.erase(delayIt);
+				dispatchDialogueSteps(self, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
+			}
+			else if (GetTickCount64() >= delayIt->second.repairTimeoutAtTick)
+			{
+				// Aborts the sequence rather than proceeding without both specialists - see DESIGN.md §3.
+				verboseLog("SkeletonRebirth: await_repair timed out for " + self->getName());
+				showGameNotification(self, "{name}'s specialists couldn't get into position in time - service mode aborted.", "");
+				g_pendingDialogueSequences.erase(delayIt);
+			}
+		}
+		else
+		{
+			bool ready = delayIt->second.waitForEditorClose
+				? !(gui && gui->isCharacterEditorMode())
+				: GetTickCount64() >= delayIt->second.fireAtTick;
+
+			if (ready)
+			{
+				PendingDialogueSequence pending = delayIt->second;
+				g_pendingDialogueSequences.erase(delayIt);
+				dispatchDialogueSteps(self, pending.initiator, pending.specialist1, pending.specialist2, pending.steps, pending.nextIndex);
+			}
 		}
 	}
 

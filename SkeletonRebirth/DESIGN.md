@@ -258,6 +258,42 @@ than a stable stat snapshot, and unsuitable for a one-time gate). Confirmed live
 header) that `who` is the caregiver, not the patient - reached the same way as the `medicalUpdate()` hook
 reaches its owning `Character*`, via `getPart(PART_HEAD)->me`.
 
+**`"await_repair"` step**: makes the "Diagnostics" button's specialists (the squad members
+`requiresSkill`/`requiresSkill2` resolved for that button, re-resolved fresh at click time rather than
+reusing the message's copy - squad composition could theoretically change between the two) physically
+walk to the patient and perform the repair animation before the item is consumed or "Service mode
+loading..." shows, rather than that text appearing the instant the button is clicked regardless of
+where anyone actually is. Confirmed live via a one-off diagnostic that `OrdersReceiver::addOrder`
+(`Character::getOrdersReciever()`, the same order-issuing entry point vanilla right-click orders use)
+with `FIRST_AID_ROBOT` genuinely walks a character to the target and plays the repair animation - not
+just a state flag. Issued once per specialist when the step first runs (`clearOld=true`, so it
+pre-empts whatever they were doing), not on every poll tick, which would otherwise restart their
+approach path repeatedly. Completion is detected via `g_firstAidCaregiverLastSeen` (patient → caregiver
+→ last tick `applyFirstAid()` fired for them, populated alongside `g_activeFirstAid` in that hook) and
+`isActivelyRepairing()`, checking "seen within the last 500ms" rather than exact same-frame
+synchronization - `g_activeFirstAid` alone can't do this since it only keeps the single most recent
+caregiver per patient, and two specialists can each be mid-animation at once. If both specialists (or
+the one required, or neither if the button needs no skill) haven't started within the step's `seconds`
+(default 45 if omitted/zero) the sequence aborts with a notification instead of silently proceeding
+without them - same "no silent partial effects" principle as `take_item`'s failure path. This is also
+what stops a squad member from reviving from across the map purely by satisfying the squad-wide skill
+check: passing the gate only gets you the option to attempt it, the specialists still have to physically
+get there.
+
+**Clearing the order once repair is confirmed matters, not just issuing it.** Crashed live on "Reset":
+`join_squad`'s `recruit(editor=true)` reassigns the patient's handle (confirmed via logged
+before/after handles differing), and a specialist's `FIRST_AID_ROBOT` order was still live, targeting
+the patient by its old identity, when that reassignment happened - a handle-vs-stale-order race. The
+same `join_squad`→`system_reset` sequence had run crash-free earlier, before `await_repair` existed,
+which pointed at the outstanding order rather than the already-documented `recruit()` flakiness above.
+Fixed by calling `OrdersReceiver::clearOrders()` (the counterpart to `addOrder`, not `removeGoal`/
+`removeJob` - those pair with `addGoal`/`addJob`, a different sub-system) on both specialists, but not
+immediately once `specialistsReady` goes true - deferred specifically to right before the `"join_squad"`
+action step fires (`dispatchDialogueSteps()`'s `"action"` handling, before `recruit()` runs), so the
+specialists keep visibly working through `take_item`/the delays/`diagnostic_menu` instead of going idle
+the moment the animation is first confirmed, only stopping at the one step that's actually unsafe to
+run while their order is still live.
+
 Earlier approaches tried and rejected before landing on the furniture-polling design above:
 - `MedicalSystem::applyFirstAid()` (the original design, gated on using a `ITEM_ROBOTREPAIR` item) broke
   once `dead=true` took effect under an earlier design - a genuinely dead character isn't a valid target
@@ -457,6 +493,9 @@ or fewer be eligible.
   per-frame delta, since `updateOnScreenCheck()` doesn't receive one and this is cosmetic UI pacing, not
   gameplay-critical timing - the same relaxed precision the old `delay` override type used, just driven
   by wall clock instead of `Dialogue::update()`'s `frameTime`.
+- `"await_repair"` — suspends the same way `"delay"` does, but resumes on a condition
+  (`isActivelyRepairing()` for both resolved specialists) instead of a fixed time, with `seconds` as a
+  timeout rather than a wait length. See §3, "`"await_repair"` step", for the full mechanism.
 
 `join_squad` (not `join_squad_fast`) always defers the rest of its sequence through the same
 `g_pendingDialogueSequences` mechanism, implicitly - not something a JSON author writes. If
@@ -593,6 +632,34 @@ the flag, since the trigger's conditions still hold - clearing it would reopen t
 frame, making "No" appear to do nothing. Only a real state change (leaving the building, or an action
 like reactivation clearing `g_deactivated`) clears it, via the same requiredStates/buildings check
 re-run every frame regardless of the flag.
+
+**`requiresQualifiedFor`/`excludeQualifiedFor`** (string, counterparts, a named `DialogueBoxes` key) gate
+a trigger on whether the initiator *personally* qualifies for a skill-gated button in that box -
+`initiatorQualifiesForMenu()` walks the named box's buttons, filters to the ones
+`isDialogueButtonForPatient()` says apply to this patient, and returns true if the initiator meets
+`requiresSkill` or `requiresSkill2` (OR, via `initiatorHasEitherSkill()`) on any of them; true
+unconditionally if none of them are skill-gated at all. No skill names or thresholds are hardcoded here -
+it reads whatever's already on the target box's own buttons, the same values `squadHasSkill()` uses for
+the squad-wide check. This is what stops an unrelated squad member from opening "Diagnostics" just
+because *someone else* in the squad qualifies and the item happens to be in their pocket: passing the
+squad-wide check only means specialists exist somewhere, not that the person standing here is one of
+them. `system_menu`/`system_menu_animal` each get a paired dead-end trigger, listed *first* in
+`DialogueTriggers` and sharing the same `requiredStates`/`buildings`, with `excludeQualifiedFor` pointing
+at the real menu and `menu` pointing at `no_specialist_menu` instead; the real trigger immediately after
+adds the matching `requiresQualifiedFor`. Since the two conditions are exact complements for a given
+initiator, at most one of the pair ever fires, and because triggers are evaluated in array order with
+`showDialogueBox()` a no-op once one is already pending, whichever is listed first effectively wins -
+"first eligible trigger" gives if/else routing to a genuinely distinct initial box, entirely through
+existing trigger evaluation, with no bespoke redirect concept.
+
+Rejected first: the same OR-check as a *button*-level `requiresInitiatorSpecialist`/
+`excludeInitiatorSpecialist` pair, with a mutually-exclusive dead-end sibling button per "Diagnostics"
+variant whose only step was `open_menu` to the dead-end box. It worked but only after an extra click
+through an intentionally-identical "Diagnostics" caption - live testing showed a player has no way to
+tell, before clicking, that this particular menu already knows they don't qualify, so it read as "nothing
+happened" rather than a warning. Moving the same check to trigger time, so the dead-end is the box that
+opens initially, fixed that without discarding the JSON-driven check itself - only where it's evaluated
+changed.
 
 ### 6. Cleanup - not implemented
 

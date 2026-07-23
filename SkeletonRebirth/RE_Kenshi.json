@@ -5,16 +5,37 @@
 		{
 			"requiredStates" : [ "deactivated", "humanoid", "inBed" ],
 			"buildings" : [ "64614-rebirth.mod" ],
+			"excludeQualifiedFor" : "system_menu",
+			"menu" : "no_specialist_menu"
+		},
+		{
+			"requiredStates" : [ "deactivated", "humanoid", "inBed" ],
+			"buildings" : [ "64614-rebirth.mod" ],
+			"requiresQualifiedFor" : "system_menu",
 			"menu" : "system_menu"
 		},
 		{
 			"requiredStates" : [ "deactivated", "humanoid", "beingRepaired", "repairerScience1" ],
 			"buildings" : [],
+			"excludeQualifiedFor" : "system_menu",
+			"menu" : "no_specialist_menu"
+		},
+		{
+			"requiredStates" : [ "deactivated", "humanoid", "beingRepaired", "repairerScience1" ],
+			"buildings" : [],
+			"requiresQualifiedFor" : "system_menu",
 			"menu" : "system_menu"
 		},
 		{
 			"requiredStates" : [ "deactivated", "animal", "beingRepaired", "repairerScience1" ],
 			"buildings" : [],
+			"excludeQualifiedFor" : "system_menu_animal",
+			"menu" : "no_specialist_menu"
+		},
+		{
+			"requiredStates" : [ "deactivated", "animal", "beingRepaired", "repairerScience1" ],
+			"buildings" : [],
+			"requiresQualifiedFor" : "system_menu_animal",
 			"menu" : "system_menu_animal"
 		}
 	],
@@ -33,6 +54,7 @@
 					"minSkill2": 40,
 					"requiresItem": "43392-changes_otto.mod",
 					"steps": [
+						{ "type": "await_repair", "seconds": 45 },
 						{ "type": "take_item", "item": "43392-changes_otto.mod" },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
@@ -48,6 +70,7 @@
 					"minSkill2": 20,
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
+						{ "type": "await_repair", "seconds": 45 },
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
@@ -74,12 +97,24 @@
 					"minSkill2": 30,
 					"requiresItem": "43398-changes_otto.mod",
 					"steps": [
+						{ "type": "await_repair", "seconds": 45 },
 						{ "type": "take_item", "item": "43398-changes_otto.mod" },
 						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43398-changes_otto.mod", "color": "#FF4C4C" },
 						{ "type": "delay", "seconds": 3 },
 						{ "type": "open_menu", "menu": "diagnostic_menu" }
 					]
 				},
+				{
+					"caption": "Exit",
+					"steps": []
+				}
+			]
+		},
+
+		"no_specialist_menu": {
+			"title": "Bootloader Menu",
+			"message": "{name}'s systems are beyond your own expertise.\n\nYou'll need someone versed in old world science or robotics to attempt this.",
+			"buttons": [
 				{
 					"caption": "Exit",
 					"steps": []
