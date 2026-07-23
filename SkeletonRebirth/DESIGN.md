@@ -547,6 +547,13 @@ confirming without editing already is the "don't rename" path; there's nothing f
 differently. Pending state (`PendingNamePrompt`) is keyed by the Confirm button widget, not by patient -
 nothing stops two robots from being mid-sequence at once.
 
+**The defer and the name prompt are both intentionally baked into `"join_squad"` itself, not left as
+separate JSON-composable steps** - the defer exists specifically to dodge the crash above, so it can't be
+optional or something a JSON author might forget to add. `"join_squad"` (recruit + mandatory defer +
+rename prompt) and `"join_squad_fast"` (recruit only, no defer, no prompt) are each already independently
+reusable by name from any future button's `steps` array via `g_dialogueActions` - pick whichever fits
+without needing to hand-assemble delay/prompt steps around either one.
+
 **Button-level gating** (`requiresSkill`/`minSkill`/`maxSkill`, `requiresItems`, `excludePlayerFaction`)
 controls whether a button is shown at all, evaluated once when `showDialogueBox()` is called, separately
 from anything its steps do:

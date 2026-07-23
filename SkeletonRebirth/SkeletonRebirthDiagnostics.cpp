@@ -1236,7 +1236,6 @@ static void DialogueAction_JoinSquadFast(Character* patient)
 		ou->player->recruit(patient, false);
 }
 
-// Must run AFTER DialogueAction_JoinSquad if a button uses both - see DESIGN.md §4.
 static void DialogueAction_SystemReset(Character* patient)
 {
 	if (isAnimalCharacterType(patient))
