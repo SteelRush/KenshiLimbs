@@ -43,11 +43,11 @@
 		"system_menu": {
 			"title": "Bootloader Menu",
 			"item": "43392-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics.\n\nWhat do you want to do?",
+			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics. {skillStatus} {skillStatus2}\n\nWhat do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
-					"excludeRace": "Skeleton No-Head MkII",
+					"excludeRace": "95870-Newwworld.mod",
 					"requiresSkill": "science",
 					"minSkill": 40,
 					"requiresSkill2": "robotics",
@@ -63,7 +63,7 @@
 				},
 				{
 					"caption": "Diagnostics",
-					"requiresRace": "Skeleton No-Head MkII",
+					"requiresRace": "95870-Newwworld.mod",
 					"requiresSkill": "science",
 					"minSkill": 20,
 					"requiresSkill2": "robotics",
@@ -87,10 +87,11 @@
 		"system_menu_animal": {
 			"title": "Bootloader Menu",
 			"item": "43398-changes_otto.mod",
-			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics.\n\nWhat do you want to do?",
+			"message": "{name} is in a catastrophic shutdown loop.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillCharacter} can handle the old world science, and {skillCharacter2} can handle the robotics. {skillStatus} {skillStatus2}\n\nWhat do you want to do?",
 			"buttons": [
 				{
 					"caption": "Diagnostics",
+					"excludeCharacter": [ "56111-Newwworld.mod", "96147-__Southern hive.mod" ],
 					"requiresSkill": "science",
 					"minSkill": 30,
 					"requiresSkill2": "robotics",
@@ -105,6 +106,22 @@
 					]
 				},
 				{
+					"caption": "Diagnostics",
+					"requiresCharacter": [ "56111-Newwworld.mod", "96147-__Southern hive.mod" ],
+					"requiresSkill": "science",
+					"minSkill": 30,
+					"requiresSkill2": "robotics",
+					"minSkill2": 30,
+					"requiresItems": [ { "item": "43392-changes_otto.mod", "count": 3 } ],
+					"steps": [
+						{ "type": "await_repair", "seconds": 45 },
+						{ "type": "take_item", "items": [ { "item": "43392-changes_otto.mod", "count": 3 } ] },
+						{ "type": "show_text", "text": "{item} used. Service mode loading...", "item": "43392-changes_otto.mod", "color": "#FF4C4C" },
+						{ "type": "delay", "seconds": 3 },
+						{ "type": "open_menu", "menu": "diagnostic_menu" }
+					]
+				},
+				{
 					"caption": "Exit",
 					"steps": []
 				}
@@ -113,7 +130,7 @@
 
 		"no_specialist_menu": {
 			"title": "Bootloader Menu",
-			"message": "{name}'s systems are beyond your own expertise.\n\nYou'll need someone versed in old world science or robotics to attempt this.",
+			"message": "{name}'s systems are beyond your own expertise.\n\nA {item} will be required to enable service mode for repairs. {itemStatus}\n\n{skillStatus} {skillStatus2}\n\nYou'll need someone versed in old world science or robotics to attempt this.",
 			"buttons": [
 				{
 					"caption": "Exit",

@@ -42,6 +42,7 @@
 #include <Windows.h>
 
 #include <cctype>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -365,8 +366,10 @@ struct DialogueBoxButtonDef
 	bool excludeDeactivated; // hidden while the patient is in g_deactivated - the counterpart to requiresDeactivated
 	bool requiresAnimal; // hidden unless isAnimalCharacterType() - lets an animal-only button require a different item than the humanoid one
 	bool excludeAnimal; // hidden if isAnimalCharacterType() - the humanoid-only counterpart to requiresAnimal
-	std::string requiresRace; // RaceData's display name (Character::getRace()->data->name) - hidden unless it matches exactly
-	std::string excludeRace; // same match, inverted - the counterpart to requiresRace
+	std::vector<std::string> requiresRace; // RaceData FCS String IDs (Character::getRace()->data->stringID) - hidden unless it matches any one of these
+	std::vector<std::string> excludeRace; // same match, inverted - the counterpart to requiresRace
+	std::vector<std::string> requiresCharacter; // the patient's own FCS String ID (Character::getGameData()->stringID, same accessor as isAnimalCharacterType()) - for gating on a specific unique character rather than its whole race
+	std::vector<std::string> excludeCharacter; // same match, inverted - the counterpart to requiresCharacter
 
 	DialogueBoxButtonDef() : hasMinSkill(false), minSkill(0.0f), hasMaxSkill(false), maxSkill(0.0f), hasMinSkill2(false), minSkill2(0.0f), hasMaxSkill2(false), maxSkill2(0.0f), excludePlayerFaction(false), requiresPlayerFaction(false), requiresDeactivated(false), excludeDeactivated(false), requiresAnimal(false), excludeAnimal(false) {}
 };
@@ -511,14 +514,17 @@ static std::string toLowerCopy(const std::string& s)
 	return result;
 }
 
-// See DESIGN.md §4 for why requiresRace/excludeRace need this.
-static std::string trimCopy(const std::string& s)
+// For logging a requiresRace/excludeRace/buildings-style "any one match" vector as one string.
+static std::string joinStrings(const std::vector<std::string>& values, const char* separator)
 {
-	size_t start = s.find_first_not_of(" \t\r\n");
-	if (start == std::string::npos)
-		return "";
-	size_t end = s.find_last_not_of(" \t\r\n");
-	return s.substr(start, end - start + 1);
+	std::string result;
+	for (size_t i = 0; i < values.size(); ++i)
+	{
+		if (i > 0)
+			result += separator;
+		result += values[i];
+	}
+	return result;
 }
 
 // Hand-rolled "#RRGGBB" parsing - MyGUI::Colour's own string constructor format isn't documented in
@@ -571,34 +577,97 @@ static bool characterHasSkill(Character* c, const std::string& skillField, bool 
 	return (!hasMin || value >= minValue) && (!hasMax || value <= maxValue);
 }
 
-// Prefers the initiator themselves over the rest of the squad - see DESIGN.md §4, "Button-level gating".
-static Character* findSquadMemberWithSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+struct SquadSkillStatus
 {
+	Character* qualifiedMember; // first squad member (initiator preferred) that meets the min/max range - nullptr if nobody does
+	Character* bestMember; // highest-value candidate seen, whether or not they qualify - nullptr if nobody in the squad has stats
+	float bestValue;
+
+	SquadSkillStatus() : qualifiedMember(nullptr), bestMember(nullptr), bestValue(0.0f) {}
+};
+
+// Prefers the initiator themselves over the rest of the squad - see DESIGN.md §4, "Button-level gating".
+// Also tracks the closest (highest-value) candidate even when nobody qualifies, so {skillStatus} can
+// tell the player what to rank up instead of just naming a blank "No one".
+static SquadSkillStatus findSquadSkillStatus(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	SquadSkillStatus status;
+
 	auto fieldIt = g_skillFields.find(toLowerCopy(skillField));
 	if (fieldIt == g_skillFields.end())
-		return initiator; // unrecognized skill name - logged once at JSON-load time, treated as no requirement
-
-	if (characterHasSkill(initiator, skillField, hasMin, minValue, hasMax, maxValue))
-		return initiator;
-
-	ActivePlatoon* platoon = initiator ? initiator->getPlatoon() : nullptr;
-	if (!platoon)
-		return nullptr;
-
-	for (auto it = platoon->things.begin(); it != platoon->things.end(); ++it)
 	{
-		Character* member = hand(*it).getCharacter();
-		if (member == initiator)
-			continue; // already checked above
+		status.qualifiedMember = initiator; // unrecognized skill name - logged once at JSON-load time, treated as no requirement
+		return status;
+	}
 
-		CharStats* stats = member ? member->getStats() : nullptr;
+	std::vector<Character*> candidates;
+	candidates.push_back(initiator);
+	ActivePlatoon* platoon = initiator ? initiator->getPlatoon() : nullptr;
+	if (platoon)
+	{
+		for (auto it = platoon->things.begin(); it != platoon->things.end(); ++it)
+		{
+			Character* member = hand(*it).getCharacter();
+			if (member != initiator)
+				candidates.push_back(member);
+		}
+	}
+
+	for (size_t i = 0; i < candidates.size(); ++i)
+	{
+		Character* c = candidates[i];
+		CharStats* stats = c ? c->getStats() : nullptr;
 		if (!stats)
 			continue;
+
 		float value = stats->*(fieldIt->second);
-		if ((!hasMin || value >= minValue) && (!hasMax || value <= maxValue))
-			return member;
+		bool qualifies = (!hasMin || value >= minValue) && (!hasMax || value <= maxValue);
+		if (qualifies && !status.qualifiedMember)
+			status.qualifiedMember = c;
+		if (!status.bestMember || value > status.bestValue)
+		{
+			status.bestMember = c;
+			status.bestValue = value;
+		}
 	}
-	return nullptr;
+
+	return status;
+}
+
+static Character* findSquadMemberWithSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	return findSquadSkillStatus(initiator, skillField, hasMin, minValue, hasMax, maxValue).qualifiedMember;
+}
+
+static std::string describeSkillThreshold(bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	std::ostringstream oss;
+	if (hasMin && hasMax)
+		oss << "between " << (int)minValue << " and " << (int)maxValue;
+	else if (hasMin)
+		oss << "at least " << (int)minValue;
+	else if (hasMax)
+		oss << "at most " << (int)maxValue;
+	return oss.str();
+}
+
+// Blank once someone qualifies - {skillStatus}/{skillStatus2} only need to explain a gap, not restate
+// a pass that {skillCharacter}/{skillCharacter2} already named.
+static std::string buildSkillStatusText(const std::string& skillField, const SquadSkillStatus& status, bool hasMin, float minValue, bool hasMax, float maxValue)
+{
+	if (status.qualifiedMember)
+		return "";
+
+	std::string threshold = describeSkillThreshold(hasMin, minValue, hasMax, maxValue);
+	if (threshold.empty())
+		return "";
+
+	std::ostringstream oss;
+	if (status.bestMember)
+		oss << status.bestMember->getName() << " is closest at " << skillField << " " << (int)status.bestValue << " (needs " << threshold << ").";
+	else
+		oss << "Nobody in the squad has trained " << skillField << " yet (needs " << threshold << ").";
+	return oss.str();
 }
 
 static bool squadHasSkill(Character* initiator, const std::string& skillField, bool hasMin, float minValue, bool hasMax, float maxValue)
@@ -649,14 +718,32 @@ static bool isDialogueButtonForPatient(const DialogueBoxButtonDef& btn, Characte
 	if (!btn.requiresRace.empty())
 	{
 		RaceData* race = patient->getRace();
-		if (!race || !race->data || trimCopy(race->data->name) != trimCopy(btn.requiresRace))
+		bool matches = race && race->data && std::find(btn.requiresRace.begin(), btn.requiresRace.end(), race->data->stringID) != btn.requiresRace.end();
+		if (!matches)
 			return false;
 	}
 
 	if (!btn.excludeRace.empty())
 	{
 		RaceData* race = patient->getRace();
-		if (race && race->data && trimCopy(race->data->name) == trimCopy(btn.excludeRace))
+		bool matches = race && race->data && std::find(btn.excludeRace.begin(), btn.excludeRace.end(), race->data->stringID) != btn.excludeRace.end();
+		if (matches)
+			return false;
+	}
+
+	if (!btn.requiresCharacter.empty())
+	{
+		GameData* data = patient->getGameData();
+		bool matches = data && std::find(btn.requiresCharacter.begin(), btn.requiresCharacter.end(), data->stringID) != btn.requiresCharacter.end();
+		if (!matches)
+			return false;
+	}
+
+	if (!btn.excludeCharacter.empty())
+	{
+		GameData* data = patient->getGameData();
+		bool matches = data && std::find(btn.excludeCharacter.begin(), btn.excludeCharacter.end(), data->stringID) != btn.excludeCharacter.end();
+		if (matches)
 			return false;
 	}
 
@@ -726,7 +813,7 @@ static void closeDialogueBox()
 }
 
 // Shared by the dialogue box message, "show_text", and "notify" - see DESIGN.md §4.
-static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, bool hasItem, const std::string& skillCharacterName, const std::string& skillCharacterName2, const std::string& callerLabel)
+static std::string resolvePlaceholders(const std::string& text, Character* patient, const std::string& itemId, int requiredItemCount, int ownedItemCount, const std::string& skillCharacterName, const std::string& skillCharacterName2, const std::string& skillStatusText, const std::string& skillStatusText2, const std::string& callerLabel)
 {
 	std::string resolvedText = text;
 
@@ -746,7 +833,14 @@ static std::string resolvePlaceholders(const std::string& text, Character* patie
 
 	size_t itemStatusPos = resolvedText.find("{itemStatus}");
 	if (itemStatusPos != std::string::npos)
-		resolvedText.replace(itemStatusPos, 12, hasItem ? "You have one." : "You don't have one yet.");
+	{
+		std::string itemStatusText;
+		if (requiredItemCount <= 1)
+			itemStatusText = ownedItemCount >= 1 ? "You have one." : "You don't have one yet.";
+		else
+			itemStatusText = "You have " + std::to_string((long long)ownedItemCount) + " of the " + std::to_string((long long)requiredItemCount) + " needed.";
+		resolvedText.replace(itemStatusPos, 12, itemStatusText);
+	}
 
 	// Falls back to "No one" rather than erroring - see DESIGN.md §4.
 	size_t skillPos = resolvedText.find("{skillCharacter}");
@@ -757,6 +851,15 @@ static std::string resolvePlaceholders(const std::string& text, Character* patie
 	if (skillPos2 != std::string::npos)
 		resolvedText.replace(skillPos2, 17, skillCharacterName2.empty() ? "No one" : skillCharacterName2);
 
+	// Blank (not "No one") once someone qualifies - see buildSkillStatusText().
+	size_t skillStatusPos = resolvedText.find("{skillStatus}");
+	if (skillStatusPos != std::string::npos)
+		resolvedText.replace(skillStatusPos, 13, skillStatusText);
+
+	size_t skillStatusPos2 = resolvedText.find("{skillStatus2}");
+	if (skillStatusPos2 != std::string::npos)
+		resolvedText.replace(skillStatusPos2, 14, skillStatusText2);
+
 	return resolvedText;
 }
 
@@ -765,7 +868,7 @@ static void showFloatingText(Character* patient, const std::string& text, const 
 	if (!gui || text.empty())
 		return;
 
-	std::string resolvedText = resolvePlaceholders(text, patient, itemId, false, "", "", "dialogue step \"show_text\"");
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, 1, 0, "", "", "", "", "dialogue step \"show_text\"");
 
 	MyGUI::Colour color = MyGUI::Colour::White;
 	if (!colorHex.empty() && !tryParseHexColor(colorHex, color))
@@ -782,7 +885,7 @@ static void showGameNotification(Character* patient, const std::string& text, co
 	if (!ou || text.empty())
 		return;
 
-	std::string resolvedText = resolvePlaceholders(text, patient, itemId, false, "", "", "dialogue step \"notify\"");
+	std::string resolvedText = resolvePlaceholders(text, patient, itemId, 1, 0, "", "", "", "", "dialogue step \"notify\"");
 	ou->showPlayerAMessage_withLog(resolvedText, true);
 }
 
@@ -806,7 +909,10 @@ static std::map<Character*, PendingDialogueSequence> g_pendingDialogueSequences;
 
 // Forward-declared - showDialogueBox() is defined further down (it needs isDialogueButtonEligible()
 // and the layout-loading machinery below), but "open_menu" steps here need to call back into it.
-static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator);
+// requirementsMenuId lets a dead-end box (e.g. no_specialist_menu, which has no requiresItems/
+// requiresSkill buttons of its own) borrow another box's per-patient button requirements for its
+// own {item}/{itemStatus}/{skillCharacter}/{skillStatus} placeholders - see evaluateDialogueTrigger().
+static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator, const std::string& requirementsMenuId = "");
 
 // A "delay"/"await_repair" step suspends the rest of `steps` in g_pendingDialogueSequences and returns
 // rather than blocking; resumed later from Character_updateOnScreenCheck_hook.
@@ -1067,7 +1173,7 @@ static void OnMessageBoxButtonClicked(int buttonId)
 
 // `initiator` is who "requiresItems"/"requiresSkill"/"take_item" are checked against - null is fine
 // for a dialogue with no gated buttons or item steps.
-static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator)
+static void showDialogueBox(const std::string& dialogueId, Character* patient, Character* initiator, const std::string& requirementsMenuId)
 {
 	if (g_pendingDialoguePatient)
 		return; // one at a time - a second trigger shouldn't stack a second box
@@ -1079,6 +1185,18 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 	const DialogueBoxDef& def = defIt->second;
+
+	// Defaults to this box's own buttons - only a dead-end box like no_specialist_menu passes a
+	// different requirementsMenuId, to borrow the real menu's item/skill requirements for its message.
+	const DialogueBoxDef* reqDef = &def;
+	if (!requirementsMenuId.empty())
+	{
+		auto reqDefIt = g_dialogueBoxes.find(requirementsMenuId);
+		if (reqDefIt != g_dialogueBoxes.end())
+			reqDef = &reqDefIt->second;
+		else
+			ErrorLog("SkeletonRebirth: dialogue box \"" + dialogueId + "\" has requirementsMenuId \"" + requirementsMenuId + "\" but no such \"DialogueBoxes\" entry exists - falling back to its own buttons");
+	}
 
 	// Capped at 3 - see DESIGN.md §4.
 	std::vector<DialogueBoxButtonDef> eligibleButtons;
@@ -1101,11 +1219,19 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 			if (!btn.requiresRace.empty() || !btn.excludeRace.empty())
 			{
 				RaceData* patientRace = patient->getRace();
-				ss << " requiresRace=\"" << btn.requiresRace << "\" excludeRace=\"" << btn.excludeRace << "\""
+				ss << " requiresRace=\"" << joinStrings(btn.requiresRace, ",") << "\" excludeRace=\"" << joinStrings(btn.excludeRace, ",") << "\""
 				   << " patientRaceNull=" << (patientRace == nullptr)
 				   << " patientRaceDataNull=" << (patientRace && !patientRace->data)
 				   << " patientRaceName=\"" << (patientRace && patientRace->data ? patientRace->data->name : "") << "\""
 				   << " patientRaceStringID=\"" << (patientRace && patientRace->data ? patientRace->data->stringID : "") << "\"";
+			}
+
+			if (!btn.requiresCharacter.empty() || !btn.excludeCharacter.empty())
+			{
+				GameData* patientData = patient->getGameData();
+				ss << " requiresCharacter=\"" << joinStrings(btn.requiresCharacter, ",") << "\" excludeCharacter=\"" << joinStrings(btn.excludeCharacter, ",") << "\""
+				   << " patientGameDataNull=" << (patientData == nullptr)
+				   << " patientStringID=\"" << (patientData ? patientData->stringID : "") << "\"";
 			}
 
 			if (!btn.requiresSkill.empty())
@@ -1145,17 +1271,20 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		return;
 	}
 
-	// Resolved via isDialogueButtonForPatient(), not eligibleButtons - see DESIGN.md §4.
-	std::string effectiveItem = def.item;
+	// Resolved via isDialogueButtonForPatient(), not eligibleButtons - see DESIGN.md §4. Reads from
+	// reqDef, not def, so a dead-end box can borrow the real menu's requirements (see above).
+	std::string effectiveItem = reqDef->item;
 	int effectiveItemCount = 1;
 	bool foundItem = false;
 	std::string skillCharacterName;
+	std::string skillStatusText;
 	bool foundSkill = false;
 	std::string skillCharacterName2;
+	std::string skillStatusText2;
 	bool foundSkill2 = false;
-	for (size_t i = 0; i < def.buttons.size() && (!foundItem || !foundSkill || !foundSkill2); ++i)
+	for (size_t i = 0; i < reqDef->buttons.size() && (!foundItem || !foundSkill || !foundSkill2); ++i)
 	{
-		const DialogueBoxButtonDef& btn = def.buttons[i];
+		const DialogueBoxButtonDef& btn = reqDef->buttons[i];
 		if (!isDialogueButtonForPatient(btn, patient))
 			continue;
 
@@ -1169,25 +1298,27 @@ static void showDialogueBox(const std::string& dialogueId, Character* patient, C
 		if (!foundSkill && !btn.requiresSkill.empty())
 		{
 			foundSkill = true;
-			Character* c = findSquadMemberWithSkill(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
-			if (c)
-				skillCharacterName = c->getName();
+			SquadSkillStatus status = findSquadSkillStatus(initiator, btn.requiresSkill, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
+			if (status.qualifiedMember)
+				skillCharacterName = status.qualifiedMember->getName();
+			skillStatusText = buildSkillStatusText(btn.requiresSkill, status, btn.hasMinSkill, btn.minSkill, btn.hasMaxSkill, btn.maxSkill);
 		}
 
 		if (!foundSkill2 && !btn.requiresSkill2.empty())
 		{
 			foundSkill2 = true;
-			Character* c = findSquadMemberWithSkill(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
-			if (c)
-				skillCharacterName2 = c->getName();
+			SquadSkillStatus status = findSquadSkillStatus(initiator, btn.requiresSkill2, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
+			if (status.qualifiedMember)
+				skillCharacterName2 = status.qualifiedMember->getName();
+			skillStatusText2 = buildSkillStatusText(btn.requiresSkill2, status, btn.hasMinSkill2, btn.minSkill2, btn.hasMaxSkill2, btn.maxSkill2);
 		}
 	}
 
 	Inventory* initiatorInv = initiator ? initiator->getInventory() : nullptr;
 	GameData* effectiveItemData = effectiveItem.empty() ? nullptr : getGameDataGuarded(effectiveItem, ITEM);
-	bool hasItem = initiatorInv && effectiveItemData && initiatorInv->hasItem(effectiveItemData, effectiveItemCount);
+	int ownedItemCount = initiatorInv && effectiveItemData ? initiatorInv->countItems(effectiveItemData) : 0;
 
-	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, hasItem, skillCharacterName, skillCharacterName2, "dialogue box \"" + dialogueId + "\"");
+	std::string message = resolvePlaceholders(def.message, patient, effectiveItem, effectiveItemCount, ownedItemCount, skillCharacterName, skillCharacterName2, skillStatusText, skillStatusText2, "dialogue box \"" + dialogueId + "\"");
 
 	// Ogre::vector<T>::type, not plain std::vector<T> - createMessageBox()'s "buttons" parameter is
 	// declared with Ogre's own custom-allocator vector, a distinct type from the plain-std one.
@@ -1312,6 +1443,22 @@ static void parseItemRequirements(const rapidjson::Value& arr, const std::string
 	}
 }
 
+// Shared by a button's "requiresRace"/"excludeRace" - either a single race String ID or an array of
+// them (any one match is enough), mirroring a trigger's "buildings".
+static void parseStringOrArray(const rapidjson::Value& value, std::vector<std::string>& out)
+{
+	if (value.IsString())
+		out.push_back(value.GetString());
+	else if (value.IsArray())
+	{
+		for (auto it = value.Begin(); it != value.End(); ++it)
+		{
+			if (it->IsString())
+				out.push_back(it->GetString());
+		}
+	}
+}
+
 static void loadDialogueBoxesFromJson()
 {
 	std::string jsonPath = getOwnModDirectory() + "RE_Kenshi.json";
@@ -1403,10 +1550,14 @@ static void loadDialogueBoxesFromJson()
 					btn.requiresAnimal = (*bit)["requiresAnimal"].GetBool();
 				if (bit->HasMember("excludeAnimal") && (*bit)["excludeAnimal"].IsBool())
 					btn.excludeAnimal = (*bit)["excludeAnimal"].GetBool();
-				if (bit->HasMember("requiresRace") && (*bit)["requiresRace"].IsString())
-					btn.requiresRace = (*bit)["requiresRace"].GetString();
-				if (bit->HasMember("excludeRace") && (*bit)["excludeRace"].IsString())
-					btn.excludeRace = (*bit)["excludeRace"].GetString();
+				if (bit->HasMember("requiresRace"))
+					parseStringOrArray((*bit)["requiresRace"], btn.requiresRace);
+				if (bit->HasMember("excludeRace"))
+					parseStringOrArray((*bit)["excludeRace"], btn.excludeRace);
+				if (bit->HasMember("requiresCharacter"))
+					parseStringOrArray((*bit)["requiresCharacter"], btn.requiresCharacter);
+				if (bit->HasMember("excludeCharacter"))
+					parseStringOrArray((*bit)["excludeCharacter"], btn.excludeCharacter);
 				if (bit->HasMember("steps") && (*bit)["steps"].IsArray())
 				{
 					for (auto sit = (*bit)["steps"].Begin(); sit != (*bit)["steps"].End(); ++sit)
@@ -1619,7 +1770,10 @@ static void evaluateDialogueTrigger(Character* self, size_t triggerIndex, const 
 	if (!trigger.excludeQualifiedFor.empty() && initiatorQualifiesForMenu(trigger.excludeQualifiedFor, self, initiator))
 		return;
 
-	showDialogueBox(trigger.menu, self, initiator);
+	// A dead-end trigger's excludeQualifiedFor names the real menu it's standing in for (e.g.
+	// no_specialist_menu's trigger has excludeQualifiedFor="system_menu_animal") - pass it through so
+	// that box's message can still report the real menu's per-patient item/skill requirements.
+	showDialogueBox(trigger.menu, self, initiator, trigger.excludeQualifiedFor);
 	g_triggerShown[shownKey] = true;
 }
 

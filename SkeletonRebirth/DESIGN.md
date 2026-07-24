@@ -449,18 +449,32 @@ and fast-recruits the patient via `PlayerInterface::recruit()`):
 
 `{name}` is substituted with the patient's name wherever it appears (`message`, and any `show_text`
 step's `text`). `{skillCharacter}`/`{skillCharacter2}` (box-level `message` only, not step text) name
-the squad member `findSquadMemberWithSkill()` found for the first patient-applicable button's (per
-`isDialogueButtonForPatient()`, not `eligibleButtons`) `requiresSkill`/`requiresSkill2` - see
+the squad member `findSquadSkillStatus()` found qualifying for the first patient-applicable button's
+(per `isDialogueButtonForPatient()`, not `eligibleButtons`) `requiresSkill`/`requiresSkill2` - see
 "Button-level gating" below - falling back to "No one" if nobody currently qualifies, since that's an
 expected outcome, not a data error. `{itemStatus}` (same scope as the two above) reads
-`initiator->getInventory()->hasItem()` against the same patient-applicable button's first
+`initiator->getInventory()->countItems()` against the same patient-applicable button's first
 `requiresItems` entry (and that entry's own `count`) and resolves to "You have one."/"You don't have
-one yet." - added so the message explains *why* a button
-like "Diagnostics" might be missing (missing item vs. nobody in the squad qualifying) instead of the
-player having to guess. Up to 3 buttons per entry
-(`Kenshi_MessageBox.layout` has exactly `ButtonA`/`ButtonB`/`ButtonC`) - see the button-gating/
-visibility rules below for how "up to 3" is actually resolved from a JSON array that might define more,
-or fewer be eligible.
+one yet." when `count` is 1, or "You have X of the Y needed." when `count` is greater than 1 - added
+so the message explains *why* a button like "Diagnostics" might be missing (missing item, and how many
+short, vs. nobody in the squad qualifying) instead of the player having to guess.
+
+`{skillStatus}`/`{skillStatus2}` (same scope, counterparts to `{skillCharacter}`/`{skillCharacter2}`)
+close the equivalent gap on the skill side: blank once `{skillCharacter}`/`{skillCharacter2}` already
+names a qualifying member (nothing more to say), otherwise `findSquadSkillStatus()` - the same
+squad-scan as `findSquadMemberWithSkill()` (initiator preferred, then platoon), but tracking the
+highest-value candidate seen even when nobody qualifies, not just a qualifying one - resolves to
+"<bestMember> is closest at <skillField> <value> (needs <threshold>)." or, if nobody in the squad has
+`CharStats` at all, "Nobody in the squad has trained <skillField> yet (needs <threshold>)." `<skillField>`
+is the raw `requiresSkill`/`requiresSkill2` JSON string (e.g. "science"), not a display-name lookup -
+matches how the message's own hardcoded "old world science"/"robotics" wording already names them
+manually. `<threshold>` comes from `describeSkillThreshold()` - "at least X" / "at most X" / "between X
+and Y" depending on which of `minSkill`/`maxSkill` the button set - resolving to `""` (no threshold to
+report) if the button set neither, in which case `{skillStatus}` is left blank same as the qualified case.
+
+Up to 3 buttons per entry (`Kenshi_MessageBox.layout` has exactly `ButtonA`/`ButtonB`/`ButtonC`) - see
+the button-gating/visibility rules below for how "up to 3" is actually resolved from a JSON array that
+might define more, or fewer be eligible.
 
 **The step types** (`DialogueBoxStepDef::type`), run in order by `dispatchDialogueSteps()`:
 - `"action"` — dispatches `action` through `g_dialogueActions` (a `std::map<std::string,
@@ -600,12 +614,22 @@ from anything its steps do:
   (`STATUS_ACCESS_VIOLATION` reading `-1`, confirmed live via minidump) when run on a still-fatally-wounded
   character; "Revive" no longer also requires `requiresPlayerFaction` (removed - it otherwise never showed
   for a wild robot at all, the exact case that needs reactivating before Reset can safely run).
-- `requiresRace`/`excludeRace` (string, counterparts) - matches `Character::getRace()->data->name`,
-  both sides trimmed (`trimCopy()`) before comparing - confirmed live that this race's real `name` carries
-  a trailing space invisible in-game, which silently broke an untrimmed exact match. Used to give
-  "Skeleton No-Head MkII" its own "Diagnostics" button variant (requiring a Power Core, same item as the
+- `requiresRace`/`excludeRace` (string or array of strings, counterparts) - matches
+  `Character::getRace()->data->stringID`, the FCS String ID, not the display `name` - `name` comparison
+  was tried first and dropped: this race's real `name` carries a trailing space invisible in-game, which
+  silently broke an untrimmed exact match, and `name` is translatable/re-orderable in a way a `stringID`
+  isn't. Accepts either a single String ID or a JSON array of them (any one match is enough), same
+  string-or-array shorthand as a trigger's `buildings`. Used to give "Skeleton No-Head MkII"
+  (`95870-Newwworld.mod`) its own "Diagnostics" button variant (requiring a Power Core, same item as the
   animal path) alongside `system_menu`'s generic humanoid one (which excludes this race so the two don't
   both show at once).
+- `requiresCharacter`/`excludeCharacter` (string or array of strings, counterparts) - same shape and
+  "any one match" semantics as `requiresRace`/`excludeRace`, but matches the patient's own FCS String ID
+  (`Character::getGameData()->stringID`, the same accessor `isAnimalCharacterType()` already uses) rather
+  than its race - for gating on specific unique characters instead of every character of a race.
+  `system_menu_animal` uses this to split two specific unique robot animals (`56111-Newwworld.mod`,
+  `96147-__Southern hive.mod`) into their own "Diagnostics" variant requiring 3 AI Cores instead of the
+  generic animal path's 1.
 - The box-level `message`'s `{item}`/`{skillCharacter}`/`{skillCharacter2}` substitutions are resolved
   from `def.buttons` filtered by `isDialogueButtonForPatient()` (the patient-only subset of gating -
   race/animal/faction/deactivated), not from `eligibleButtons` (the full, initiator-inclusive gate).
@@ -708,6 +732,19 @@ initiator, at most one of the pair ever fires, and because triggers are evaluate
 `showDialogueBox()` a no-op once one is already pending, whichever is listed first effectively wins -
 "first eligible trigger" gives if/else routing to a genuinely distinct initial box, entirely through
 existing trigger evaluation, with no bespoke redirect concept.
+
+`no_specialist_menu` has no `requiresItems`/`requiresSkill` buttons of its own (just "Exit"), so without
+help its message could never say *what* is missing - only the message's own box's buttons feed
+`{item}`/`{itemStatus}`/`{skillCharacter}`/`{skillStatus}` (see above), and this box's buttons are empty
+of that data by design (it's the dead end, not the real menu). `evaluateDialogueTrigger()` closes this
+gap for free: the dead-end trigger's own `excludeQualifiedFor` already names the real menu it stands in
+for (e.g. `"system_menu_animal"`), so it's passed straight through as `showDialogueBox()`'s
+`requirementsMenuId` argument. Inside, `reqDef` points at that real menu's `DialogueBoxDef` instead of
+`no_specialist_menu`'s own for the item/skill-resolution loop only - `eligibleButtons`, `title`, and the
+literal `message` template still come from `no_specialist_menu` itself, so it still only ever offers
+"Exit". This is JSON-driven with zero new fields: the same `excludeQualifiedFor` value already had to name
+the real menu for the trigger gate to work at all, so the message-fallback wiring is entirely a
+consequence of data already in `RE_Kenshi.json`, not a hardcoded C++ special case.
 
 Rejected first: the same OR-check as a *button*-level `requiresInitiatorSpecialist`/
 `excludeInitiatorSpecialist` pair, with a mutually-exclusive dead-end sibling button per "Diagnostics"
